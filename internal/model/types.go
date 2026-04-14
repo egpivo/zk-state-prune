@@ -145,6 +145,51 @@ type AccessEvent struct {
 	TxHash      string
 }
 
+// ObservationWindow is the [Start, End) block range that analysis looks at.
+// Events outside the window are invisible to EDA and survival fits, so the
+// window choice directly controls left-truncation and right-censoring rates.
+type ObservationWindow struct {
+	Start uint64
+	End   uint64
+}
+
+// Contains reports whether block b falls inside the window.
+func (w ObservationWindow) Contains(b uint64) bool { return b >= w.Start && b < w.End }
+
+// Span returns the window length in blocks.
+func (w ObservationWindow) Span() uint64 { return w.End - w.Start }
+
+// InterAccessInterval is one [start, stop] survival observation built from a
+// slot's access trace, restricted to an observation window. It is the unit of
+// input for both EDA inter-access analysis and Kaplan–Meier / Cox fits.
+//
+// Censoring & truncation:
+//   - IsObserved=true means the interval ended on a real access (event); false
+//     means it was right-censored at window.End.
+//   - IsLeftTrunc=true marks the first interval of a slot whose creation
+//     block precedes window.Start. The slot enters the risk set at EntryTime
+//     (= window.Start), not at its true creation time, which avoids the
+//     survivorship bias from over-representing long-lived slots.
+//   - For non-first intervals EntryTime equals IntervalStart and the flag is
+//     false: the slot is already in the risk set from the previous access.
+type InterAccessInterval struct {
+	SlotID        string
+	IntervalStart uint64
+	IntervalEnd   uint64
+	Duration      uint64
+	IsObserved    bool
+	IsLeftTrunc   bool
+	EntryTime     uint64
+
+	// Cox covariates captured at IntervalStart so the model sees the state
+	// of the world the way an online policy would.
+	ContractType ContractCategory
+	SlotType     SlotType
+	AccessCount  uint64
+	ContractAge  uint64
+	SlotAge      uint64
+}
+
 // ContractMeta is per-contract metadata, populated by the extractor and
 // refreshed by analysis passes.
 type ContractMeta struct {
