@@ -1,0 +1,43 @@
+# Default configuration for zksp.
+# All sections are consumed by viper; CLI flags override these values.
+
+extractor:
+  source: mock          # mock|rpc|file
+  mock:
+    seed: 42
+    num_contracts: 500
+    slots_per_contract_mean: 200
+    access_alpha: 1.5            # power-law exponent for access frequency
+    intra_contract_correlation: 0.7
+    periodic_contracts_ratio: 0.1
+    total_blocks: 1000000
+    contract_type_distribution:
+      erc20: 0.40
+      dex: 0.15
+      nft: 0.20
+      bridge: 0.05
+      governance: 0.05
+      other: 0.15
+
+storage:
+  path: zksp.db
+
+survival:
+  stratify_by: [contract_type, slot_type]
+
+pruning:
+  cost:
+    storage_per_slot_bytes: 64
+    reactivation_proof_cost: 1.0
+    false_prune_penalty: 10.0
+  policies:
+    statistical:
+      survival_threshold: 0.05   # prune when P(next access > horizon) < threshold
+      horizon_blocks: 100000
+    fixed_30d:
+      idle_blocks: 216000        # ~30 days at 12s blocks
+    fixed_90d:
+      idle_blocks: 648000
+
+logging:
+  level: info
