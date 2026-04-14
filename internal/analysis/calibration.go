@@ -30,6 +30,10 @@ type PHTestResult struct {
 // but matches the empirical CDF.
 type CalibratedModel struct {
 	Base *CoxResult
+	// Tau is the horizon at which the recalibration was fitted. It
+	// becomes the canonical horizon for PredictAccessProb on this model:
+	// raw Cox predictions at any other horizon would not match the grid.
+	Tau float64
 	// Recalibration grid: PredX[i] is a sorted predicted probability,
 	// CalibratedY[i] is the isotonic-fitted empirical rate at that
 	// quantile. PredictAccessProb does a step lookup on this grid.
@@ -76,6 +80,127 @@ func isotonicLookup(x, y []float64, q float64) float64 {
 		}
 	}
 	return y[lo]
+}
+
+// CalibrationCurve summarizes the agreement between Cox-predicted
+// access probabilities and the empirical access rate on a held-out
+// interval set, evaluated at a single horizon tau. It is the standard
+// reliability-diagram input: each bin pairs the mean predicted
+// probability with the observed rate among rows whose prediction landed
+// in that bin.
+//
+// Phase-1 censoring policy: each holdout interval is labelled as
+//
+//   - 1 ("happened") if IsObserved && Duration <= tau
+//   - 0 ("did not happen by tau") if Duration > tau, regardless of
+//     observed/censored — at time tau we still hadn't seen an access
+//   - dropped if !IsObserved && Duration <= tau ("censored before tau"):
+//     we don't know whether an access would have happened by tau, so
+//     using either label biases the curve.
+//
+// The drop policy is the cleanest small-N approach. A future revision
+// can replace it with bin-wise Kaplan–Meier observed rates that
+// incorporate the dropped rows correctly.
+type CalibrationCurve struct {
+	Tau float64
+
+	Bins []CalibrationBin
+
+	// BrierScore is the mean squared error between predicted probability
+	// and the binary label, averaged over kept rows. Lower is better; a
+	// well-calibrated and well-discriminating model has a small Brier.
+	BrierScore float64
+
+	// NumKept and NumDropped account for every holdout row. Reporting
+	// both lets the reader sanity-check the censoring drop rate.
+	NumKept    int
+	NumDropped int
+}
+
+// CalibrationBin is one row of a reliability diagram.
+type CalibrationBin struct {
+	PredictedMean float64
+	ObservedRate  float64
+	N             int
+}
+
+// CalibrationCurveFromCox evaluates a fitted Cox model on the holdout
+// intervals at horizon tau and produces a reliability diagram with
+// `nBins` equal-population quantile bins.
+func CalibrationCurveFromCox(
+	model *CoxResult,
+	holdout []model.InterAccessInterval,
+	tau float64,
+	nBins int,
+) (*CalibrationCurve, error) {
+	if model == nil {
+		return nil, fmt.Errorf("CalibrationCurveFromCox: nil model")
+	}
+	if tau <= 0 {
+		return nil, fmt.Errorf("CalibrationCurveFromCox: tau must be > 0")
+	}
+	if len(holdout) == 0 {
+		return nil, fmt.Errorf("CalibrationCurveFromCox: empty holdout")
+	}
+	if nBins <= 0 {
+		nBins = 10
+	}
+
+	type point struct{ p, y float64 }
+	pts := make([]point, 0, len(holdout))
+	dropped := 0
+	for _, it := range holdout {
+		var label float64
+		switch {
+		case it.IsObserved && it.Duration <= uint64(tau):
+			label = 1
+		case it.Duration > uint64(tau):
+			label = 0
+		default:
+			// censored && Duration <= tau → ambiguous, skip.
+			dropped++
+			continue
+		}
+		p := model.PredictAccessProbForInterval(it, tau)
+		pts = append(pts, point{p: p, y: label})
+	}
+	if len(pts) < nBins {
+		return nil, fmt.Errorf("CalibrationCurveFromCox: only %d non-ambiguous rows for %d bins", len(pts), nBins)
+	}
+
+	sort.Slice(pts, func(i, j int) bool { return pts[i].p < pts[j].p })
+
+	bins := make([]CalibrationBin, 0, nBins)
+	binSize := len(pts) / nBins
+	brier := 0.0
+	for b := 0; b < nBins; b++ {
+		lo := b * binSize
+		hi := lo + binSize
+		if b == nBins-1 {
+			hi = len(pts)
+		}
+		var sumP, sumY float64
+		for j := lo; j < hi; j++ {
+			sumP += pts[j].p
+			sumY += pts[j].y
+			d := pts[j].p - pts[j].y
+			brier += d * d
+		}
+		n := hi - lo
+		bins = append(bins, CalibrationBin{
+			PredictedMean: sumP / float64(n),
+			ObservedRate:  sumY / float64(n),
+			N:             n,
+		})
+	}
+
+	return &CalibrationCurve{
+		Tau:        tau,
+		Bins:       bins,
+		BrierScore: brier / float64(len(pts)),
+		NumKept:    len(pts),
+		NumDropped: dropped,
+	}, nil
 }
 
 // CheckPH runs a Schoenfeld-residuals proportional-hazards test on a
@@ -316,8 +441,93 @@ func averageRanks(xs []float64) []float64 {
 	return ranks
 }
 
-// Calibrate fits an isotonic recalibration on the holdout interval set.
-// Stub for Segment 11; returns ErrNotImplemented today.
-func (StatmodelFitter) Calibrate(_ *CoxResult, _ []model.InterAccessInterval) (*CalibratedModel, error) {
-	return nil, ErrNotImplemented
+// CalibrateAt fits an isotonic recalibration map from raw Cox-predicted
+// access probability to empirical access rate on the holdout set, at
+// horizon tau. Returns a CalibratedModel that wraps the original
+// CoxResult and recovers a calibrated PredictAccessProb via PAV-fitted
+// step lookup.
+//
+// Censoring handling matches CalibrationCurveFromCox: rows that are
+// censored before tau are dropped because their label is unknowable
+// without a survival adjustment; rows with Duration > tau are 0
+// regardless of their observed-flag.
+//
+// CalibrateAt is the lower-level entry point that takes tau explicitly.
+// The interface method Calibrate(res, holdout) defaults tau to the
+// median Duration of the training set (read off res.intervals).
+func (StatmodelFitter) CalibrateAt(
+	res *CoxResult,
+	holdout []model.InterAccessInterval,
+	tau float64,
+) (*CalibratedModel, error) {
+	if res == nil {
+		return nil, fmt.Errorf("CalibrateAt: nil CoxResult")
+	}
+	if tau <= 0 {
+		return nil, fmt.Errorf("CalibrateAt: tau must be > 0")
+	}
+	if len(holdout) == 0 {
+		return nil, fmt.Errorf("CalibrateAt: empty holdout")
+	}
+
+	type point struct{ p, y float64 }
+	pts := make([]point, 0, len(holdout))
+	for _, it := range holdout {
+		var label float64
+		switch {
+		case it.IsObserved && it.Duration <= uint64(tau):
+			label = 1
+		case it.Duration > uint64(tau):
+			label = 0
+		default:
+			continue
+		}
+		pts = append(pts, point{
+			p: res.PredictAccessProbForInterval(it, tau),
+			y: label,
+		})
+	}
+	if len(pts) < 5 {
+		return nil, fmt.Errorf("CalibrateAt: only %d non-ambiguous holdout rows (need >= 5)", len(pts))
+	}
+
+	sort.Slice(pts, func(i, j int) bool { return pts[i].p < pts[j].p })
+
+	x := make([]float64, len(pts))
+	y := make([]float64, len(pts))
+	for i, p := range pts {
+		x[i] = p.p
+		y[i] = p.y
+	}
+	yHat := poolAdjacentViolators(y)
+
+	return &CalibratedModel{
+		Base:        res,
+		Tau:         tau,
+		PredX:       x,
+		CalibratedY: yHat,
+	}, nil
+}
+
+// Calibrate is the SurvivalFitter interface method. It selects a
+// default horizon (median Duration of the training intervals retained
+// inside res) and delegates to CalibrateAt. Callers that want to pin
+// tau should invoke CalibrateAt directly.
+func (f StatmodelFitter) Calibrate(res *CoxResult, holdout []model.InterAccessInterval) (*CalibratedModel, error) {
+	if res == nil {
+		return nil, fmt.Errorf("Calibrate: nil CoxResult")
+	}
+	if len(res.intervals) == 0 {
+		return nil, fmt.Errorf("Calibrate: training intervals not retained on CoxResult")
+	}
+	durs := make([]float64, 0, len(res.intervals))
+	for _, it := range res.intervals {
+		durs = append(durs, float64(it.Duration))
+	}
+	sort.Float64s(durs)
+	tau := durs[len(durs)/2]
+	if tau <= 0 {
+		tau = 1
+	}
+	return f.CalibrateAt(res, holdout, tau)
 }

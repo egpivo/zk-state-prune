@@ -1,7 +1,6 @@
 package analysis
 
 import (
-	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -10,11 +9,6 @@ import (
 
 	"github.com/egpivo/zk-state-prune/internal/model"
 )
-
-// ErrNotImplemented is returned by SurvivalFitter methods that are reserved
-// for later Phase-1 segments. Keeping the interface stable across segments
-// means upstream code can compile against the final shape today.
-var ErrNotImplemented = errors.New("not implemented")
 
 // KMResult is a fitted Kaplan–Meier curve with the diagnostics a pruning
 // policy actually needs. Time[i], Surv[i], SE[i], NumRisk[i] are aligned.

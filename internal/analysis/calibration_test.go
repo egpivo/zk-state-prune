@@ -181,6 +181,148 @@ func TestAverageRanks_HandlesTies(t *testing.T) {
 	}
 }
 
+// --- Calibrate / CalibratedModel tests ---------------------------------
+
+func TestCalibrate_ProducesMonotoneRecalibration(t *testing.T) {
+	// PH-holding synthetic, fit Cox, then calibrate at the median tau.
+	ivs := phHoldsIntervals(800)
+	res, err := NewStatmodelFitter().FitCoxPH(ivs, DefaultCoxPredictors)
+	if err != nil {
+		t.Fatalf("FitCoxPH: %v", err)
+	}
+	calib, err := NewStatmodelFitter().Calibrate(res, ivs)
+	if err != nil {
+		t.Fatalf("Calibrate: %v", err)
+	}
+	if calib.Base != res {
+		t.Errorf("CalibratedModel.Base must point at the original CoxResult")
+	}
+	if calib.Tau <= 0 {
+		t.Errorf("Tau=%v, want > 0", calib.Tau)
+	}
+	if len(calib.PredX) == 0 || len(calib.PredX) != len(calib.CalibratedY) {
+		t.Fatalf("grid mismatch: |PredX|=%d |CalibratedY|=%d", len(calib.PredX), len(calib.CalibratedY))
+	}
+	// PredX is sorted ascending.
+	for i := 1; i < len(calib.PredX); i++ {
+		if calib.PredX[i] < calib.PredX[i-1]-1e-12 {
+			t.Errorf("PredX not sorted at %d: %v", i, calib.PredX[i-1:i+1])
+			break
+		}
+	}
+	// CalibratedY is monotone non-decreasing (PAV invariant).
+	for i := 1; i < len(calib.CalibratedY); i++ {
+		if calib.CalibratedY[i] < calib.CalibratedY[i-1]-1e-12 {
+			t.Errorf("CalibratedY not monotone at %d: %v", i, calib.CalibratedY[i-1:i+1])
+			break
+		}
+	}
+	// Calibrated values are bounded in [0,1] since they are PAV-fitted
+	// 0/1 labels.
+	for i, v := range calib.CalibratedY {
+		if v < 0 || v > 1 {
+			t.Errorf("CalibratedY[%d]=%v out of [0,1]", i, v)
+		}
+	}
+}
+
+func TestCalibratedModel_PredictAccessProb_BoundedAndMonotone(t *testing.T) {
+	ivs := phHoldsIntervals(600)
+	res, err := NewStatmodelFitter().FitCoxPH(ivs, DefaultCoxPredictors)
+	if err != nil {
+		t.Fatalf("FitCoxPH: %v", err)
+	}
+	calib, err := NewStatmodelFitter().Calibrate(res, ivs)
+	if err != nil {
+		t.Fatalf("Calibrate: %v", err)
+	}
+	// Probe across a sweep of AccessCount, holding other covariates
+	// fixed. The calibrated probability must stay bounded and must not
+	// strictly decrease as AccessCount rises (PH-holding data has a
+	// positive AccessCount→hazard relationship).
+	prev := -1.0
+	for ac := 0.0; ac <= 20; ac += 1 {
+		p := calib.PredictAccessProb(map[string]float64{
+			ColAccessCount: ac,
+			ColSlotAge:     500,
+		}, calib.Tau)
+		if p < 0 || p > 1 {
+			t.Errorf("predict(ac=%v) = %v out of [0,1]", ac, p)
+		}
+		if prev >= 0 && p < prev-1e-9 {
+			t.Errorf("calibrated prob decreased at ac=%v: %v < %v", ac, p, prev)
+		}
+		prev = p
+	}
+}
+
+func TestCalibrate_ErrorPaths(t *testing.T) {
+	f := NewStatmodelFitter()
+	if _, err := f.Calibrate(nil, nil); err == nil {
+		t.Error("expected error on nil res")
+	}
+	// CoxResult without retained training intervals
+	if _, err := f.Calibrate(&CoxResult{}, nil); err == nil {
+		t.Error("expected error on empty retained intervals")
+	}
+	// CalibrateAt edges
+	if _, err := f.CalibrateAt(nil, nil, 1); err == nil {
+		t.Error("expected error on nil res")
+	}
+	if _, err := f.CalibrateAt(&CoxResult{}, nil, 0); err == nil {
+		t.Error("expected error on tau=0")
+	}
+	if _, err := f.CalibrateAt(&CoxResult{}, nil, 1); err == nil {
+		t.Error("expected error on empty holdout")
+	}
+}
+
+func TestCalibrate_MockTrainHoldoutEndToEnd(t *testing.T) {
+	ctx := context.Background()
+	db := openDB(t)
+	cfg := extractor.DefaultMockConfig()
+	cfg.NumContracts = 50
+	cfg.SlotsPerContractXmin = 5
+	cfg.SlotsPerContractMax = 30
+	cfg.TotalBlocks = 20_000
+	cfg.Window = model.ObservationWindow{Start: 4_000, End: 20_000}
+	cfg.AccessRateXmin = 1e-4
+	cfg.MaxEventsPerSlot = 200
+	cfg.PeriodBlocks = 2_000
+	if err := extractor.NewMockExtractor(cfg).Extract(ctx, db); err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	built, err := BuildIntervals(ctx, db, cfg.Window)
+	if err != nil {
+		t.Fatalf("BuildIntervals: %v", err)
+	}
+	train, holdout, err := TrainHoldoutSplitBySlot(built.Intervals, 0.3, 7)
+	if err != nil {
+		t.Fatalf("split: %v", err)
+	}
+	res, err := NewStatmodelFitter().FitCoxPH(train, DefaultCoxPredictors)
+	if err != nil {
+		t.Fatalf("FitCoxPH: %v", err)
+	}
+	calib, err := NewStatmodelFitter().CalibrateAt(res, holdout, 2_000)
+	if err != nil {
+		t.Fatalf("CalibrateAt: %v", err)
+	}
+	for _, v := range calib.CalibratedY {
+		if math.IsNaN(v) || v < 0 || v > 1 {
+			t.Errorf("CalibratedY out of [0,1]: %v", v)
+		}
+	}
+	// Spot-check a prediction.
+	p := calib.PredictAccessProb(map[string]float64{
+		ColAccessCount: 1,
+		ColSlotAge:     1000,
+	}, 2_000)
+	if math.IsNaN(p) || p < 0 || p > 1 {
+		t.Errorf("PredictAccessProb out of [0,1]: %v", p)
+	}
+}
+
 func TestPearsonCorrelation_KnownAnswer(t *testing.T) {
 	// Perfect linear relationship → ρ = 1.
 	x := []float64{1, 2, 3, 4, 5}

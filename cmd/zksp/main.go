@@ -199,13 +199,13 @@ func newEDACmd() *cobra.Command {
 func newFitCmd() *cobra.Command {
 	var dbPath, modelKind, stratify string
 	var startBlock, endBlock uint64
+	var holdoutFrac float64
+	var splitSeed uint64
+	var tau uint64
 	cmd := &cobra.Command{
 		Use:   "fit",
-		Short: "Fit a survival model (Phase 1: km only)",
+		Short: "Fit a survival model: km or cox (with PH check + isotonic calibration)",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if modelKind != "km" {
-				return fmt.Errorf("model %q not supported in Phase 1 (use km)", modelKind)
-			}
 			ctx := cmd.Context()
 			db, err := openDB(ctx, dbPath)
 			if err != nil {
@@ -221,45 +221,215 @@ func newFitCmd() *cobra.Command {
 			fitter := analysis.NewStatmodelFitter()
 			out := os.Stdout
 
-			if stratify == "none" || stratify == "" {
-				res, err := fitter.FitKaplanMeier(built.Intervals)
-				if err != nil {
-					return fmt.Errorf("fit km: %w", err)
-				}
-				res.Label = "all"
-				return printKM(out, []*analysis.KMResult{res})
-			}
-
-			var key func(model.InterAccessInterval) string
-			switch stratify {
-			case "contract-type", "contract":
-				key = analysis.StratumByContractType
-			case "slot-type", "slot":
-				key = analysis.StratumBySlotType
+			switch modelKind {
+			case "km":
+				return runKMFit(out, fitter, built.Intervals, stratify)
+			case "cox":
+				return runCoxFit(out, fitter, built.Intervals, holdoutFrac, splitSeed, tau)
 			default:
-				return fmt.Errorf("unknown stratify mode %q", stratify)
+				return fmt.Errorf("unknown model %q (use km or cox)", modelKind)
 			}
-			curves, err := analysis.FitKaplanMeierStratified(fitter, built.Intervals, key)
-			if err != nil {
-				return fmt.Errorf("fit km stratified: %w", err)
-			}
-			labels := make([]string, 0, len(curves))
-			for k := range curves {
-				labels = append(labels, k)
-			}
-			sort.Strings(labels)
-			ordered := make([]*analysis.KMResult, 0, len(curves))
-			for _, l := range labels {
-				ordered = append(ordered, curves[l])
-			}
-			return printKM(out, ordered)
 		},
 	}
 	cmd.Flags().StringVar(&dbPath, "db", defaultDBPath, "SQLite DB path")
-	cmd.Flags().StringVar(&modelKind, "model", "km", "model type (Phase 1: km; cox in Phase 2)")
-	cmd.Flags().StringVar(&stratify, "stratify", "none", "stratify by: none|contract-type|slot-type")
+	cmd.Flags().StringVar(&modelKind, "model", "km", "model type: km|cox")
+	cmd.Flags().StringVar(&stratify, "stratify", "none", "(km only) stratify by: none|contract-type|slot-type")
+	cmd.Flags().Float64Var(&holdoutFrac, "holdout", 0.3, "(cox only) holdout fraction for calibration split")
+	cmd.Flags().Uint64Var(&splitSeed, "split-seed", 1, "(cox only) PRNG seed for the train/holdout split")
+	cmd.Flags().Uint64Var(&tau, "tau", 0, "(cox only) calibration horizon in blocks (0 = median training Duration)")
 	addWindowFlags(cmd, &startBlock, &endBlock)
 	return cmd
+}
+
+func runKMFit(out io.Writer, fitter analysis.SurvivalFitter, intervals []model.InterAccessInterval, stratify string) error {
+	if stratify == "none" || stratify == "" {
+		res, err := fitter.FitKaplanMeier(intervals)
+		if err != nil {
+			return fmt.Errorf("fit km: %w", err)
+		}
+		res.Label = "all"
+		return printKM(out, []*analysis.KMResult{res})
+	}
+	var key func(model.InterAccessInterval) string
+	switch stratify {
+	case "contract-type", "contract":
+		key = analysis.StratumByContractType
+	case "slot-type", "slot":
+		key = analysis.StratumBySlotType
+	default:
+		return fmt.Errorf("unknown stratify mode %q", stratify)
+	}
+	curves, err := analysis.FitKaplanMeierStratified(fitter, intervals, key)
+	if err != nil {
+		return fmt.Errorf("fit km stratified: %w", err)
+	}
+	labels := make([]string, 0, len(curves))
+	for k := range curves {
+		labels = append(labels, k)
+	}
+	sort.Strings(labels)
+	ordered := make([]*analysis.KMResult, 0, len(curves))
+	for _, l := range labels {
+		ordered = append(ordered, curves[l])
+	}
+	return printKM(out, ordered)
+}
+
+// runCoxFit drives the Cox PH path: split → fit → PH check → calibration
+// curve (raw) → isotonic recalibration → calibration curve (post). The
+// before/after Brier comparison is the headline number for whether the
+// recalibration actually helps on this dataset.
+func runCoxFit(
+	out io.Writer,
+	fitter analysis.StatmodelFitter,
+	intervals []model.InterAccessInterval,
+	holdoutFrac float64,
+	splitSeed uint64,
+	tauFlag uint64,
+) error {
+	train, holdout, err := analysis.TrainHoldoutSplitBySlot(intervals, holdoutFrac, splitSeed)
+	if err != nil {
+		return fmt.Errorf("split: %w", err)
+	}
+	slog.Info("cox split", "train_intervals", len(train), "holdout_intervals", len(holdout))
+
+	res, err := fitter.FitCoxPH(train, analysis.DefaultCoxPredictors)
+	if err != nil {
+		return fmt.Errorf("fit cox: %w", err)
+	}
+	if err := printCoxSummary(out, res); err != nil {
+		return err
+	}
+
+	ph, err := fitter.CheckPH(res)
+	if err != nil {
+		return fmt.Errorf("check PH: %w", err)
+	}
+	fmt.Fprintln(out, "\n-- proportional-hazards check (Schoenfeld) --")
+	if err := printPHTest(out, ph); err != nil {
+		return err
+	}
+
+	tau := float64(tauFlag)
+	if tau == 0 {
+		tau = medianDuration(train)
+	}
+	fmt.Fprintf(out, "\n-- calibration @ tau=%.0f blocks --\n", tau)
+	rawCurve, err := analysis.CalibrationCurveFromCox(res, holdout, tau, 10)
+	if err != nil {
+		return fmt.Errorf("calibration curve: %w", err)
+	}
+	fmt.Fprintln(out, "raw Cox:")
+	if err := printCalibrationCurve(out, rawCurve); err != nil {
+		return err
+	}
+
+	calib, err := fitter.CalibrateAt(res, holdout, tau)
+	if err != nil {
+		return fmt.Errorf("calibrate: %w", err)
+	}
+	postCurve, err := calibrationCurveFromCalibrated(calib, holdout, tau, 10)
+	if err != nil {
+		return fmt.Errorf("post-calibration curve: %w", err)
+	}
+	fmt.Fprintln(out, "\nisotonic-recalibrated:")
+	if err := printCalibrationCurve(out, postCurve); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "\nBrier: raw=%.4f → calibrated=%.4f (delta=%+.4f)\n",
+		rawCurve.BrierScore, postCurve.BrierScore, postCurve.BrierScore-rawCurve.BrierScore)
+	return nil
+}
+
+// medianDuration is a tiny in-place median for picking a default cox tau.
+func medianDuration(ivs []model.InterAccessInterval) float64 {
+	if len(ivs) == 0 {
+		return 1
+	}
+	xs := make([]float64, len(ivs))
+	for i, it := range ivs {
+		xs[i] = float64(it.Duration)
+	}
+	sort.Float64s(xs)
+	v := xs[len(xs)/2]
+	if v <= 0 {
+		v = 1
+	}
+	return v
+}
+
+// calibrationCurveFromCalibrated runs the same drop/bin policy as
+// CalibrationCurveFromCox but uses the wrapper's recalibrated
+// PredictAccessProb for the predicted side. It lets the CLI report a
+// before/after pair without exposing a second analysis-package entry
+// point. Definition kept here (CLI-local) because it's only used for
+// diagnostic display, not as a reusable analysis API.
+func calibrationCurveFromCalibrated(
+	calib *analysis.CalibratedModel,
+	holdout []model.InterAccessInterval,
+	tau float64,
+	nBins int,
+) (*analysis.CalibrationCurve, error) {
+	if calib == nil || calib.Base == nil {
+		return nil, fmt.Errorf("calibrationCurveFromCalibrated: nil calibrated model")
+	}
+	if nBins <= 0 {
+		nBins = 10
+	}
+	type point struct{ p, y float64 }
+	pts := make([]point, 0, len(holdout))
+	dropped := 0
+	for _, it := range holdout {
+		var label float64
+		switch {
+		case it.IsObserved && it.Duration <= uint64(tau):
+			label = 1
+		case it.Duration > uint64(tau):
+			label = 0
+		default:
+			dropped++
+			continue
+		}
+		p := calib.PredictAccessProb(map[string]float64{
+			analysis.ColAccessCount: float64(it.AccessCount),
+			analysis.ColSlotAge:     float64(it.SlotAge),
+		}, tau)
+		pts = append(pts, point{p, label})
+	}
+	if len(pts) < nBins {
+		return nil, fmt.Errorf("calibrationCurveFromCalibrated: only %d non-ambiguous rows for %d bins", len(pts), nBins)
+	}
+	sort.Slice(pts, func(i, j int) bool { return pts[i].p < pts[j].p })
+	bins := make([]analysis.CalibrationBin, 0, nBins)
+	binSize := len(pts) / nBins
+	brier := 0.0
+	for b := 0; b < nBins; b++ {
+		lo := b * binSize
+		hi := lo + binSize
+		if b == nBins-1 {
+			hi = len(pts)
+		}
+		var sumP, sumY float64
+		for j := lo; j < hi; j++ {
+			sumP += pts[j].p
+			sumY += pts[j].y
+			d := pts[j].p - pts[j].y
+			brier += d * d
+		}
+		n := hi - lo
+		bins = append(bins, analysis.CalibrationBin{
+			PredictedMean: sumP / float64(n),
+			ObservedRate:  sumY / float64(n),
+			N:             n,
+		})
+	}
+	return &analysis.CalibrationCurve{
+		Tau:        tau,
+		Bins:       bins,
+		BrierScore: brier / float64(len(pts)),
+		NumKept:    len(pts),
+		NumDropped: dropped,
+	}, nil
 }
 
 // --------------------------------------------------------------- simulate
@@ -367,7 +537,19 @@ func newReportCmd() *cobra.Command {
 				return fmt.Errorf("run all policies: %w", err)
 			}
 			fmt.Fprintln(out, "\n=== Pruning baselines ===")
-			return printSimResults(out, results)
+			if err := printSimResults(out, results); err != nil {
+				return err
+			}
+
+			// 4. Cox PH on a 70/30 split, with PH check and isotonic
+			// recalibration. Failures here are non-fatal — the PH
+			// check is expected to reject for the realistic mock and
+			// we still want the EDA / KM / pruning sections to print.
+			fmt.Fprintln(out, "\n=== Cox PH (70/30 split) ===")
+			if err := runCoxFit(out, fitter, built.Intervals, 0.3, 1, 0); err != nil {
+				fmt.Fprintf(out, "cox section skipped: %v\n", err)
+			}
+			return nil
 		},
 	}
 	cmd.Flags().StringVar(&dbPath, "db", defaultDBPath, "SQLite DB path")
@@ -437,6 +619,43 @@ func printKM(w io.Writer, curves []*analysis.KMResult) error {
 		fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%s\t%.3f\t%.3f\t%.3f\n",
 			c.Label, c.N, c.NumEvents, c.NumCensored, median,
 			c.SurvAt(1_000), c.SurvAt(10_000), c.SurvAt(100_000))
+	}
+	return tw.Flush()
+}
+
+func printCoxSummary(w io.Writer, r *analysis.CoxResult) error {
+	fmt.Fprintf(w, "n=%d  events=%d  loglik=%.2f\n", r.NumObs, r.NumEvents, r.LogLike)
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "predictor\tcoef\tstd_err\tz\tp")
+	for i, name := range r.Predictors {
+		fmt.Fprintf(tw, "%s\t%+.4f\t%.4f\t%+.2f\t%.4f\n",
+			name, r.Coef[i], r.StdErr[i], r.ZScore[i], r.PValue[i])
+	}
+	return tw.Flush()
+}
+
+func printPHTest(w io.Writer, r *analysis.PHTestResult) error {
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "predictor\tp_value\tPH ok @ 0.05")
+	for _, name := range r.Predictors {
+		p := r.PerCovariatePValue[name]
+		mark := "yes"
+		if p < 0.05 {
+			mark = "NO"
+		}
+		fmt.Fprintf(tw, "%s\t%.4f\t%s\n", name, p, mark)
+	}
+	fmt.Fprintf(tw, "global\t%.4f\t%s\n", r.GlobalPValue,
+		map[bool]string{true: "yes", false: "NO"}[r.GlobalPValue >= 0.05])
+	return tw.Flush()
+}
+
+func printCalibrationCurve(w io.Writer, c *analysis.CalibrationCurve) error {
+	fmt.Fprintf(w, "kept=%d  dropped=%d  brier=%.4f\n", c.NumKept, c.NumDropped, c.BrierScore)
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "bin\tn\tpredicted\tobserved")
+	for i, b := range c.Bins {
+		fmt.Fprintf(tw, "%d\t%d\t%.3f\t%.3f\n", i+1, b.N, b.PredictedMean, b.ObservedRate)
 	}
 	return tw.Flush()
 }
