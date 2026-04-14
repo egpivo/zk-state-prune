@@ -166,13 +166,11 @@ func TestFitCoxPH_OnMockEndToEnd(t *testing.T) {
 	}
 }
 
-func TestSurvivalFitterInterface_StubsReturnNotImplemented(t *testing.T) {
-	// CheckPH and Calibrate are reserved for segments 9 and 11; the
-	// stable interface lets callers compile against the final shape now.
+func TestSurvivalFitterInterface_CalibrateStillStub(t *testing.T) {
+	// CheckPH was promoted to a real implementation in Segment 9.
+	// Calibrate is reserved for Segment 11; the stable interface lets
+	// callers compile against the final shape now.
 	f := NewStatmodelFitter()
-	if _, err := f.CheckPH(&CoxResult{}); !errors.Is(err, ErrNotImplemented) {
-		t.Errorf("CheckPH stub err=%v, want ErrNotImplemented", err)
-	}
 	if _, err := f.Calibrate(&CoxResult{}, nil); !errors.Is(err, ErrNotImplemented) {
 		t.Errorf("Calibrate stub err=%v, want ErrNotImplemented", err)
 	}

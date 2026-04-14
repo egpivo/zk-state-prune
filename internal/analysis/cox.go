@@ -39,6 +39,12 @@ type CoxResult struct {
 
 	BaselineTime   []float64
 	BaselineCumHaz []float64
+
+	// intervals is the training set, retained so post-fit diagnostics
+	// (CheckPH, calibration) don't have to be re-loaded from the DB.
+	// Phase-1 sizes (≤1e5 intervals × ~100B each) make the memory cost
+	// trivial compared with the convenience of a self-contained result.
+	intervals []model.InterAccessInterval
 }
 
 // CovarScale records the centering / scaling applied to one predictor at
@@ -129,7 +135,27 @@ func (StatmodelFitter) FitCoxPH(intervals []model.InterAccessInterval, covariate
 	t, h := ph.BaselineCumHaz(0, out.Coef)
 	out.BaselineTime = append([]float64(nil), t...)
 	out.BaselineCumHaz = append([]float64(nil), h...)
+	out.intervals = append([]model.InterAccessInterval(nil), intervals...)
 	return out, nil
+}
+
+// rawCovariate pulls a single covariate value out of an interval by
+// predictor-column name. Returns 0 for unknown names so callers don't
+// have to special-case missing optional predictors.
+func rawCovariate(it model.InterAccessInterval, name string) float64 {
+	switch name {
+	case ColAccessCount:
+		return float64(it.AccessCount)
+	case ColContractAge:
+		return float64(it.ContractAge)
+	case ColSlotAge:
+		return float64(it.SlotAge)
+	case ColContractType:
+		return float64(it.ContractType)
+	case ColSlotType:
+		return float64(it.SlotType)
+	}
+	return 0
 }
 
 // PredictAccessProb returns the probability that a slot with the given

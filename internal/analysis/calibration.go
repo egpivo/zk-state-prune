@@ -1,6 +1,14 @@
 package analysis
 
-import "github.com/egpivo/zk-state-prune/internal/model"
+import (
+	"fmt"
+	"math"
+	"sort"
+
+	"gonum.org/v1/gonum/stat/distuv"
+
+	"github.com/egpivo/zk-state-prune/internal/model"
+)
 
 // PHTestResult holds the outcome of a Schoenfeld-residual test of the
 // proportional-hazards assumption. Filled in by Segment 9.
@@ -70,10 +78,242 @@ func isotonicLookup(x, y []float64, q float64) float64 {
 	return y[lo]
 }
 
-// CheckPH runs the Schoenfeld-residuals PH-assumption test. Stub for
-// Segment 9; returns ErrNotImplemented today so callers can compile.
-func (StatmodelFitter) CheckPH(_ *CoxResult) (*PHTestResult, error) {
-	return nil, ErrNotImplemented
+// CheckPH runs a Schoenfeld-residuals proportional-hazards test on a
+// fitted Cox model. The result reports a per-covariate p-value plus a
+// Fisher-combined global p-value. Small p means the residuals correlate
+// with event time, i.e. the covariate's effect is itself time-dependent
+// and the PH assumption is violated.
+//
+// Algorithm (gap-time, right-censored, no strata):
+//
+//  1. Standardize each covariate the same way the fit did, using
+//     CoxResult.Scales. Compute the per-row linear predictor lp_i.
+//  2. Sort intervals by Duration ascending and walk *backward* so the
+//     running sums {sum_w, sum_wx_k} for the risk set R(t) are built
+//     incrementally in O(N). Tied event times are added together
+//     before any of their residuals are read so a tied event sees
+//     itself in its own risk set.
+//  3. At every observed event the Schoenfeld residual for covariate k
+//     is r_ik = z_ik − x̄_k(t_i), where the bar denotes a Cox-weighted
+//     mean over the risk set. We don't use scaled residuals — for a
+//     Phase-1 misspecification screen the raw form against time-rank
+//     is enough and avoids a second matrix inversion.
+//  4. Per covariate: Pearson correlation between residuals and the
+//     event-time *rank* (rank, not raw time, makes the test invariant
+//     to monotone time transforms — equivalent to the "transform=km"
+//     option in R's cox.zph). The t-statistic of that correlation
+//     gives the per-covariate p-value.
+//  5. Global: Fisher's method combines the per-covariate p-values into
+//     a chi-square with df = 2K.
+//
+// Phase-1 limitations to be aware of:
+//   - We assume no stratification (single baseline). When FitCoxPH
+//     grows a StrataVar, this routine has to walk per-stratum risk
+//     sets in lockstep.
+//   - Tie handling matches the Breslow approximation (one risk-set
+//     summary per tie group). Efron tie correction is not applied;
+//     for typical Phase-1 data with mostly distinct gap times the
+//     difference is negligible.
+func (StatmodelFitter) CheckPH(res *CoxResult) (*PHTestResult, error) {
+	if res == nil {
+		return nil, fmt.Errorf("CheckPH: nil CoxResult")
+	}
+	if len(res.Predictors) == 0 {
+		return nil, fmt.Errorf("CheckPH: CoxResult has no predictors")
+	}
+	if len(res.intervals) == 0 {
+		return nil, fmt.Errorf("CheckPH: CoxResult has no retained intervals")
+	}
+	K := len(res.Predictors)
+	n := len(res.intervals)
+
+	// Step 1: standardize and linear predictor.
+	z := make([][]float64, n)
+	lp := make([]float64, n)
+	for i, it := range res.intervals {
+		zi := make([]float64, K)
+		for k, name := range res.Predictors {
+			raw := rawCovariate(it, name)
+			sc := CovarScale{Std: 1}
+			if k < len(res.Scales) {
+				sc = res.Scales[k]
+			}
+			var zik float64
+			if sc.Std > 0 {
+				zik = (raw - sc.Mean) / sc.Std
+			}
+			zi[k] = zik
+			lp[i] += res.Coef[k] * zik
+		}
+		z[i] = zi
+	}
+
+	// Step 2: sort indices ascending by Duration. Tie order doesn't
+	// matter so SliceStable is the cheap choice.
+	order := make([]int, n)
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool {
+		return res.intervals[order[a]].Duration < res.intervals[order[b]].Duration
+	})
+
+	// Step 3: walk backward grouping by tied time, computing residuals.
+	// residTime[e] is the time of the e-th observed event in the order
+	// it was processed (high-to-low time). resid[e] is the K-vector of
+	// raw Schoenfeld residuals for that event. The orientation is
+	// arbitrary — the correlation with rank does not care.
+	type ev struct {
+		time float64
+		r    []float64
+	}
+	events := make([]ev, 0, n)
+
+	sumW := 0.0
+	sumWX := make([]float64, K)
+	i := n - 1
+	for i >= 0 {
+		// Find the tie group [j+1, i] sharing this time.
+		j := i
+		curT := res.intervals[order[i]].Duration
+		for j >= 0 && res.intervals[order[j]].Duration == curT {
+			j--
+		}
+		// Add every member of the tie group to the running sums
+		// before reading any of them — a tied event must see its
+		// peers in its own risk set.
+		for m := j + 1; m <= i; m++ {
+			ii := order[m]
+			w := math.Exp(lp[ii])
+			sumW += w
+			for k := 0; k < K; k++ {
+				sumWX[k] += w * z[ii][k]
+			}
+		}
+		if sumW > 0 {
+			xbar := make([]float64, K)
+			for k := 0; k < K; k++ {
+				xbar[k] = sumWX[k] / sumW
+			}
+			for m := j + 1; m <= i; m++ {
+				ii := order[m]
+				if !res.intervals[ii].IsObserved {
+					continue
+				}
+				r := make([]float64, K)
+				for k := 0; k < K; k++ {
+					r[k] = z[ii][k] - xbar[k]
+				}
+				events = append(events, ev{time: float64(curT), r: r})
+			}
+		}
+		i = j
+	}
+
+	if len(events) < 5 {
+		return nil, fmt.Errorf("CheckPH: too few observed events for PH test (%d)", len(events))
+	}
+
+	// Step 4: per-covariate Pearson correlation against time rank.
+	times := make([]float64, len(events))
+	for e := range events {
+		times[e] = events[e].time
+	}
+	ranks := averageRanks(times)
+
+	out := &PHTestResult{
+		Predictors:         append([]string(nil), res.Predictors...),
+		PerCovariatePValue: make(map[string]float64, K),
+	}
+	chi2 := 0.0
+	for k := 0; k < K; k++ {
+		col := make([]float64, len(events))
+		for e := range events {
+			col[e] = events[e].r[k]
+		}
+		rho := pearsonCorrelation(col, ranks)
+		p := correlationPValue(rho, len(events))
+		out.PerCovariatePValue[res.Predictors[k]] = p
+		// Fisher's method needs strictly positive p; clamp away from
+		// zero to keep -2 ln(p) finite.
+		if p < 1e-300 {
+			p = 1e-300
+		}
+		chi2 += -2 * math.Log(p)
+	}
+	// Step 5: global p from Fisher's combined statistic, df = 2K.
+	chi := distuv.ChiSquared{K: float64(2 * K)}
+	out.GlobalPValue = chi.Survival(chi2)
+	return out, nil
+}
+
+// pearsonCorrelation is a small zero-mean / unit-norm Pearson coefficient
+// implementation. Returns 0 when either side has zero variance to keep
+// the downstream t-test well-defined instead of producing NaN.
+func pearsonCorrelation(x, y []float64) float64 {
+	if len(x) != len(y) || len(x) < 2 {
+		return 0
+	}
+	var sx, sy float64
+	for i := range x {
+		sx += x[i]
+		sy += y[i]
+	}
+	mx := sx / float64(len(x))
+	my := sy / float64(len(y))
+	var num, dx, dy float64
+	for i := range x {
+		ax := x[i] - mx
+		ay := y[i] - my
+		num += ax * ay
+		dx += ax * ax
+		dy += ay * ay
+	}
+	if dx == 0 || dy == 0 {
+		return 0
+	}
+	return num / math.Sqrt(dx*dy)
+}
+
+// correlationPValue is a two-sided p-value for H0: ρ = 0 using the
+// standard t = ρ √((n−2) / (1−ρ²)) transform.
+func correlationPValue(rho float64, n int) float64 {
+	if n <= 2 {
+		return 1
+	}
+	if math.Abs(rho) >= 1 {
+		return 0
+	}
+	t := rho * math.Sqrt(float64(n-2)/(1-rho*rho))
+	st := distuv.StudentsT{Mu: 0, Sigma: 1, Nu: float64(n - 2)}
+	return 2 * st.Survival(math.Abs(t))
+}
+
+// averageRanks returns the rank of each input value with ties resolved
+// to the average rank of the tied positions. Output ranks are 1..n.
+// Used by CheckPH so the time axis is invariant to monotone transforms.
+func averageRanks(xs []float64) []float64 {
+	n := len(xs)
+	idx := make([]int, n)
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.SliceStable(idx, func(a, b int) bool { return xs[idx[a]] < xs[idx[b]] })
+	ranks := make([]float64, n)
+	i := 0
+	for i < n {
+		j := i
+		for j < n && xs[idx[j]] == xs[idx[i]] {
+			j++
+		}
+		// Average rank for the tied block [i, j) is (i+1 + j)/2.
+		avg := float64(i+1+j) / 2
+		for k := i; k < j; k++ {
+			ranks[idx[k]] = avg
+		}
+		i = j
+	}
+	return ranks
 }
 
 // Calibrate fits an isotonic recalibration on the holdout interval set.
