@@ -328,7 +328,7 @@ func runCoxFit(
 	if err != nil {
 		return fmt.Errorf("calibrate: %w", err)
 	}
-	postCurve, err := calibrationCurveFromCalibrated(calib, holdout, tau, 10)
+	postCurve, err := calibrationCurveFromCalibrated(calib, holdout, 10)
 	if err != nil {
 		return fmt.Errorf("post-calibration curve: %w", err)
 	}
@@ -367,7 +367,6 @@ func medianDuration(ivs []model.InterAccessInterval) float64 {
 func calibrationCurveFromCalibrated(
 	calib *analysis.CalibratedModel,
 	holdout []model.InterAccessInterval,
-	tau float64,
 	nBins int,
 ) (*analysis.CalibrationCurve, error) {
 	if calib == nil || calib.Base == nil {
@@ -376,6 +375,7 @@ func calibrationCurveFromCalibrated(
 	if nBins <= 0 {
 		nBins = 10
 	}
+	tau := calib.Tau
 	type point struct{ p, y float64 }
 	pts := make([]point, 0, len(holdout))
 	dropped := 0
@@ -390,10 +390,7 @@ func calibrationCurveFromCalibrated(
 			dropped++
 			continue
 		}
-		p := calib.PredictAccessProb(map[string]float64{
-			analysis.ColAccessCount: float64(it.AccessCount),
-			analysis.ColSlotAge:     float64(it.SlotAge),
-		}, tau)
+		p := calib.PredictAccessProbForInterval(it)
 		pts = append(pts, point{p, label})
 	}
 	if len(pts) < nBins {

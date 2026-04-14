@@ -194,14 +194,20 @@ func (r *CoxResult) PredictAccessProb(covariates map[string]float64, tau float64
 }
 
 // PredictAccessProbForInterval is a convenience wrapper that pulls
-// covariates straight off an InterAccessInterval. Used by calibration
-// and any caller that already has built intervals.
+// covariates straight off an InterAccessInterval. It iterates whatever
+// predictor set the model was fit with — hard-coding a fixed map would
+// silently zero out any predictor outside the default set (e.g. a model
+// fit with ContractType / SlotType would be evaluated on incomplete
+// covariates and return wrong probabilities).
 func (r *CoxResult) PredictAccessProbForInterval(it model.InterAccessInterval, tau float64) float64 {
-	return r.PredictAccessProb(map[string]float64{
-		ColAccessCount: float64(it.AccessCount),
-		ColContractAge: float64(it.ContractAge),
-		ColSlotAge:     float64(it.SlotAge),
-	}, tau)
+	if r == nil {
+		return 0
+	}
+	cov := make(map[string]float64, len(r.Predictors))
+	for _, name := range r.Predictors {
+		cov[name] = rawCovariate(it, name)
+	}
+	return r.PredictAccessProb(cov, tau)
 }
 
 // baselineCumHazAt is a right-continuous step lookup on a (time, H0) grid.

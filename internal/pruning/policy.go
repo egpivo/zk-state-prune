@@ -1,5 +1,18 @@
-// Package pruning hosts the pruning policy engine, the baseline simulator,
-// and the evaluation metrics that let us compare policies on a trace.
+// Package pruning hosts the tiering policy engine, the baseline simulator,
+// and the evaluation metrics used to compare policies on a trace.
+//
+// "Pruning" here is shorthand for the broader hot/cold tiering decision:
+// each slot is classified into a tier and the simulator scores how well a
+// policy trades RAM (the cost of keeping a slot hot) against the miss
+// penalty (the cost of fetching a cold slot when an access actually lands
+// on it). The cost-aware decision rule a future statistical policy will
+// minimize is the per-slot surrogate
+//
+//	d_i* = argmin_d  c(d) + ℓ(d) · p_i(τ)
+//
+// where c(d) is the per-tier holding cost, ℓ(d) the miss penalty for that
+// tier, and p_i(τ) the probability the slot is accessed within the
+// horizon τ.
 //
 // Phase 1 only ships two families of policies — NoPrune and fixed-idle-window
 // rules — which together form the baseline the statistical policy in Phase 2
@@ -13,27 +26,30 @@ import (
 	"strings"
 )
 
-// Policy is a pruning decision rule expressed on gap-time. Given the number
+// Policy is a tiering decision rule expressed on gap-time. Given the number
 // of blocks a slot has been idle (i.e. time since its last access), the
-// policy reports whether the slot is currently in the pruned state. A
-// stateless duration predicate is enough because the simulator operates on
-// inter-access intervals and can recompute idle durations directly.
+// policy reports whether the slot is currently demoted to the cold tier
+// ("pruned" in legacy field names). A stateless duration predicate is
+// enough because the simulator operates on inter-access intervals and can
+// recompute idle durations directly.
 type Policy interface {
 	// Name is used for logging, reports, and CLI selection.
 	Name() string
 
-	// IsPruned reports whether a slot idle for `idle` blocks is pruned.
-	// Must be monotone: once true for some idle, stays true for larger.
+	// IsPruned reports whether a slot idle for `idle` blocks is in the
+	// cold tier. Must be monotone: once true for some idle, stays true
+	// for larger.
 	IsPruned(idle uint64) bool
 
 	// PruneThreshold is the smallest idle duration at which the slot
-	// transitions to the pruned state. Returning 0 means "never prunes"
-	// and short-circuits savings computation in the simulator.
+	// transitions to the cold tier. Returning 0 means "never demotes"
+	// and short-circuits the cold-tier accounting in the simulator.
 	PruneThreshold() uint64
 }
 
-// NoPrune is the no-op baseline: slots live forever. Useful as the upper
-// bound on storage cost and the lower bound on false-prune rate (zero).
+// NoPrune is the all-hot baseline: slots stay in the hot tier forever.
+// Useful as the upper bound on RAM ratio and the lower bound on miss
+// rate (zero).
 type NoPrune struct{}
 
 func (NoPrune) Name() string            { return "no-prune" }

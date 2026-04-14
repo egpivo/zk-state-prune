@@ -245,7 +245,7 @@ func TestCalibratedModel_PredictAccessProb_BoundedAndMonotone(t *testing.T) {
 		p := calib.PredictAccessProb(map[string]float64{
 			ColAccessCount: ac,
 			ColSlotAge:     500,
-		}, calib.Tau)
+		})
 		if p < 0 || p > 1 {
 			t.Errorf("predict(ac=%v) = %v out of [0,1]", ac, p)
 		}
@@ -313,11 +313,11 @@ func TestCalibrate_MockTrainHoldoutEndToEnd(t *testing.T) {
 			t.Errorf("CalibratedY out of [0,1]: %v", v)
 		}
 	}
-	// Spot-check a prediction.
+	// Spot-check a prediction at the calibration horizon.
 	p := calib.PredictAccessProb(map[string]float64{
 		ColAccessCount: 1,
 		ColSlotAge:     1000,
-	}, 2_000)
+	})
 	if math.IsNaN(p) || p < 0 || p > 1 {
 		t.Errorf("PredictAccessProb out of [0,1]: %v", p)
 	}

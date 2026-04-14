@@ -42,18 +42,38 @@ type CalibratedModel struct {
 }
 
 // PredictAccessProb returns the recalibrated probability of access by
-// horizon tau for the given covariates. Until Segment 11 lands this
-// just delegates to the base model; the wrapper exists so calling code
-// can be written against the final API today.
-func (c *CalibratedModel) PredictAccessProb(covariates map[string]float64, tau float64) float64 {
+// horizon c.Tau for the given covariates.
+//
+// The horizon is fixed at fit time (CalibrateAt's tau argument) — the
+// isotonic grid only knows how to map raw predictions at exactly that
+// horizon back to empirical rates. Calling at any other tau would mean
+// looking up the wrong calibration curve, so the API does not let the
+// caller pass one. Use Base.PredictAccessProb directly for off-horizon
+// raw queries.
+func (c *CalibratedModel) PredictAccessProb(covariates map[string]float64) float64 {
 	if c == nil || c.Base == nil {
 		return 0
 	}
-	raw := c.Base.PredictAccessProb(covariates, tau)
+	raw := c.Base.PredictAccessProb(covariates, c.Tau)
 	if len(c.PredX) == 0 {
 		return raw
 	}
 	return isotonicLookup(c.PredX, c.CalibratedY, raw)
+}
+
+// PredictAccessProbForInterval is the InterAccessInterval analogue of
+// PredictAccessProb. It uses the model's full predictor set so a model
+// fit with extra covariates (ContractType, SlotType, …) does not get
+// silently evaluated on a truncated map.
+func (c *CalibratedModel) PredictAccessProbForInterval(it model.InterAccessInterval) float64 {
+	if c == nil || c.Base == nil {
+		return 0
+	}
+	cov := make(map[string]float64, len(c.Base.Predictors))
+	for _, name := range c.Base.Predictors {
+		cov[name] = rawCovariate(it, name)
+	}
+	return c.PredictAccessProb(cov)
 }
 
 // isotonicLookup is a placeholder right-continuous step lookup used until
