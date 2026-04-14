@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -9,6 +10,11 @@ import (
 
 	"github.com/egpivo/zk-state-prune/internal/model"
 )
+
+// ErrNotImplemented is returned by SurvivalFitter methods that are reserved
+// for later Phase-1 segments. Keeping the interface stable across segments
+// means upstream code can compile against the final shape today.
+var ErrNotImplemented = errors.New("not implemented")
 
 // KMResult is a fitted Kaplan–Meier curve with the diagnostics a pruning
 // policy actually needs. Time[i], Surv[i], SE[i], NumRisk[i] are aligned.
@@ -49,10 +55,24 @@ func (k *KMResult) SurvAt(t float64) float64 {
 }
 
 // SurvivalFitter abstracts the underlying survival library so we can swap
-// implementations without touching callers. Phase 1 only needs KM; the
-// interface will grow a FitCoxPH method in Phase 2.
+// implementations without touching callers. The full interface is the
+// Phase-1 final shape:
+//
+//   - FitKaplanMeier and FitCoxPH return raw fits.
+//   - CheckPH runs the Schoenfeld-residual PH-assumption test on a Cox fit
+//     and returns per-covariate p-values plus a global p-value.
+//   - Calibrate fits an isotonic recalibration on a held-out interval set
+//     and returns a CalibratedModel that overrides PredictAccessProb to
+//     emit recalibrated probabilities.
+//
+// Segments 9–11 implement CheckPH / Calibrate; today they return
+// ErrNotImplemented but the interface is already final so callers can be
+// written and tested against the eventual shape.
 type SurvivalFitter interface {
 	FitKaplanMeier(intervals []model.InterAccessInterval) (*KMResult, error)
+	FitCoxPH(intervals []model.InterAccessInterval, covariates []string) (*CoxResult, error)
+	CheckPH(result *CoxResult) (*PHTestResult, error)
+	Calibrate(result *CoxResult, holdout []model.InterAccessInterval) (*CalibratedModel, error)
 }
 
 // StatmodelFitter is the kshedden/statmodel/duration-backed implementation
