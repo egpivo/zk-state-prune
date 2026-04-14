@@ -8,7 +8,10 @@
 // without growing a stateful slot-tracking loop.
 package pruning
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // Policy is a pruning decision rule expressed on gap-time. Given the number
 // of blocks a slot has been idle (i.e. time since its last access), the
@@ -55,11 +58,17 @@ var (
 	Fixed90d = FixedIdle{Label: "fixed-90d", IdleBlocks: 648_000}
 )
 
-// PolicyByName resolves a CLI flag value into a concrete Policy. It is the
-// single entry point for `zksp simulate --policy` so that adding a new
-// policy touches one place.
+// PolicyByName resolves a CLI flag or config key into a concrete Policy.
+// It is the single entry point for `zksp simulate --policy` so that adding
+// a new policy touches one place.
+//
+// Input is normalized before lookup: the name is lowercased and underscores
+// are rewritten to dashes, so CLI idiom ("fixed-30d") and YAML idiom
+// ("fixed_30d") both resolve to the same policy. Surrounding whitespace is
+// trimmed.
 func PolicyByName(name string) (Policy, error) {
-	switch name {
+	key := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(name)), "_", "-")
+	switch key {
 	case "no-prune":
 		return NoPrune{}, nil
 	case "fixed-30d":

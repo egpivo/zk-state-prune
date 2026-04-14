@@ -116,19 +116,32 @@ func TestRun_NilPolicyError(t *testing.T) {
 
 func TestPolicyByName(t *testing.T) {
 	cases := []struct {
-		name string
-		err  bool
+		name    string
+		wantErr bool
+		// wantLabel, if non-empty, asserts the resolved policy's Name().
+		// Lets us verify that the underscore / dash / whitespace / case
+		// normalization all route to the same concrete policy.
+		wantLabel string
 	}{
-		{"no-prune", false},
-		{"fixed-30d", false},
-		{"fixed-90d", false},
-		{"statistical", true}, // Phase-2 stub
-		{"bogus", true},
+		{name: "no-prune", wantLabel: "no-prune"},
+		{name: "fixed-30d", wantLabel: "fixed-30d"},
+		{name: "fixed-90d", wantLabel: "fixed-90d"},
+		// YAML idiom with underscores must resolve identically to the
+		// canonical dashed form — this is the config/CLI bridge.
+		{name: "fixed_30d", wantLabel: "fixed-30d"},
+		{name: "fixed_90d", wantLabel: "fixed-90d"},
+		{name: "  Fixed-30d  ", wantLabel: "fixed-30d"},
+		{name: "statistical", wantErr: true}, // Phase-2 stub
+		{name: "bogus", wantErr: true},
 	}
 	for _, c := range cases {
-		_, err := PolicyByName(c.name)
-		if (err != nil) != c.err {
-			t.Errorf("PolicyByName(%q) err=%v want err=%v", c.name, err, c.err)
+		p, err := PolicyByName(c.name)
+		if (err != nil) != c.wantErr {
+			t.Errorf("PolicyByName(%q) err=%v want err=%v", c.name, err, c.wantErr)
+			continue
+		}
+		if err == nil && c.wantLabel != "" && p.Name() != c.wantLabel {
+			t.Errorf("PolicyByName(%q).Name() = %q, want %q", c.name, p.Name(), c.wantLabel)
 		}
 	}
 }

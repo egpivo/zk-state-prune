@@ -30,13 +30,16 @@ pruning:
     storage_per_slot_bytes: 64
     reactivation_proof_cost: 1.0
     false_prune_penalty: 10.0
+  # Policy keys below are the same strings accepted by `zksp simulate
+  # --policy` and by pruning.PolicyByName. Dashes are canonical; the
+  # factory also tolerates the YAML-idiomatic underscore form.
   policies:
     statistical:
       survival_threshold: 0.05   # prune when P(next access > horizon) < threshold
       horizon_blocks: 100000
-    fixed_30d:
+    fixed-30d:
       idle_blocks: 216000        # ~30 days at 12s blocks
-    fixed_90d:
+    fixed-90d:
       idle_blocks: 648000
 
 logging:

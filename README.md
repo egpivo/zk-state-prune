@@ -43,7 +43,7 @@ exactly when its expected reactivation cost falls below its storage cost.
 zksp extract  --source <rpc|file|mock> --output <db_path>
 zksp eda      --db <db_path> --output <report_dir>
 zksp fit      --db <db_path> --model <km|cox>
-zksp simulate --db <db_path> --policy <statistical|fixed-30d|fixed-90d|no-prune>
+zksp simulate --db <db_path> --policy <no-prune|fixed-30d|fixed-90d>   # statistical: Phase 2
 zksp report   --db <db_path> --output <report_dir>
 ```
 
