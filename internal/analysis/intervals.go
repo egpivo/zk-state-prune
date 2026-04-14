@@ -14,12 +14,23 @@ import (
 )
 
 // IntervalBuildResult bundles the interval set with the diagnostics the EDA
-// report needs. RightCensored / LeftTruncated are counts, not rates, so the
-// consumer can format them as either.
+// report needs. All fields are raw counts; consumers format them as rates.
 type IntervalBuildResult struct {
 	Intervals     []model.InterAccessInterval
 	RightCensored int
-	LeftTruncated int
+	// LeftTruncatedIntervals counts intervals that carry IsLeftTrunc=true,
+	// i.e. intervals that use Window.Start as a surrogate prior access.
+	// This is the right input for Cox models that filter on the flag.
+	LeftTruncatedIntervals int
+	// LeftTruncatedSlots counts distinct slots whose creation block
+	// precedes Window.Start, regardless of whether any emitted interval
+	// ended up carrying IsLeftTrunc=true. A left-truncated slot whose
+	// first visible event sits exactly on Window.Start has its opener
+	// consumed by the entry fast-path and contributes zero LT intervals,
+	// but it is still a left-truncated slot for diagnostic purposes.
+	// Use this field for the plan's "left_truncated_count / total_slots"
+	// metric.
+	LeftTruncatedSlots int
 	// SlotsWithNoEvents counts slots that existed during the window but were
 	// never touched in it. Each contributes exactly one fully-censored
 	// interval [entry, window.End].
@@ -129,8 +140,18 @@ func BuildIntervals(
 				res.RightCensored++
 			}
 			if lt {
-				res.LeftTruncated++
+				res.LeftTruncatedIntervals++
 			}
+		}
+
+		if leftTrunc {
+			// Count the slot as left-truncated up front, regardless of
+			// whether the emit loop below ends up flagging any individual
+			// interval. The entry fast-path may consume the first event
+			// and leave no interval with IsLeftTrunc=true, but the slot
+			// still pre-existed the window and should appear in the
+			// diagnostic "slots whose history we can't see the start of".
+			res.LeftTruncatedSlots++
 		}
 
 		if len(inWindow) == 0 {

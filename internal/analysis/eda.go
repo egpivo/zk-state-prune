@@ -32,9 +32,9 @@ type EDAReport struct {
 
 	// Censoring diagnostics. Rate is a fraction in [0,1].
 	TotalIntervals     int
-	RightCensoredCount int
+	RightCensoredCount int // interval-level
 	RightCensoredRate  float64
-	LeftTruncatedCount int
+	LeftTruncatedCount int // slot-level (distinct slots with CreatedAt < Window.Start)
 	LeftTruncatedRate  float64
 	SlotsWithNoEvents  int
 	SlotsSkipped       int
@@ -165,7 +165,7 @@ func summarize(built IntervalBuildResult, window model.ObservationWindow) *EDARe
 		BySlotType:         make(map[model.SlotType]SlotTypeSummary, len(bySlot)),
 		TotalIntervals:     n,
 		RightCensoredCount: built.RightCensored,
-		LeftTruncatedCount: built.LeftTruncated,
+		LeftTruncatedCount: built.LeftTruncatedSlots,
 		SlotsWithNoEvents:  built.SlotsWithNoEvents,
 		SlotsSkipped:       built.SlotsSkipped,
 		SlotCount:          len(slotFreq),
@@ -174,7 +174,7 @@ func summarize(built IntervalBuildResult, window model.ObservationWindow) *EDARe
 		report.RightCensoredRate = float64(built.RightCensored) / float64(n)
 	}
 	if report.SlotCount > 0 {
-		report.LeftTruncatedRate = float64(built.LeftTruncated) / float64(report.SlotCount)
+		report.LeftTruncatedRate = float64(built.LeftTruncatedSlots) / float64(report.SlotCount)
 	}
 	for cat, agg := range byCat {
 		cr := 0.0

@@ -97,8 +97,9 @@ func TestBuildIntervals_AllObserved(t *testing.T) {
 	if res.RightCensored != 1 {
 		t.Errorf("RightCensored=%d want 1", res.RightCensored)
 	}
-	if res.LeftTruncated != 0 {
-		t.Errorf("LeftTruncated=%d want 0", res.LeftTruncated)
+	if res.LeftTruncatedIntervals != 0 || res.LeftTruncatedSlots != 0 {
+		t.Errorf("LT intervals=%d slots=%d want 0,0",
+			res.LeftTruncatedIntervals, res.LeftTruncatedSlots)
 	}
 }
 
@@ -146,8 +147,9 @@ func TestBuildIntervals_LeftTruncated(t *testing.T) {
 	if !first.IsLeftTrunc || first.IntervalStart != 100 || first.IntervalEnd != 150 {
 		t.Errorf("first interval wrong: %+v", first)
 	}
-	if res.LeftTruncated != 1 {
-		t.Errorf("LeftTruncated=%d want 1", res.LeftTruncated)
+	if res.LeftTruncatedIntervals != 1 || res.LeftTruncatedSlots != 1 {
+		t.Errorf("LT intervals=%d slots=%d want 1,1",
+			res.LeftTruncatedIntervals, res.LeftTruncatedSlots)
 	}
 	if res.RightCensored != 1 {
 		t.Errorf("RightCensored=%d want 1", res.RightCensored)
@@ -168,6 +170,33 @@ func TestBuildIntervals_SlotBornAfterWindow(t *testing.T) {
 	}
 	if res.SlotsSkipped != 1 {
 		t.Errorf("SlotsSkipped=%d want 1", res.SlotsSkipped)
+	}
+}
+
+func TestBuildIntervals_LTCountedEvenWhenFirstEventOnWindowStart(t *testing.T) {
+	// Regression: left-truncated slot whose first visible access lands
+	// exactly on Window.Start. The entry fast-path consumes the opener
+	// so no emitted interval carries IsLeftTrunc=true, but the slot must
+	// still be counted as left-truncated at the slot-level diagnostic.
+	ctx := context.Background()
+	db := openDB(t)
+	seed(t, db, "s1", 50 /*pre-window*/, 100 /*==Window.Start*/, 300)
+
+	res, err := BuildIntervals(ctx, db, model.ObservationWindow{Start: 100, End: 500})
+	if err != nil {
+		t.Fatalf("BuildIntervals: %v", err)
+	}
+	// No interval should have IsLeftTrunc=true under this fast-path.
+	for _, it := range res.Intervals {
+		if it.IsLeftTrunc {
+			t.Errorf("did not expect any LT interval, got %+v", it)
+		}
+	}
+	if res.LeftTruncatedIntervals != 0 {
+		t.Errorf("LeftTruncatedIntervals=%d want 0", res.LeftTruncatedIntervals)
+	}
+	if res.LeftTruncatedSlots != 1 {
+		t.Errorf("LeftTruncatedSlots=%d want 1", res.LeftTruncatedSlots)
 	}
 }
 
