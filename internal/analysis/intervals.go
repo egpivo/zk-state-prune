@@ -72,21 +72,31 @@ func BuildIntervals(
 			leftTrunc = true
 		}
 
-		// The extractor inserts events in any order across slots but we
-		// asked storage to sort by (slot_id, block_number), so the per-slot
-		// stream is already ordered. Still, be defensive about duplicates
-		// at the boundary.
+		// Collect in-window events and dedupe same-block touches. Multiple
+		// accesses to one slot inside the same block (intra-tx read+write,
+		// co-access buddies injected by the mock, etc.) count as ONE
+		// logical event for survival purposes: treating them as distinct
+		// would emit Duration=0 intervals, which (a) skew IAT summaries
+		// toward zero and (b) are fragile inputs for KM/Cox libraries that
+		// assume strictly positive durations or need explicit tie handling.
+		// Storage already hands us events sorted by (slot_id, block_number),
+		// so "previous block equals current block" is sufficient for dedup.
 		inWindow := make([]uint64, 0, len(events))
+		var prevBlock uint64
+		havePrev := false
 		for _, e := range events {
 			if !window.Contains(e.BlockNumber) {
 				continue
 			}
 			if e.BlockNumber < entry {
-				// Event precedes the slot's effective entry (can happen
-				// if CreatedAt was wrong); clamp.
+				continue
+			}
+			if havePrev && e.BlockNumber == prevBlock {
 				continue
 			}
 			inWindow = append(inWindow, e.BlockNumber)
+			prevBlock = e.BlockNumber
+			havePrev = true
 		}
 
 		slotAgeAt := func(t uint64) uint64 {
@@ -129,13 +139,28 @@ func BuildIntervals(
 			return nil
 		}
 
-		// First interval: entry → first event. Left-truncated iff the slot
-		// pre-existed the window.
+		// If the first in-window event coincides with the slot's entry
+		// block (e.g. CreatedAt == first access, or a left-truncated slot
+		// whose first visible touch is Window.Start) the "entry → first"
+		// interval has zero length and carries no information. Consume
+		// the event as the chain's starting reference and emit gap-time
+		// intervals from there. Left-truncation attribution flows to the
+		// first *emitted* interval, so if we skip the degenerate opener
+		// no interval for this slot inherits the LT flag — which matches
+		// reality: once we've seen a real access at window.Start, the
+		// remaining gaps are honest gap times, not truncated.
 		prev := entry
 		accessCount := uint64(0)
-		for i, blk := range inWindow {
+		startIdx := 0
+		if inWindow[0] == entry {
+			prev = inWindow[0]
+			accessCount = 1
+			startIdx = 1
+		}
+		for i := startIdx; i < len(inWindow); i++ {
+			blk := inWindow[i]
 			lt := false
-			if i == 0 {
+			if i == startIdx && startIdx == 0 {
 				lt = leftTrunc
 			}
 			emit(prev, blk, true, lt, accessCount)
@@ -144,7 +169,9 @@ func BuildIntervals(
 		}
 		// Trailing censored interval from the final in-window event to
 		// window.End. Never left-truncated (slot is already in the risk
-		// set at this point).
+		// set at this point). accessCount now equals the total number of
+		// unique in-window access blocks for this slot, so downstream EDA
+		// can recover "accesses per slot" without retaining raw events.
 		emit(prev, window.End, false, false, accessCount)
 		return nil
 	})

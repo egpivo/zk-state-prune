@@ -171,6 +171,77 @@ func TestBuildIntervals_SlotBornAfterWindow(t *testing.T) {
 	}
 }
 
+func TestBuildIntervals_DedupesSameBlockEvents(t *testing.T) {
+	ctx := context.Background()
+	db := openDB(t)
+	// Three "events" at the same block 200 collapse to one logical touch.
+	seed(t, db, "s1", 100, 200, 200, 200, 400)
+
+	res, err := BuildIntervals(ctx, db, model.ObservationWindow{Start: 100, End: 500})
+	if err != nil {
+		t.Fatalf("BuildIntervals: %v", err)
+	}
+	// After dedupe: effective events [200, 400]. Intervals:
+	//   [100,200] obs, [200,400] obs, [400,500] censored → 3 total.
+	if got := len(res.Intervals); got != 3 {
+		t.Fatalf("len=%d want 3: %+v", got, res.Intervals)
+	}
+	for i, it := range res.Intervals {
+		if it.Duration == 0 {
+			t.Errorf("interval[%d] has Duration=0: %+v", i, it)
+		}
+	}
+}
+
+func TestBuildIntervals_FirstEventAtEntryIsConsumed(t *testing.T) {
+	ctx := context.Background()
+	db := openDB(t)
+	// CreatedAt == first event block; the degenerate [100,100] interval
+	// must be elided, leaving only the gap [100,200] and trailing censor.
+	seed(t, db, "s1", 100, 100, 200)
+
+	res, err := BuildIntervals(ctx, db, model.ObservationWindow{Start: 100, End: 500})
+	if err != nil {
+		t.Fatalf("BuildIntervals: %v", err)
+	}
+	if got := len(res.Intervals); got != 2 {
+		t.Fatalf("len=%d want 2: %+v", got, res.Intervals)
+	}
+	for _, it := range res.Intervals {
+		if it.Duration == 0 {
+			t.Errorf("unexpected zero-duration interval: %+v", it)
+		}
+	}
+	// AccessCount invariant: the trailing censored interval's
+	// AccessCount must equal the true number of in-window accesses (2).
+	last := res.Intervals[len(res.Intervals)-1]
+	if last.IsObserved || last.AccessCount != 2 {
+		t.Errorf("trailing interval = %+v, want censored ac=2", last)
+	}
+}
+
+func TestBuildIntervals_NoZeroDurationOnMockBurst(t *testing.T) {
+	// Seed a slot with many co-accesses clumped in a few blocks, which is
+	// what the mock extractor's intra-contract correlation pass produces.
+	// Every emitted interval must have Duration > 0.
+	ctx := context.Background()
+	db := openDB(t)
+	seed(t, db, "s1", 100, 120, 120, 120, 121, 130, 130, 200, 200, 300)
+
+	res, err := BuildIntervals(ctx, db, model.ObservationWindow{Start: 100, End: 500})
+	if err != nil {
+		t.Fatalf("BuildIntervals: %v", err)
+	}
+	if len(res.Intervals) == 0 {
+		t.Fatalf("no intervals")
+	}
+	for i, it := range res.Intervals {
+		if it.Duration == 0 {
+			t.Errorf("interval[%d] Duration=0: %+v", i, it)
+		}
+	}
+}
+
 func TestBuildIntervals_CovariatesAtIntervalStart(t *testing.T) {
 	ctx := context.Background()
 	db := openDB(t)

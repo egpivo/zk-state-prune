@@ -92,8 +92,16 @@ func summarize(built IntervalBuildResult, window model.ObservationWindow) *EDARe
 	intervals := built.Intervals
 	n := len(intervals)
 
-	// Per-slot access count inside the window: count of observed intervals
-	// per slot (right-censored trailing interval does not count as an event).
+	// Per-slot access count inside the window. We cannot simply count
+	// observed intervals here: when BuildIntervals skips a degenerate
+	// entry-equal-first interval the first access is consumed silently
+	// and the observed-interval count is (total_accesses - 1) rather
+	// than total. Instead we use the invariant that every interval's
+	// AccessCount field holds the cumulative access count up to its
+	// start, so `AccessCount + [observed?1:0]` equals the access count
+	// immediately after this interval. Taking the per-slot maximum of
+	// that quantity recovers the true in-window access total, which is
+	// what the frequency distribution should summarize.
 	slotFreq := make(map[string]int)
 	// Observed-only durations, used for IAT summary. Censored durations
 	// would bias the mean/percentiles downward, so they're excluded from
@@ -104,9 +112,14 @@ func summarize(built IntervalBuildResult, window model.ObservationWindow) *EDARe
 	bySlot := make(map[model.SlotType]*stAgg)
 
 	for _, it := range intervals {
-		slotFreq[it.SlotID] = slotFreq[it.SlotID] // ensure key exists
+		total := int(it.AccessCount)
 		if it.IsObserved {
-			slotFreq[it.SlotID]++
+			total++
+		}
+		if v, ok := slotFreq[it.SlotID]; !ok || v < total {
+			slotFreq[it.SlotID] = total
+		}
+		if it.IsObserved {
 			iat = append(iat, float64(it.Duration))
 		}
 		cat := getOrInit(byCat, it.ContractType)

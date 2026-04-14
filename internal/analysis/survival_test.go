@@ -218,12 +218,10 @@ func TestFitKaplanMeierStratified_OnMock(t *testing.T) {
 				break
 			}
 		}
-		// SurvAt should be bounded in [0,1] and non-increasing under
-		// larger probes. A minority of intervals have Duration==0
-		// (legitimate intra-block co-accesses), so S(0) can legitimately
-		// sit below 1.
-		if s := c.SurvAt(0); s < 0.5 || s > 1.0 {
-			t.Errorf("%s: SurvAt(0)=%v out of [0.5,1]", label, s)
+		// After the interval builder's same-block dedup + entry-skip
+		// fixes, no interval has Duration==0, so S(0) must be exactly 1.
+		if s := c.SurvAt(0); s != 1 {
+			t.Errorf("%s: SurvAt(0)=%v, want 1", label, s)
 		}
 		if s0, s1 := c.SurvAt(0), c.SurvAt(1e9); s1 > s0+1e-9 {
 			t.Errorf("%s: SurvAt(∞)=%v > SurvAt(0)=%v", label, s1, s0)
