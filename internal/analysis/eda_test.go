@@ -70,10 +70,15 @@ func TestRunEDA_LeftTruncationDetected(t *testing.T) {
 	if rep.LeftTruncatedCount == 0 {
 		t.Fatalf("expected left-truncated slots, got zero")
 	}
-	// LeftTruncatedRate is per slot. Every slot pre-exists the window →
-	// rate should be 1.0.
-	if rep.LeftTruncatedRate < 0.99 {
-		t.Errorf("LeftTruncatedRate = %v, want ~1.0", rep.LeftTruncatedRate)
+	// With Phase-2's "slot.CreatedAt = first-event-block" semantics, a
+	// slot is left-truncated iff its first visible touch lands before
+	// Window.Start — not iff its parent contract was deployed there.
+	// Even with PreWindowSlotFraction=1.0 that's typically 30–70% of
+	// slots depending on how many events a slot receives. Assert the
+	// diagnostic fires on a meaningful share rather than the strict
+	// "≈ 1.0" the Phase-1 semantics guaranteed.
+	if rep.LeftTruncatedRate < 0.2 {
+		t.Errorf("LeftTruncatedRate = %v, want > 0.2", rep.LeftTruncatedRate)
 	}
 }
 

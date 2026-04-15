@@ -1,7 +1,9 @@
 package analysis
 
 import (
+	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math"
 
 	"github.com/kshedden/statmodel/duration"
@@ -55,20 +57,71 @@ type CovarScale struct {
 	Std  float64
 }
 
-// DefaultCoxPredictors is the predictor set used by Phase-1 callers that
-// don't want to think about which columns to feed Cox. They are the
-// continuous covariates that the interval builder snapshots at
-// IntervalStart, which are the things an online pruning policy could
-// realistically read off the live state.
+// MarshalJSON renders a CoxResult safely for encoding/json: NaN and
+// Inf float fields (which the encoder refuses to serialize) are
+// rewritten as null. Partial fits from gonum's linesearch often leave
+// StdErr / PValue / ZScore padded with NaN, and log-likelihood can
+// be -Inf on degenerate inputs.
+func (r *CoxResult) MarshalJSON() ([]byte, error) {
+	nullable := func(xs []float64) []*float64 {
+		out := make([]*float64, len(xs))
+		for i, v := range xs {
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				continue
+			}
+			vv := v
+			out[i] = &vv
+		}
+		return out
+	}
+	scalar := func(v float64) *float64 {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return nil
+		}
+		vv := v
+		return &vv
+	}
+	type alias struct {
+		Predictors     []string     `json:"Predictors"`
+		Coef           []*float64   `json:"Coef"`
+		StdErr         []*float64   `json:"StdErr"`
+		PValue         []*float64   `json:"PValue"`
+		ZScore         []*float64   `json:"ZScore"`
+		LogLike        *float64     `json:"LogLike"`
+		NumObs         int          `json:"NumObs"`
+		NumEvents      int          `json:"NumEvents"`
+		Scales         []CovarScale `json:"Scales"`
+		BaselineTime   []float64    `json:"BaselineTime"`
+		BaselineCumHaz []float64    `json:"BaselineCumHaz"`
+	}
+	return json.Marshal(alias{
+		Predictors:     r.Predictors,
+		Coef:           nullable(r.Coef),
+		StdErr:         nullable(r.StdErr),
+		PValue:         nullable(r.PValue),
+		ZScore:         nullable(r.ZScore),
+		LogLike:        scalar(r.LogLike),
+		NumObs:         r.NumObs,
+		NumEvents:      r.NumEvents,
+		Scales:         r.Scales,
+		BaselineTime:   r.BaselineTime,
+		BaselineCumHaz: r.BaselineCumHaz,
+	})
+}
+
+// DefaultCoxPredictors is the predictor set used by callers that don't
+// want to think about which columns to feed Cox. They are the continuous
+// covariates that the interval builder snapshots at IntervalStart, which
+// are the things an online tiering policy could realistically read off
+// the live state.
 //
-// ContractAge is intentionally absent: in Phase-1 BuildIntervals does not
-// yet fetch a slot's parent contract deploy block, so it falls back to
-// using slot.CreatedAt for both ages, making ContractAge perfectly
-// collinear with SlotAge. Feeding both to Cox produces a singular
-// Hessian and a non-convergent fit. We add ContractAge back the moment
-// IterateSlotEvents surfaces deploy_block — see the TODO in
-// internal/analysis/intervals.go's contractAgeAt closure.
-var DefaultCoxPredictors = []string{ColAccessCount, ColSlotAge}
+// ContractAge re-joins the set in Phase 2 now that storage surfaces
+// contracts.deploy_block via SlotWithMeta.DeployBlock and the mock
+// extractor sets slot.CreatedAt to the slot's first event block. Those
+// two changes together make ContractAge ≥ SlotAge with strict inequality
+// in the typical case, removing the Phase-1 collinearity that gave the
+// optimizer a singular Hessian.
+var DefaultCoxPredictors = []string{ColAccessCount, ColContractAge, ColSlotAge}
 
 // FitCoxPH fits a Cox proportional-hazards model on intervals using
 // kshedden/statmodel/duration. predictors is the ordered list of column
@@ -107,25 +160,70 @@ func (StatmodelFitter) FitCoxPH(intervals []model.InterAccessInterval, covariate
 	ds := statmodel.NewDataset(cols, names)
 	cfg := duration.DefaultPHRegConfig()
 	cfg.EntryVar = ColEntry
+	// Light L2 ridge on every predictor. ContractAge and SlotAge are
+	// structurally correlated (a slot can only exist from deploy block
+	// onwards) so the unregularized Hessian can become nearly singular
+	// on smaller datasets, especially after a train/holdout split.
+	// A 1e-6 penalty is small enough to leave coefficient estimates
+	// essentially unchanged on well-conditioned data but large enough
+	// to keep the optimizer stable when the covariates crowd together.
+	cfg.L2Penalty = make(map[string]float64, len(covariates))
+	for _, p := range covariates {
+		cfg.L2Penalty[p] = 1e-6
+	}
 
 	ph, err := duration.NewPHReg(ds, ColDuration, ColStatus, covariates, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("NewPHReg: %w", err)
 	}
-	res, err := ph.Fit()
-	if err != nil {
-		return nil, fmt.Errorf("Fit: %w", err)
+	// gonum's optimizer occasionally returns a "linesearch: failed to
+	// converge" error together with a partial PHResults: the gradient
+	// has essentially vanished but a zero-length step couldn't satisfy
+	// the Wolfe conditions. Those partial fits are almost always
+	// usable, so we accept any non-nil result and only error out when
+	// the library returns nil (the fit truly failed). A slog warning
+	// keeps the event visible downstream without killing the pipeline.
+	res, fitErr := ph.Fit()
+	if res == nil {
+		return nil, fmt.Errorf("Fit: %w", fitErr)
+	}
+	if fitErr != nil {
+		slog.Warn("cox optimizer returned non-fatal error, using partial fit", "err", fitErr)
+	}
+	// Guard against NaN / Inf in the partial coefficients that would
+	// poison every downstream consumer (calibration, conformal…).
+	for i, c := range res.Params() {
+		if math.IsNaN(c) || math.IsInf(c, 0) {
+			return nil, fmt.Errorf("Fit: coef[%d] not finite (%v); err=%v", i, c, fitErr)
+		}
 	}
 
+	// Partial fits populate Params() but leave StdErr()/PValues()/ZScores()
+	// empty because the optimizer bailed before the covariance step.
+	// Pad to len(covariates) with NaN so consumers can index safely and
+	// the text printer renders "NaN" rather than segfaulting.
 	out := &CoxResult{
 		Predictors: append([]string(nil), covariates...),
 		Coef:       append([]float64(nil), res.Params()...),
-		StdErr:     append([]float64(nil), res.StdErr()...),
-		PValue:     append([]float64(nil), res.PValues()...),
-		ZScore:     append([]float64(nil), res.ZScores()...),
+		StdErr:     padOrCopy(res.StdErr(), len(covariates)),
+		PValue:     padOrCopy(res.PValues(), len(covariates)),
+		ZScore:     padOrCopy(res.ZScores(), len(covariates)),
 		LogLike:    res.LogLike(),
 		NumObs:     len(intervals),
 		Scales:     scales,
+	}
+	// Coef may also be shorter than covariates on a very-early bailout;
+	// pad to keep every slice the same length for consumers.
+	if len(out.Coef) < len(covariates) {
+		padded := make([]float64, len(covariates))
+		for i := range padded {
+			if i < len(out.Coef) {
+				padded[i] = out.Coef[i]
+			} else {
+				padded[i] = math.NaN()
+			}
+		}
+		out.Coef = padded
 	}
 	for _, it := range intervals {
 		if it.IsObserved {
@@ -137,6 +235,21 @@ func (StatmodelFitter) FitCoxPH(intervals []model.InterAccessInterval, covariate
 	out.BaselineCumHaz = append([]float64(nil), h...)
 	out.intervals = append([]model.InterAccessInterval(nil), intervals...)
 	return out, nil
+}
+
+// padOrCopy returns a copy of xs padded out to length n with NaN.
+// Used to normalize statmodel partial-fit outputs where optional
+// fields (StdErr, PValues, ZScores) may come back empty.
+func padOrCopy(xs []float64, n int) []float64 {
+	out := make([]float64, n)
+	for i := range out {
+		if i < len(xs) {
+			out[i] = xs[i]
+		} else {
+			out[i] = math.NaN()
+		}
+	}
+	return out
 }
 
 // rawCovariate pulls a single covariate value out of an interval by
@@ -158,19 +271,12 @@ func rawCovariate(it model.InterAccessInterval, name string) float64 {
 	return 0
 }
 
-// PredictAccessProb returns the probability that a slot with the given
-// raw covariate vector is accessed within the next tau blocks, assuming
-// it has just been touched (idle = 0).
-//
-//	S(t | x) = exp(-H_0(t) * exp(x'β))
-//	P(access by t) = 1 - S(t | x)
-//
-// covariates must be keyed by predictor name and contain at least the
-// keys in r.Predictors. Missing keys are treated as zero (post-scaling
-// equivalent to "the population mean") so callers can omit ones they
-// don't have on hand.
-func (r *CoxResult) PredictAccessProb(covariates map[string]float64, tau float64) float64 {
-	if r == nil || len(r.BaselineTime) == 0 {
+// linearPredictor computes the standardized x'β for an interval or a
+// caller-provided covariate map, using the scaling parameters stored at
+// fit time. Centralized so PredictAccessProb and SurvivalAt stay
+// numerically consistent.
+func (r *CoxResult) linearPredictor(covariates map[string]float64) float64 {
+	if r == nil {
 		return 0
 	}
 	lp := 0.0
@@ -182,15 +288,50 @@ func (r *CoxResult) PredictAccessProb(covariates map[string]float64, tau float64
 		}
 		lp += r.Coef[i] * z
 	}
-	h := baselineCumHazAt(r.BaselineTime, r.BaselineCumHaz, tau)
-	surv := math.Exp(-h * math.Exp(lp))
-	if surv < 0 {
-		surv = 0
+	return lp
+}
+
+// Survival returns S(t | x) for the raw Cox baseline, clipped to [0, 1].
+//
+//	S(t | x) = exp(-H_0(t) * exp(x'β))
+//
+// Use this rather than PredictAccessProb when you need the survival
+// curve at arbitrary t (e.g. the tiering policy's conditional-survival
+// search). PredictAccessProb at time τ is equivalent to 1 − Survival(τ).
+func (r *CoxResult) Survival(covariates map[string]float64, t float64) float64 {
+	if r == nil || len(r.BaselineTime) == 0 {
+		return 1
 	}
-	if surv > 1 {
-		surv = 1
+	lp := r.linearPredictor(covariates)
+	h := baselineCumHazAt(r.BaselineTime, r.BaselineCumHaz, t)
+	s := math.Exp(-h * math.Exp(lp))
+	if s < 0 {
+		return 0
 	}
-	return 1 - surv
+	if s > 1 {
+		return 1
+	}
+	return s
+}
+
+// SurvivalForInterval is the InterAccessInterval analogue of Survival.
+// Uses the full predictor set fit on the model.
+func (r *CoxResult) SurvivalForInterval(it model.InterAccessInterval, t float64) float64 {
+	if r == nil {
+		return 1
+	}
+	cov := make(map[string]float64, len(r.Predictors))
+	for _, name := range r.Predictors {
+		cov[name] = rawCovariate(it, name)
+	}
+	return r.Survival(cov, t)
+}
+
+// PredictAccessProb returns the probability that a slot with the given
+// raw covariate vector is accessed within the next tau blocks, assuming
+// it has just been touched (idle = 0). Thin wrapper around Survival.
+func (r *CoxResult) PredictAccessProb(covariates map[string]float64, tau float64) float64 {
+	return 1 - r.Survival(covariates, tau)
 }
 
 // PredictAccessProbForInterval is a convenience wrapper that pulls

@@ -42,6 +42,13 @@ type EDAReport struct {
 	// SlotCount is the number of slots that contributed at least one
 	// interval (i.e. had any risk exposure inside the window).
 	SlotCount int
+
+	// Spatial and Temporal are optional sub-reports, filled in by
+	// RunEDAFull when the caller also wants the spatial / temporal
+	// analysis passes. RunEDA leaves them nil to keep the fast path
+	// fast; the JSON envelope omits them via omitempty.
+	Spatial  *SpatialReport  `json:"spatial,omitempty"`
+	Temporal *TemporalReport `json:"temporal,omitempty"`
 }
 
 // DistributionSummary is a compact first-moment / tail summary. We keep it
@@ -77,6 +84,27 @@ type SlotTypeSummary struct {
 	Intervals          int
 	InterAccessTime    DistributionSummary
 	RightCensoredRate  float64
+}
+
+// RunEDAFull runs the full EDA pass plus spatial and temporal analyses.
+// Callers that don't care about the spatiotemporal sections can use
+// RunEDA and save one storage scan per extra pass.
+func RunEDAFull(ctx context.Context, db *storage.DB, window model.ObservationWindow) (*EDAReport, error) {
+	rep, err := RunEDA(ctx, db, window)
+	if err != nil {
+		return nil, err
+	}
+	spatial, err := RunSpatial(ctx, db, window)
+	if err != nil {
+		return nil, fmt.Errorf("spatial: %w", err)
+	}
+	temporal, err := RunTemporal(ctx, db, window)
+	if err != nil {
+		return nil, fmt.Errorf("temporal: %w", err)
+	}
+	rep.Spatial = spatial
+	rep.Temporal = temporal
+	return rep, nil
 }
 
 // RunEDA builds intervals for the given window and produces an EDAReport.

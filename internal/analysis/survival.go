@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -28,6 +29,39 @@ type KMResult struct {
 	// MedianSurv is the smallest sampled time t with Surv(t) <= 0.5, or
 	// NaN if the curve never crosses 0.5 (heavy censoring).
 	MedianSurv float64
+}
+
+// MarshalJSON renders a KMResult safely for `encoding/json`, replacing
+// the NaN-valued MedianSurv (which Go's encoder refuses to emit) with
+// a JSON `null`. Every other field is a plain numeric or slice and
+// marshals with default semantics.
+func (k *KMResult) MarshalJSON() ([]byte, error) {
+	type alias struct {
+		Label       string    `json:"label"`
+		N           int       `json:"n"`
+		NumEvents   int       `json:"num_events"`
+		NumCensored int       `json:"num_censored"`
+		Time        []float64 `json:"time"`
+		Surv        []float64 `json:"surv"`
+		SE          []float64 `json:"se"`
+		NumRisk     []float64 `json:"num_risk"`
+		MedianSurv  *float64  `json:"median_surv"`
+	}
+	out := alias{
+		Label:       k.Label,
+		N:           k.N,
+		NumEvents:   k.NumEvents,
+		NumCensored: k.NumCensored,
+		Time:        k.Time,
+		Surv:        k.Surv,
+		SE:          k.SE,
+		NumRisk:     k.NumRisk,
+	}
+	if !math.IsNaN(k.MedianSurv) && !math.IsInf(k.MedianSurv, 0) {
+		v := k.MedianSurv
+		out.MedianSurv = &v
+	}
+	return json.Marshal(out)
 }
 
 // SurvAt returns S(t) via right-continuous step interpolation. For t before

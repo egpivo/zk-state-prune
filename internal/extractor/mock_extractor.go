@@ -206,8 +206,16 @@ func (m *MockExtractor) Extract(ctx context.Context, db *storage.DB) error {
 			perSlotEvents[j] = blocks
 			totalEvents += uint64(n)
 
+			// Slot creation block is the *first* event the slot ever
+			// receives, not the contract's deploy block — a storage
+			// slot only exists once it has been written to. Modelling
+			// it this way makes ContractAge and SlotAge naturally
+			// distinct (ContractAge ≥ SlotAge), which is what the Cox
+			// fit needs to keep both predictors non-collinear.
+			createdAt := deployBlock
 			lastAccess := deployBlock
 			if len(blocks) > 0 {
+				createdAt = minU64(blocks)
 				lastAccess = maxU64(blocks)
 			}
 			slots = append(slots, model.StateSlot{
@@ -215,7 +223,7 @@ func (m *MockExtractor) Extract(ctx context.Context, db *storage.DB) error {
 				ContractAddr: addr,
 				SlotIndex:    uint64(j),
 				SlotType:     slotType,
-				CreatedAt:    deployBlock,
+				CreatedAt:    createdAt,
 				LastAccess:   lastAccess,
 				AccessCount:  uint64(len(blocks)),
 				IsActive:     true,
@@ -458,6 +466,16 @@ func maxU64(xs []uint64) uint64 {
 	m := xs[0]
 	for _, x := range xs[1:] {
 		if x > m {
+			m = x
+		}
+	}
+	return m
+}
+
+func minU64(xs []uint64) uint64 {
+	m := xs[0]
+	for _, x := range xs[1:] {
+		if x < m {
 			m = x
 		}
 	}

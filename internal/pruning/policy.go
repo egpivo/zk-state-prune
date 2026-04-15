@@ -24,27 +24,36 @@ package pruning
 import (
 	"fmt"
 	"strings"
+
+	"github.com/egpivo/zk-state-prune/internal/model"
 )
 
-// Policy is a tiering decision rule expressed on gap-time. Given the number
-// of blocks a slot has been idle (i.e. time since its last access), the
-// policy reports whether the slot is currently demoted to the cold tier
-// ("pruned" in legacy field names). A stateless duration predicate is
-// enough because the simulator operates on inter-access intervals and can
-// recompute idle durations directly.
+// Policy is a tiering decision rule. Given an inter-access interval, the
+// policy returns the number of blocks the slot was held in the hot tier
+// during that interval. The remainder of the interval — Duration minus
+// HotBlocks — is the cold-tier residency, which the simulator turns into
+// either a saved hot slot-block (for non-observed tails) or a miss (for
+// observed tails ending in a real access).
+//
+// Returning HotBlocks rather than a "is pruned?" boolean lets the
+// simulator handle three policy families uniformly:
+//
+//   - NoPrune: HotBlocks = Duration (never demotes)
+//   - FixedIdle: HotBlocks = min(Duration, IdleBlocks) (demotes after a
+//     fixed wall-clock idle)
+//   - Statistical: HotBlocks ∈ {0, Duration} based on the per-interval
+//     cost-aware decision
+//
+// Phase-1's IsPruned / PruneThreshold pair is gone — they could not
+// express the statistical case, where the demotion threshold depends on
+// covariates evaluated at IntervalStart.
 type Policy interface {
 	// Name is used for logging, reports, and CLI selection.
 	Name() string
 
-	// IsPruned reports whether a slot idle for `idle` blocks is in the
-	// cold tier. Must be monotone: once true for some idle, stays true
-	// for larger.
-	IsPruned(idle uint64) bool
-
-	// PruneThreshold is the smallest idle duration at which the slot
-	// transitions to the cold tier. Returning 0 means "never demotes"
-	// and short-circuits the cold-tier accounting in the simulator.
-	PruneThreshold() uint64
+	// HotBlocks returns the number of blocks the slot stayed in the hot
+	// tier during this interval. Must be in [0, it.Duration].
+	HotBlocks(it model.InterAccessInterval) uint64
 }
 
 // NoPrune is the all-hot baseline: slots stay in the hot tier forever.
@@ -52,20 +61,27 @@ type Policy interface {
 // rate (zero).
 type NoPrune struct{}
 
-func (NoPrune) Name() string            { return "no-prune" }
-func (NoPrune) IsPruned(uint64) bool    { return false }
-func (NoPrune) PruneThreshold() uint64  { return 0 }
+func (NoPrune) Name() string                                       { return "no-prune" }
+func (NoPrune) HotBlocks(it model.InterAccessInterval) uint64      { return it.Duration }
 
-// FixedIdle prunes any slot that has been idle for at least IdleBlocks
+// FixedIdle demotes any slot that has been idle for at least IdleBlocks
 // blocks. This is the strawman that statistical policies must beat.
 type FixedIdle struct {
 	Label      string
 	IdleBlocks uint64
 }
 
-func (f FixedIdle) Name() string           { return f.Label }
-func (f FixedIdle) IsPruned(idle uint64) bool { return idle >= f.IdleBlocks }
-func (f FixedIdle) PruneThreshold() uint64  { return f.IdleBlocks }
+func (f FixedIdle) Name() string { return f.Label }
+
+// HotBlocks: the slot is hot for the first IdleBlocks of the interval
+// and cold thereafter. If the interval is shorter than IdleBlocks the
+// slot stayed hot for its entire span.
+func (f FixedIdle) HotBlocks(it model.InterAccessInterval) uint64 {
+	if it.Duration <= f.IdleBlocks {
+		return it.Duration
+	}
+	return f.IdleBlocks
+}
 
 // Phase-1 presets, matching the idle-window values in configs/default.yaml
 // (30 and 90 days at 12-second blocks).
@@ -74,15 +90,30 @@ var (
 	Fixed90d = FixedIdle{Label: "fixed-90d", IdleBlocks: 648_000}
 )
 
-// PolicyByName resolves a CLI flag or config key into a concrete Policy.
-// It is the single entry point for `zksp simulate --policy` so that adding
-// a new policy touches one place.
+// PolicyDeps bundles optional dependencies that PolicyByName needs to
+// resolve certain names. Stateless / no-op policies ignore it; the
+// statistical policy requires a pre-built StatisticalPolicy because
+// there is no way to materialize a fitted Cox + calibrated model from
+// a name alone.
 //
-// Input is normalized before lookup: the name is lowercased and underscores
-// are rewritten to dashes, so CLI idiom ("fixed-30d") and YAML idiom
-// ("fixed_30d") both resolve to the same policy. Surrounding whitespace is
-// trimmed.
-func PolicyByName(name string) (Policy, error) {
+// The CLI builds a fresh PolicyDeps per invocation: pre-run the
+// statistical fit pipeline via buildStatisticalPolicy if the user
+// asked for "statistical", then pass it here; otherwise leave
+// Statistical nil and PolicyByName handles fixed / no-prune like
+// before.
+type PolicyDeps struct {
+	Statistical *StatisticalPolicy
+}
+
+// PolicyByName resolves a CLI flag or config key into a concrete Policy.
+// It is the single entry point for `zksp simulate --policy` so that
+// adding a new policy touches one place.
+//
+// Input is normalized before lookup: the name is lowercased and
+// underscores are rewritten to dashes, so CLI idiom ("fixed-30d") and
+// YAML idiom ("fixed_30d") both resolve to the same policy. Surrounding
+// whitespace is trimmed.
+func PolicyByName(name string, deps PolicyDeps) (Policy, error) {
 	key := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(name)), "_", "-")
 	switch key {
 	case "no-prune":
@@ -91,8 +122,11 @@ func PolicyByName(name string) (Policy, error) {
 		return Fixed30d, nil
 	case "fixed-90d":
 		return Fixed90d, nil
-	case "statistical":
-		return nil, fmt.Errorf("policy %q: not yet implemented (Phase 2)", name)
+	case "statistical", "statistical-robust":
+		if deps.Statistical == nil {
+			return nil, fmt.Errorf("policy %q: PolicyDeps.Statistical must be a pre-built StatisticalPolicy (use NewStatisticalPolicy after fit + calibrate)", name)
+		}
+		return deps.Statistical, nil
 	default:
 		return nil, fmt.Errorf("unknown policy %q", name)
 	}
