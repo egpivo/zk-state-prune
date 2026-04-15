@@ -26,10 +26,15 @@ survival:
   stratify_by: [contract_type, slot_type]
 
 pruning:
+  # Cost axis used by the tiering simulator. The ratio drives policy
+  # ranking; absolute units are arbitrary. Defaults are tuned so the
+  # statistical policy's threshold p* = (ram_unit_cost · τ) / miss_penalty
+  # lands in (0, 1) for τ ≈ 1e4 blocks. Override by passing --ram-unit-cost
+  # / --miss-penalty on the CLI or by editing this file and running with
+  # --config configs/default.yaml.
   cost:
-    storage_per_slot_bytes: 64
-    reactivation_proof_cost: 1.0
-    false_prune_penalty: 10.0
+    ram_unit_cost: 1.0
+    miss_penalty: 100000.0
   # Policy keys below are the same strings accepted by `zksp simulate
   # --policy` and by pruning.PolicyByName. Dashes are canonical; the
   # factory also tolerates the YAML-idiomatic underscore form.

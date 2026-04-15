@@ -39,6 +39,36 @@ type CalibratedModel struct {
 	// quantile. PredictAccessProb does a step lookup on this grid.
 	PredX       []float64
 	CalibratedY []float64
+
+	// --- Split-conformal interval (Segment 15) -----------------------
+	//
+	// Epsilon is the non-conformity quantile CalibrateAt computed on
+	// the conformal half of the holdout. It is the half-width of a
+	// symmetric prediction interval around the calibrated p̂ for one
+	// specific quantity: the probability of access within the next
+	// Tau blocks, evaluated from idle = 0 (i.e. right after the
+	// previous access), using the isotonic-recalibrated prediction.
+	// For that quantity, on an i.i.d. draw from the same
+	// distribution, the true label lies in [p̂ − Epsilon, p̂ + Epsilon]
+	// with marginal coverage ≥ CoverageLevel.
+	//
+	// The guarantee does NOT cover:
+	//   - other horizons (τ' ≠ Tau)
+	//   - conditional predictions at arbitrary idle u > 0 (a
+	//     different quantity the isotonic grid was not fit for)
+	//   - predictions on data drawn from a materially different
+	//     distribution than the holdout
+	//
+	// Callers that want a conformal interval for conditional
+	// predictions have to fit their own ε on the target quantity —
+	// the robust CLI path explicitly avoids reusing this Epsilon for
+	// anything other than idle = 0 to stay honest with the claim.
+	//
+	// CoverageLevel is the nominal 1 − α (e.g. 0.9 for α = 0.1). Zero
+	// means conformal prediction was not fitted (intervals are
+	// width-zero point estimates).
+	Epsilon       float64
+	CoverageLevel float64
 }
 
 // PredictAccessProb returns the recalibrated probability of access by
@@ -76,6 +106,45 @@ func (c *CalibratedModel) PredictAccessProbForInterval(it model.InterAccessInter
 	return c.PredictAccessProb(cov)
 }
 
+// PredictInterval returns the split-conformal prediction interval
+// [lower, upper] around the calibrated access probability, with
+// marginal coverage ≥ c.CoverageLevel. The interval collapses to the
+// point estimate when Epsilon == 0 (conformal prediction not fitted).
+// Both endpoints are clipped to [0, 1].
+func (c *CalibratedModel) PredictInterval(covariates map[string]float64) (lower, upper float64) {
+	p := c.PredictAccessProb(covariates)
+	lower = p - c.Epsilon
+	upper = p + c.Epsilon
+	if lower < 0 {
+		lower = 0
+	}
+	if upper > 1 {
+		upper = 1
+	}
+	return lower, upper
+}
+
+// PredictIntervalForInterval is the InterAccessInterval analogue of
+// PredictInterval.
+func (c *CalibratedModel) PredictIntervalForInterval(it model.InterAccessInterval) (lower, upper float64) {
+	if c == nil || c.Base == nil {
+		return 0, 0
+	}
+	cov := make(map[string]float64, len(c.Base.Predictors))
+	for _, name := range c.Base.Predictors {
+		cov[name] = rawCovariate(it, name)
+	}
+	return c.PredictInterval(cov)
+}
+
+// PredictUpperAccessProbForInterval returns just the upper endpoint of
+// the conformal interval, which is the quantity the robust decision
+// rule plugs into the surrogate for d=cold.
+func (c *CalibratedModel) PredictUpperAccessProbForInterval(it model.InterAccessInterval) float64 {
+	_, upper := c.PredictIntervalForInterval(it)
+	return upper
+}
+
 // isotonicLookup is a placeholder right-continuous step lookup used until
 // Segment 11 builds the real PAV-fitted grid. Returning the input value
 // when no grid is present makes CalibratedModel a no-op wrapper for the
@@ -109,31 +178,40 @@ func isotonicLookup(x, y []float64, q float64) float64 {
 // probability with the observed rate among rows whose prediction landed
 // in that bin.
 //
-// Phase-1 censoring policy: each holdout interval is labelled as
+// Bin observed rates are computed via **bin-wise Kaplan–Meier**: for
+// each quantile bin we fit a KM curve on the bin's intervals and read
+// 1 − S_KM(τ) as the empirical access-by-tau rate. This keeps all
+// rows in the bin population — including the "censored before tau"
+// rows that Phase 1 used to drop — at the cost of one KM fit per bin.
+// KM handles the censoring correctly: a row censored at time t < τ
+// still contributes to the risk set for the event times ≤ t and then
+// leaves, which is exactly the treatment a naive drop couldn't express.
 //
-//   - 1 ("happened") if IsObserved && Duration <= tau
-//   - 0 ("did not happen by tau") if Duration > tau, regardless of
-//     observed/censored — at time tau we still hadn't seen an access
-//   - dropped if !IsObserved && Duration <= tau ("censored before tau"):
-//     we don't know whether an access would have happened by tau, so
-//     using either label biases the curve.
-//
-// The drop policy is the cleanest small-N approach. A future revision
-// can replace it with bin-wise Kaplan–Meier observed rates that
-// incorporate the dropped rows correctly.
+// BrierScore still uses row-level binary labels and therefore excludes
+// censored-before-τ rows from its denominator (they don't have an
+// unambiguous {0, 1} label). NumKept counts all holdout rows used for
+// bin construction; BrierN is the subset with unambiguous labels.
 type CalibrationCurve struct {
 	Tau float64
 
 	Bins []CalibrationBin
 
 	// BrierScore is the mean squared error between predicted probability
-	// and the binary label, averaged over kept rows. Lower is better; a
-	// well-calibrated and well-discriminating model has a small Brier.
+	// and the binary label, averaged over BrierN rows that had
+	// unambiguous labels. Lower is better.
 	BrierScore float64
 
-	// NumKept and NumDropped account for every holdout row. Reporting
-	// both lets the reader sanity-check the censoring drop rate.
-	NumKept    int
+	// NumKept is the number of holdout rows that ended up in a bin.
+	// Under the bin-wise KM policy every non-empty holdout row is kept,
+	// so NumKept == len(holdout).
+	NumKept int
+	// BrierN is the subset of NumKept used as the Brier denominator
+	// (rows where the {0, 1} label is unambiguous). Kept separate so
+	// the reader can see how much censoring pressure the Brier was
+	// computed under.
+	BrierN int
+	// NumDropped is retained for source compatibility. It is always
+	// zero under bin-wise KM and will be removed in a later phase.
 	NumDropped int
 }
 
@@ -144,82 +222,131 @@ type CalibrationBin struct {
 	N             int
 }
 
+// PredictForIntervalFunc is the predict-by-interval abstraction both
+// CoxResult and CalibratedModel satisfy. Pulling it out lets the
+// calibration machinery serve both model flavours without a switch.
+type PredictForIntervalFunc func(it model.InterAccessInterval) float64
+
 // CalibrationCurveFromCox evaluates a fitted Cox model on the holdout
 // intervals at horizon tau and produces a reliability diagram with
-// `nBins` equal-population quantile bins.
+// `nBins` equal-population quantile bins. Thin wrapper around
+// CalibrationCurveFromPredict that delegates prediction to the raw
+// Cox baseline hazard.
 func CalibrationCurveFromCox(
-	model *CoxResult,
+	res *CoxResult,
 	holdout []model.InterAccessInterval,
 	tau float64,
 	nBins int,
 ) (*CalibrationCurve, error) {
-	if model == nil {
+	if res == nil {
 		return nil, fmt.Errorf("CalibrationCurveFromCox: nil model")
 	}
+	predict := func(it model.InterAccessInterval) float64 {
+		return res.PredictAccessProbForInterval(it, tau)
+	}
+	return CalibrationCurveFromPredict(predict, holdout, tau, nBins)
+}
+
+// CalibrationCurveFromPredict is the reusable reliability-diagram
+// builder. It runs the Phase-2 bin-wise KM observed-rate policy so
+// censored-before-τ rows stay in the bins instead of being dropped.
+func CalibrationCurveFromPredict(
+	predict PredictForIntervalFunc,
+	holdout []model.InterAccessInterval,
+	tau float64,
+	nBins int,
+) (*CalibrationCurve, error) {
+	if predict == nil {
+		return nil, fmt.Errorf("CalibrationCurveFromPredict: nil predict")
+	}
 	if tau <= 0 {
-		return nil, fmt.Errorf("CalibrationCurveFromCox: tau must be > 0")
+		return nil, fmt.Errorf("CalibrationCurveFromPredict: tau must be > 0")
 	}
 	if len(holdout) == 0 {
-		return nil, fmt.Errorf("CalibrationCurveFromCox: empty holdout")
+		return nil, fmt.Errorf("CalibrationCurveFromPredict: empty holdout")
 	}
 	if nBins <= 0 {
 		nBins = 10
 	}
 
-	type point struct{ p, y float64 }
-	pts := make([]point, 0, len(holdout))
-	dropped := 0
+	type row struct {
+		p  float64
+		it model.InterAccessInterval
+	}
+	rows := make([]row, 0, len(holdout))
 	for _, it := range holdout {
-		var label float64
-		switch {
-		case it.IsObserved && it.Duration <= uint64(tau):
-			label = 1
-		case it.Duration > uint64(tau):
-			label = 0
-		default:
-			// censored && Duration <= tau → ambiguous, skip.
-			dropped++
-			continue
-		}
-		p := model.PredictAccessProbForInterval(it, tau)
-		pts = append(pts, point{p: p, y: label})
+		rows = append(rows, row{
+			p:  predict(it),
+			it: it,
+		})
 	}
-	if len(pts) < nBins {
-		return nil, fmt.Errorf("CalibrationCurveFromCox: only %d non-ambiguous rows for %d bins", len(pts), nBins)
+	if len(rows) < nBins {
+		return nil, fmt.Errorf("CalibrationCurveFromPredict: only %d holdout rows for %d bins", len(rows), nBins)
 	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].p < rows[j].p })
 
-	sort.Slice(pts, func(i, j int) bool { return pts[i].p < pts[j].p })
-
+	fitter := NewStatmodelFitter()
 	bins := make([]CalibrationBin, 0, nBins)
-	binSize := len(pts) / nBins
+	binSize := len(rows) / nBins
 	brier := 0.0
+	brierN := 0
 	for b := 0; b < nBins; b++ {
 		lo := b * binSize
 		hi := lo + binSize
 		if b == nBins-1 {
-			hi = len(pts)
+			hi = len(rows)
 		}
-		var sumP, sumY float64
+		var sumP float64
+		ivs := make([]model.InterAccessInterval, 0, hi-lo)
 		for j := lo; j < hi; j++ {
-			sumP += pts[j].p
-			sumY += pts[j].y
-			d := pts[j].p - pts[j].y
-			brier += d * d
+			r := rows[j]
+			sumP += r.p
+			ivs = append(ivs, r.it)
+			// Row-level Brier contribution for rows with unambiguous
+			// labels. Censored-before-τ rows are still in the bin (KM
+			// consumes them) but contribute no Brier term.
+			switch {
+			case r.it.IsObserved && r.it.Duration <= uint64(tau):
+				d := r.p - 1
+				brier += d * d
+				brierN++
+			case r.it.Duration > uint64(tau):
+				d := r.p - 0
+				brier += d * d
+				brierN++
+			}
 		}
 		n := hi - lo
+		predictedMean := sumP / float64(n)
+
+		// Bin-wise KM. If the fit fails (extremely small bin, pathological
+		// data) we fall back to 0 so the reliability diagram still prints
+		// rather than blowing up the whole report.
+		observedRate := 0.0
+		if km, err := fitter.FitKaplanMeier(ivs); err == nil && km != nil {
+			observedRate = 1 - km.SurvAt(tau)
+			if observedRate < 0 {
+				observedRate = 0
+			}
+		}
 		bins = append(bins, CalibrationBin{
-			PredictedMean: sumP / float64(n),
-			ObservedRate:  sumY / float64(n),
+			PredictedMean: predictedMean,
+			ObservedRate:  observedRate,
 			N:             n,
 		})
 	}
 
+	brierScore := 0.0
+	if brierN > 0 {
+		brierScore = brier / float64(brierN)
+	}
 	return &CalibrationCurve{
 		Tau:        tau,
 		Bins:       bins,
-		BrierScore: brier / float64(len(pts)),
-		NumKept:    len(pts),
-		NumDropped: dropped,
+		BrierScore: brierScore,
+		NumKept:    len(rows),
+		BrierN:     brierN,
+		NumDropped: 0,
 	}, nil
 }
 
@@ -464,13 +591,24 @@ func averageRanks(xs []float64) []float64 {
 // CalibrateAt fits an isotonic recalibration map from raw Cox-predicted
 // access probability to empirical access rate on the holdout set, at
 // horizon tau. Returns a CalibratedModel that wraps the original
-// CoxResult and recovers a calibrated PredictAccessProb via PAV-fitted
-// step lookup.
+// CoxResult and recovers a calibrated PredictAccessProb via a
+// PAV-fitted step lookup, plus a split-conformal ε around that
+// prediction.
 //
-// Censoring handling matches CalibrationCurveFromCox: rows that are
-// censored before tau are dropped because their label is unknowable
-// without a survival adjustment; rows with Duration > tau are 0
-// regardless of their observed-flag.
+// Data discipline:
+//
+//   - The non-ambiguous holdout rows are split 50/50 by a deterministic
+//     FNV hash of SlotID into "iso" and "cal" sets. iso fits the PAV
+//     isotonic map; cal is then scored against that fitted map and its
+//     residuals become the conformal non-conformity scores. This is
+//     the standard split-conformal recipe — no row helps fit its own
+//     ε, so the finite-sample coverage claim actually holds.
+//
+//   - Censoring policy is the same as CalibrationCurveFromCox: rows
+//     with Duration > tau are label 0 (no access yet at tau), observed
+//     rows with Duration <= tau are label 1, and censored rows with
+//     Duration <= tau are dropped because their label is unknowable
+//     without a survival adjustment.
 //
 // CalibrateAt is the lower-level entry point that takes tau explicitly.
 // The interface method Calibrate(res, holdout) defaults tau to the
@@ -490,8 +628,11 @@ func (StatmodelFitter) CalibrateAt(
 		return nil, fmt.Errorf("CalibrateAt: empty holdout")
 	}
 
-	type point struct{ p, y float64 }
-	pts := make([]point, 0, len(holdout))
+	type point struct {
+		p, y   float64
+		slotID string
+	}
+	all := make([]point, 0, len(holdout))
 	for _, it := range holdout {
 		var label float64
 		switch {
@@ -502,31 +643,86 @@ func (StatmodelFitter) CalibrateAt(
 		default:
 			continue
 		}
-		pts = append(pts, point{
-			p: res.PredictAccessProbForInterval(it, tau),
-			y: label,
+		all = append(all, point{
+			p:      res.PredictAccessProbForInterval(it, tau),
+			y:      label,
+			slotID: it.SlotID,
 		})
 	}
-	if len(pts) < 5 {
-		return nil, fmt.Errorf("CalibrateAt: only %d non-ambiguous holdout rows (need >= 5)", len(pts))
+	if len(all) < 10 {
+		return nil, fmt.Errorf("CalibrateAt: only %d non-ambiguous holdout rows (need >= 10 for split conformal)", len(all))
 	}
 
-	sort.Slice(pts, func(i, j int) bool { return pts[i].p < pts[j].p })
-
-	x := make([]float64, len(pts))
-	y := make([]float64, len(pts))
-	for i, p := range pts {
-		x[i] = p.p
-		y[i] = p.y
+	// Deterministic 50/50 partition on SlotID → even hash bucket
+	// fits PAV, odd bucket measures residuals. Done before the sort
+	// below so each half is independent of the predicted-probability
+	// order.
+	var isoPts, calPts []point
+	for _, p := range all {
+		if slotIDBucket(p.slotID) == 0 {
+			isoPts = append(isoPts, p)
+		} else {
+			calPts = append(calPts, p)
+		}
 	}
-	yHat := poolAdjacentViolators(y)
+	if len(isoPts) < 5 || len(calPts) < 5 {
+		return nil, fmt.Errorf("CalibrateAt: split-conformal partition too small (iso=%d, cal=%d)", len(isoPts), len(calPts))
+	}
+
+	// Fit the PAV isotonic map on the iso half.
+	sort.Slice(isoPts, func(i, j int) bool { return isoPts[i].p < isoPts[j].p })
+	xIso := make([]float64, len(isoPts))
+	yIso := make([]float64, len(isoPts))
+	for i, p := range isoPts {
+		xIso[i] = p.p
+		yIso[i] = p.y
+	}
+	yHatIso := poolAdjacentViolators(yIso)
+
+	// Compute conformal residuals on the cal half by looking up each
+	// row's prediction on the PAV grid fitted above.
+	const defaultCoverage = 0.9
+	resid := make([]float64, len(calPts))
+	for i, p := range calPts {
+		fitted := isotonicLookup(xIso, yHatIso, p.p)
+		d := p.y - fitted
+		if d < 0 {
+			d = -d
+		}
+		resid[i] = d
+	}
+	sort.Float64s(resid)
+	alpha := 1 - defaultCoverage
+	k := int(math.Ceil((1-alpha)*float64(len(resid)+1))) - 1
+	if k < 0 {
+		k = 0
+	}
+	if k >= len(resid) {
+		k = len(resid) - 1
+	}
+	epsilon := resid[k]
 
 	return &CalibratedModel{
-		Base:        res,
-		Tau:         tau,
-		PredX:       x,
-		CalibratedY: yHat,
+		Base:          res,
+		Tau:           tau,
+		PredX:         xIso,
+		CalibratedY:   yHatIso,
+		Epsilon:       epsilon,
+		CoverageLevel: defaultCoverage,
 	}, nil
+}
+
+// slotIDBucket deterministically hashes a slot id to {0, 1}. Used by
+// CalibrateAt to build disjoint iso-fit / conformal-residual halves
+// from a single holdout set without introducing a stateful RNG.
+func slotIDBucket(id string) uint32 {
+	// FNV-1a on the id bytes, low bit for the split.
+	var h uint32 = 2166136261
+	for i := 0; i < len(id); i++ {
+		h ^= uint32(id[i])
+		h *= 16777619
+	}
+	return h & 1
 }
 
 // Calibrate is the SurvivalFitter interface method. It selects a

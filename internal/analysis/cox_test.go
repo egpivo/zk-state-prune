@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"testing"
@@ -23,7 +24,7 @@ func syntheticCoxIntervals(n int) []model.InterAccessInterval {
 		base := 100.0 / float64(ac+1)
 		dur := uint64(math.Max(1, base+r.NormFloat64()*2))
 		out = append(out, model.InterAccessInterval{
-			SlotID:       "s",
+			SlotID:       fmt.Sprintf("s%d", i),
 			Duration:     dur,
 			IsObserved:   true,
 			AccessCount:  ac,

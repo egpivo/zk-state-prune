@@ -116,10 +116,19 @@ func BuildIntervals(
 			}
 			return t - slot.CreatedAt
 		}
-		// Contract deploy block is not fetched by IterateSlotEvents today —
-		// use CreatedAt as a stand-in. In Phase 1 the mock sets them equal,
-		// and the Cox pass can swap this out once we surface deploy_block.
-		contractAgeAt := slotAgeAt
+		// Contract age is measured from the contract's deploy block,
+		// which storage now joins in via SlotWithMeta.DeployBlock. In
+		// the Phase-1 mock deploy_block == slot.CreatedAt for every
+		// slot in a given contract; in real data they diverge as
+		// individual slots are written long after the contract was
+		// deployed.
+		contractDeploy := sm.DeployBlock
+		contractAgeAt := func(t uint64) uint64 {
+			if t < contractDeploy {
+				return 0
+			}
+			return t - contractDeploy
+		}
 
 		emit := func(start, end uint64, observed, lt bool, accessCount uint64) {
 			res.Intervals = append(res.Intervals, model.InterAccessInterval{

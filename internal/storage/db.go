@@ -153,12 +153,14 @@ func (d *DB) Reset(ctx context.Context) error {
 	return nil
 }
 
-// SlotWithMeta bundles a slot with its parent contract's category. Analysis
-// passes need both to build Cox covariates, so we ship them together from a
-// single join.
+// SlotWithMeta bundles a slot with the contract metadata its parent row
+// carries. Analysis passes need slot type, contract category, and the
+// contract's deploy block (so ContractAge can be distinct from SlotAge),
+// so we ship the whole bundle from a single join.
 type SlotWithMeta struct {
-	Slot     model.StateSlot
-	Category model.ContractCategory
+	Slot        model.StateSlot
+	Category    model.ContractCategory
+	DeployBlock uint64
 }
 
 // IterateSlotEvents streams every slot in the DB together with its full
@@ -251,7 +253,7 @@ func (d *DB) loadSlotMeta(ctx context.Context) (map[string]SlotWithMeta, []strin
 	rows, err := d.sql.QueryContext(ctx, `
 		SELECT s.slot_id, s.contract_addr, s.slot_index, s.slot_type,
 		       s.created_at, s.last_access, s.access_count, s.is_active,
-		       c.contract_type
+		       c.contract_type, c.deploy_block
 		  FROM state_slots s
 		  JOIN contracts    c ON c.address = s.contract_addr
 		 ORDER BY s.slot_id`)
@@ -267,17 +269,22 @@ func (d *DB) loadSlotMeta(ctx context.Context) (map[string]SlotWithMeta, []strin
 			s             model.StateSlot
 			slotType, cat string
 			active        int
+			deployBlock   uint64
 		)
 		if err := rows.Scan(
 			&s.SlotID, &s.ContractAddr, &s.SlotIndex, &slotType,
 			&s.CreatedAt, &s.LastAccess, &s.AccessCount, &active,
-			&cat,
+			&cat, &deployBlock,
 		); err != nil {
 			return nil, nil, fmt.Errorf("scan slot: %w", err)
 		}
 		s.SlotType = model.ParseSlotType(slotType)
 		s.IsActive = active != 0
-		meta[s.SlotID] = SlotWithMeta{Slot: s, Category: model.ParseContractCategory(cat)}
+		meta[s.SlotID] = SlotWithMeta{
+			Slot:        s,
+			Category:    model.ParseContractCategory(cat),
+			DeployBlock: deployBlock,
+		}
 		order = append(order, s.SlotID)
 	}
 	if err := rows.Err(); err != nil {

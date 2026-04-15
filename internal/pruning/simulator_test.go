@@ -2,6 +2,7 @@ package pruning
 
 import (
 	"context"
+	"math"
 	"path/filepath"
 	"testing"
 
@@ -27,7 +28,7 @@ func TestRun_NoPruneIsFreeAndLoseless(t *testing.T) {
 		mkInterval("s1", 50, true),
 		mkInterval("s1", 200, false),
 	}
-	res, err := Run(NoPrune{}, ivs)
+	res, err := Run(NoPrune{}, ivs, DefaultCostParams())
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -50,7 +51,7 @@ func TestRun_FixedIdleThresholdHit(t *testing.T) {
 		mkInterval("s1", 30, true),  // crosses threshold → reactivation + 10 saved
 		mkInterval("s1", 50, false), // trailing censored, 30 saved, final=pruned
 	}
-	res, err := Run(policy, ivs)
+	res, err := Run(policy, ivs, DefaultCostParams())
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -87,7 +88,7 @@ func TestRun_ReactivationResetsFinalState(t *testing.T) {
 		mkInterval("s1", 50, true), // pruned then reactivated
 		mkInterval("s1", 5, false), // trailing short censored, not pruned
 	}
-	res, _ := Run(policy, ivs)
+	res, _ := Run(policy, ivs, DefaultCostParams())
 	if res.Reactivations != 1 {
 		t.Errorf("Reactivations=%d want 1", res.Reactivations)
 	}
@@ -102,14 +103,88 @@ func TestRun_ThresholdLargerThanAllIntervals(t *testing.T) {
 		mkInterval("s1", 100, true),
 		mkInterval("s1", 200, false),
 	}
-	res, _ := Run(policy, ivs)
+	res, _ := Run(policy, ivs, DefaultCostParams())
 	if res.SlotBlocksPruned != 0 || res.Reactivations != 0 || res.FinalPrunedSlots != 0 {
 		t.Errorf("oversized threshold should be a no-op: %+v", res)
 	}
 }
 
+func TestRun_CostAccounting(t *testing.T) {
+	// Hand-crafted intervals with a threshold of 20 → one observed
+	// reactivation (Duration=30, 10 cold slot-blocks) + one censored
+	// cold tail (Duration=50, 30 cold slot-blocks). Exposure 10+30+50=90.
+	// Hot = 90 − (10+30) = 50 slot-blocks.
+	policy := FixedIdle{Label: "t", IdleBlocks: 20}
+	ivs := []model.InterAccessInterval{
+		mkInterval("s1", 10, true),  // hot throughout, no reactivation
+		mkInterval("s1", 30, true),  // hot 20 + cold 10 → reactivation
+		mkInterval("s1", 50, false), // hot 20 + cold 30 → final=cold
+	}
+	costs := CostParams{RAMUnitCost: 2, MissPenalty: 100}
+	res, err := Run(policy, ivs, costs)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.TotalExposure != 90 {
+		t.Errorf("TotalExposure=%d want 90", res.TotalExposure)
+	}
+	if res.SlotBlocksPruned != 40 {
+		t.Errorf("SlotBlocksPruned=%d want 40", res.SlotBlocksPruned)
+	}
+	if res.SlotBlocksHot != 50 {
+		t.Errorf("SlotBlocksHot=%d want 50", res.SlotBlocksHot)
+	}
+	wantRAM := 50.0 / 90.0
+	if math.Abs(res.RAMRatio-wantRAM) > 1e-9 {
+		t.Errorf("RAMRatio=%v want %v", res.RAMRatio, wantRAM)
+	}
+	// HotHitCoverage = 1 - 1/2 = 0.5 (two observed intervals, one miss).
+	if math.Abs(res.HotHitCoverage-0.5) > 1e-9 {
+		t.Errorf("HotHitCoverage=%v want 0.5", res.HotHitCoverage)
+	}
+	if math.Abs(res.RAMCost-100) > 1e-9 { // 50 * 2
+		t.Errorf("RAMCost=%v want 100", res.RAMCost)
+	}
+	if math.Abs(res.MissPenaltyAgg-100) > 1e-9 { // 1 * 100
+		t.Errorf("MissPenaltyAgg=%v want 100", res.MissPenaltyAgg)
+	}
+	if math.Abs(res.TotalCost-200) > 1e-9 {
+		t.Errorf("TotalCost=%v want 200", res.TotalCost)
+	}
+	// Legacy aliases must round-trip.
+	if math.Abs(res.StorageSavedFrac-(1-wantRAM)) > 1e-9 {
+		t.Errorf("StorageSavedFrac=%v want %v", res.StorageSavedFrac, 1-wantRAM)
+	}
+	if math.Abs(res.FalsePruneRate-0.5) > 1e-9 {
+		t.Errorf("FalsePruneRate=%v want 0.5", res.FalsePruneRate)
+	}
+}
+
+func TestRun_NoPruneAllHotBaseline(t *testing.T) {
+	// No-prune keeps every slot-block hot → RAMRatio=1, misses=0,
+	// TotalCost = RAMUnitCost * exposure. Sanity check the upper bound.
+	ivs := []model.InterAccessInterval{
+		mkInterval("s1", 10, true),
+		mkInterval("s1", 50, false),
+	}
+	costs := CostParams{RAMUnitCost: 1, MissPenalty: 100}
+	res, _ := Run(NoPrune{}, ivs, costs)
+	if res.RAMRatio != 1 {
+		t.Errorf("RAMRatio=%v want 1", res.RAMRatio)
+	}
+	if res.HotHitCoverage != 1 {
+		t.Errorf("HotHitCoverage=%v want 1", res.HotHitCoverage)
+	}
+	if res.MissPenaltyAgg != 0 {
+		t.Errorf("MissPenaltyAgg=%v want 0", res.MissPenaltyAgg)
+	}
+	if res.TotalCost != 60 {
+		t.Errorf("TotalCost=%v want 60", res.TotalCost)
+	}
+}
+
 func TestRun_NilPolicyError(t *testing.T) {
-	if _, err := Run(nil, nil); err == nil {
+	if _, err := Run(nil, nil, DefaultCostParams()); err == nil {
 		t.Fatal("expected error on nil policy")
 	}
 }
@@ -131,11 +206,14 @@ func TestPolicyByName(t *testing.T) {
 		{name: "fixed_30d", wantLabel: "fixed-30d"},
 		{name: "fixed_90d", wantLabel: "fixed-90d"},
 		{name: "  Fixed-30d  ", wantLabel: "fixed-30d"},
-		{name: "statistical", wantErr: true}, // Phase-2 stub
+		// "statistical" without deps still errors because the registry
+		// needs a pre-built StatisticalPolicy; the dedicated branch
+		// below verifies the positive path.
+		{name: "statistical", wantErr: true},
 		{name: "bogus", wantErr: true},
 	}
 	for _, c := range cases {
-		p, err := PolicyByName(c.name)
+		p, err := PolicyByName(c.name, PolicyDeps{})
 		if (err != nil) != c.wantErr {
 			t.Errorf("PolicyByName(%q) err=%v want err=%v", c.name, err, c.wantErr)
 			continue
@@ -143,6 +221,22 @@ func TestPolicyByName(t *testing.T) {
 		if err == nil && c.wantLabel != "" && p.Name() != c.wantLabel {
 			t.Errorf("PolicyByName(%q).Name() = %q, want %q", c.name, p.Name(), c.wantLabel)
 		}
+	}
+
+	// Positive path: with a pre-built StatisticalPolicy in deps,
+	// PolicyByName("statistical") resolves to it.
+	stat, err := NewStatisticalPolicy("statistical",
+		func(_ model.InterAccessInterval, _ float64) float64 { return 0.5 },
+		10, CostParams{RAMUnitCost: 1, MissPenalty: 10})
+	if err != nil {
+		t.Fatalf("NewStatisticalPolicy: %v", err)
+	}
+	got, err := PolicyByName("statistical", PolicyDeps{Statistical: stat})
+	if err != nil {
+		t.Fatalf("PolicyByName(statistical, deps): %v", err)
+	}
+	if got.Name() != "statistical" {
+		t.Errorf("resolved name=%q want statistical", got.Name())
 	}
 }
 
@@ -187,7 +281,7 @@ func TestRunAll_EndToEndOnMock_MonotonicOrdering(t *testing.T) {
 	lenient := FixedIdle{Label: "lenient", IdleBlocks: 20_000}
 	strict := FixedIdle{Label: "strict", IdleBlocks: 5_000}
 
-	results, err := RunAll([]Policy{NoPrune{}, lenient, strict}, built.Intervals)
+	results, err := RunAll([]Policy{NoPrune{}, lenient, strict}, built.Intervals, DefaultCostParams())
 	if err != nil {
 		t.Fatalf("RunAll: %v", err)
 	}

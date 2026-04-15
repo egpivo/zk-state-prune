@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"testing"
@@ -27,7 +28,7 @@ func phHoldsIntervals(n int) []model.InterAccessInterval {
 		}
 		dur := uint64(math.Max(1, -math.Log(u)*100/float64(ac+1)))
 		out = append(out, model.InterAccessInterval{
-			SlotID:      "s",
+			SlotID:      fmt.Sprintf("s%d", i),
 			Duration:    dur,
 			IsObserved:  true,
 			AccessCount: ac,
@@ -56,7 +57,7 @@ func phViolatedIntervals(n int) []model.InterAccessInterval {
 			dur = uint64(math.Max(1, 200-float64(ac)*5+r.NormFloat64()*3))
 		}
 		out = append(out, model.InterAccessInterval{
-			SlotID:      "s",
+			SlotID:      fmt.Sprintf("s%d", i),
 			Duration:    dur,
 			IsObserved:  true,
 			AccessCount: ac,
@@ -274,6 +275,91 @@ func TestCalibrate_ErrorPaths(t *testing.T) {
 	}
 	if _, err := f.CalibrateAt(&CoxResult{}, nil, 1); err == nil {
 		t.Error("expected error on empty holdout")
+	}
+}
+
+func TestCalibrate_ConformalIntervalCoverage(t *testing.T) {
+	// Split-conformal marginal coverage: on a sample drawn from the
+	// same distribution as the holdout, at least 1 − α of labels should
+	// fall inside the predicted interval (slack allowed for finite
+	// sample). We use phHoldsIntervals for both sides because it's a
+	// well-behaved i.i.d. generator.
+	train := phHoldsIntervals(800)
+	test := phHoldsIntervals(400)
+
+	fitter := NewStatmodelFitter()
+	res, err := fitter.FitCoxPH(train, DefaultCoxPredictors)
+	if err != nil {
+		t.Fatalf("FitCoxPH: %v", err)
+	}
+	calib, err := fitter.Calibrate(res, train)
+	if err != nil {
+		t.Fatalf("Calibrate: %v", err)
+	}
+	if calib.Epsilon <= 0 || calib.Epsilon > 1 {
+		t.Fatalf("Epsilon=%v out of (0,1]", calib.Epsilon)
+	}
+	if calib.CoverageLevel != 0.9 {
+		t.Errorf("CoverageLevel=%v, want 0.9", calib.CoverageLevel)
+	}
+
+	tau := calib.Tau
+	covered := 0
+	evaluated := 0
+	for _, it := range test {
+		var label float64
+		switch {
+		case it.IsObserved && it.Duration <= uint64(tau):
+			label = 1
+		case it.Duration > uint64(tau):
+			label = 0
+		default:
+			continue
+		}
+		evaluated++
+		lower, upper := calib.PredictIntervalForInterval(it)
+		if label >= lower && label <= upper {
+			covered++
+		}
+	}
+	if evaluated == 0 {
+		t.Fatal("no evaluable rows in test set")
+	}
+	rate := float64(covered) / float64(evaluated)
+	// Split-conformal gives ~1-α marginal coverage. Allow 10% slack
+	// for finite-sample noise; miscoverage > 0.2 means something is
+	// structurally wrong.
+	if rate < 0.7 {
+		t.Errorf("empirical coverage = %v (%d/%d), want ≥ 0.7",
+			rate, covered, evaluated)
+	}
+}
+
+func TestCalibrate_PredictIntervalOrderingAndClipping(t *testing.T) {
+	train := phHoldsIntervals(400)
+	fitter := NewStatmodelFitter()
+	res, err := fitter.FitCoxPH(train, DefaultCoxPredictors)
+	if err != nil {
+		t.Fatalf("FitCoxPH: %v", err)
+	}
+	calib, err := fitter.Calibrate(res, train)
+	if err != nil {
+		t.Fatalf("Calibrate: %v", err)
+	}
+	for i := 0; i < 50; i++ {
+		it := train[i]
+		p := calib.PredictAccessProbForInterval(it)
+		lower, upper := calib.PredictIntervalForInterval(it)
+		if lower > p+1e-9 || upper < p-1e-9 {
+			t.Errorf("interval [%v, %v] does not contain point %v", lower, upper, p)
+		}
+		if lower < 0 || lower > 1 || upper < 0 || upper > 1 {
+			t.Errorf("interval [%v, %v] out of [0,1]", lower, upper)
+		}
+		// Upper endpoint helper returns the same upper bound.
+		if got := calib.PredictUpperAccessProbForInterval(it); math.Abs(got-upper) > 1e-12 {
+			t.Errorf("PredictUpperAccessProbForInterval = %v, interval upper = %v", got, upper)
+		}
 	}
 }
 

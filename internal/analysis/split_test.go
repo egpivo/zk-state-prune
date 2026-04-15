@@ -170,7 +170,7 @@ func TestCalibrationCurveFromCox_ErrorPaths(t *testing.T) {
 	}
 }
 
-func TestCalibrationCurveFromCox_DropsCensoredBeforeTau(t *testing.T) {
+func TestCalibrationCurveFromCox_BinWiseKMKeepsCensoredRows(t *testing.T) {
 	// Model that always predicts 0.5 (no covariate variance).
 	res := &CoxResult{
 		Predictors:     []string{},
@@ -179,21 +179,45 @@ func TestCalibrationCurveFromCox_DropsCensoredBeforeTau(t *testing.T) {
 		BaselineTime:   []float64{0, 100},
 		BaselineCumHaz: []float64{0, math.Log(2)}, // S(100)=0.5
 	}
+	// Four holdout rows at τ=100:
+	//   (50, censored) — Phase 1 would drop; Phase 2 keeps via KM
+	//   (50, observed) — event at t=50, contributes to KM
+	//   (200, censored) — censored after τ, unambiguous label 0
+	//   (200, observed) — event after τ, unambiguous label 0
+	//
+	// With one bin covering all four rows, KM processes the event at
+	// t=50: at risk = 4, d = 1 → S(50) = 3/4 = 0.75. No events after,
+	// so S(100) = 0.75 and the bin's observed rate is 1 − 0.75 = 0.25.
+	// BrierN should be 3 (everything except the censored-before-τ row);
+	// NumKept should be 4 (bin-wise KM doesn't drop).
 	holdout := []model.InterAccessInterval{
-		{Duration: 50, IsObserved: false},  // censored before τ → dropped
-		{Duration: 50, IsObserved: true},   // kept, label=1
-		{Duration: 200, IsObserved: false}, // kept, label=0
-		{Duration: 200, IsObserved: true},  // kept, label=0
+		{SlotID: "a", Duration: 50, IsObserved: false},
+		{SlotID: "b", Duration: 50, IsObserved: true},
+		{SlotID: "c", Duration: 200, IsObserved: false},
+		{SlotID: "d", Duration: 200, IsObserved: true},
 	}
 	curve, err := CalibrationCurveFromCox(res, holdout, 100, 1)
 	if err != nil {
 		t.Fatalf("CalibrationCurveFromCox: %v", err)
 	}
-	if curve.NumDropped != 1 {
-		t.Errorf("NumDropped=%d want 1", curve.NumDropped)
+	if curve.NumDropped != 0 {
+		t.Errorf("NumDropped=%d want 0 (bin-wise KM should not drop)", curve.NumDropped)
 	}
-	if curve.NumKept != 3 {
-		t.Errorf("NumKept=%d want 3", curve.NumKept)
+	if curve.NumKept != 4 {
+		t.Errorf("NumKept=%d want 4", curve.NumKept)
+	}
+	if curve.BrierN != 3 {
+		t.Errorf("BrierN=%d want 3 (one censored-before-τ excluded from Brier)", curve.BrierN)
+	}
+	if got := len(curve.Bins); got != 1 {
+		t.Fatalf("len(Bins)=%d want 1", got)
+	}
+	if got := curve.Bins[0].N; got != 4 {
+		t.Errorf("Bins[0].N=%d want 4", got)
+	}
+	// Bin-wise KM observed rate should be close to 0.25 (see comment).
+	if got := curve.Bins[0].ObservedRate; math.Abs(got-0.25) > 1e-9 {
+		t.Errorf("Bins[0].ObservedRate=%v want 0.25", got)
 	}
 }
 
