@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"sort"
 
 	"github.com/kshedden/statmodel/duration"
 	"github.com/kshedden/statmodel/statmodel"
@@ -41,6 +42,23 @@ type CoxResult struct {
 
 	BaselineTime   []float64
 	BaselineCumHaz []float64
+
+	// --- Stratified fit (Phase 3) ----------------------------------
+	//
+	// StratumColumn is the dstream column name the fit stratified on
+	// (e.g. ColContractType). Empty for unstratified fits. When set,
+	// Survival routes through per-stratum baseline hazards keyed on
+	// the interval's value in that column.
+	StratumColumn string
+	// StratumLabels[i] is the training-time value of StratumColumn
+	// for stratum i. Prediction-time lookup matches the row's column
+	// value against this list to pick the right baseline; rows whose
+	// value never appeared in training fall back to the first stratum.
+	StratumLabels []float64
+	// StratumBaselineTimes[i] / StratumBaselineCumHaz[i] are the
+	// per-stratum baseline hazard grids. Same length as StratumLabels.
+	StratumBaselineTimes    [][]float64
+	StratumBaselineCumHaz   [][]float64
 
 	// intervals is the training set, retained so post-fit diagnostics
 	// (CheckPH, calibration) don't have to be re-loaded from the DB.
@@ -82,30 +100,38 @@ func (r *CoxResult) MarshalJSON() ([]byte, error) {
 		return &vv
 	}
 	type alias struct {
-		Predictors     []string     `json:"Predictors"`
-		Coef           []*float64   `json:"Coef"`
-		StdErr         []*float64   `json:"StdErr"`
-		PValue         []*float64   `json:"PValue"`
-		ZScore         []*float64   `json:"ZScore"`
-		LogLike        *float64     `json:"LogLike"`
-		NumObs         int          `json:"NumObs"`
-		NumEvents      int          `json:"NumEvents"`
-		Scales         []CovarScale `json:"Scales"`
-		BaselineTime   []float64    `json:"BaselineTime"`
-		BaselineCumHaz []float64    `json:"BaselineCumHaz"`
+		Predictors            []string     `json:"Predictors"`
+		Coef                  []*float64   `json:"Coef"`
+		StdErr                []*float64   `json:"StdErr"`
+		PValue                []*float64   `json:"PValue"`
+		ZScore                []*float64   `json:"ZScore"`
+		LogLike               *float64     `json:"LogLike"`
+		NumObs                int          `json:"NumObs"`
+		NumEvents             int          `json:"NumEvents"`
+		Scales                []CovarScale `json:"Scales"`
+		BaselineTime          []float64    `json:"BaselineTime"`
+		BaselineCumHaz        []float64    `json:"BaselineCumHaz"`
+		StratumColumn         string       `json:"StratumColumn,omitempty"`
+		StratumLabels         []float64    `json:"StratumLabels,omitempty"`
+		StratumBaselineTimes  [][]float64  `json:"StratumBaselineTimes,omitempty"`
+		StratumBaselineCumHaz [][]float64  `json:"StratumBaselineCumHaz,omitempty"`
 	}
 	return json.Marshal(alias{
-		Predictors:     r.Predictors,
-		Coef:           nullable(r.Coef),
-		StdErr:         nullable(r.StdErr),
-		PValue:         nullable(r.PValue),
-		ZScore:         nullable(r.ZScore),
-		LogLike:        scalar(r.LogLike),
-		NumObs:         r.NumObs,
-		NumEvents:      r.NumEvents,
-		Scales:         r.Scales,
-		BaselineTime:   r.BaselineTime,
-		BaselineCumHaz: r.BaselineCumHaz,
+		Predictors:            r.Predictors,
+		Coef:                  nullable(r.Coef),
+		StdErr:                nullable(r.StdErr),
+		PValue:                nullable(r.PValue),
+		ZScore:                nullable(r.ZScore),
+		LogLike:               scalar(r.LogLike),
+		NumObs:                r.NumObs,
+		NumEvents:             r.NumEvents,
+		Scales:                r.Scales,
+		BaselineTime:          r.BaselineTime,
+		BaselineCumHaz:        r.BaselineCumHaz,
+		StratumColumn:         r.StratumColumn,
+		StratumLabels:         r.StratumLabels,
+		StratumBaselineTimes:  r.StratumBaselineTimes,
+		StratumBaselineCumHaz: r.StratumBaselineCumHaz,
 	})
 }
 
@@ -139,12 +165,39 @@ var DefaultCoxPredictors = []string{ColAccessCount, ColContractAge, ColSlotAge}
 //     standardize before the fit and store the inverse transform.
 //   - The library's "Status must be 0/1" check is satisfied by the
 //     dstream adapter's encoding of IsObserved.
-func (StatmodelFitter) FitCoxPH(intervals []model.InterAccessInterval, covariates []string) (*CoxResult, error) {
+func (f StatmodelFitter) FitCoxPH(intervals []model.InterAccessInterval, covariates []string) (*CoxResult, error) {
+	return f.FitCoxPHStratified(intervals, covariates, "")
+}
+
+// FitCoxPHStratified is FitCoxPH with an additional stratification
+// variable. When strataColumn is non-empty, statmodel fits a shared
+// coefficient vector but a separate baseline hazard per unique value
+// of that column. The plan recommends stratifying on contract type
+// because Phase-2 CheckPH confirmed the aging covariates do not
+// satisfy PH in aggregate: different application archetypes age in
+// different ways, and giving each one its own clock absorbs that
+// non-proportionality into the baseline.
+//
+// strataColumn must be a dstream column name from the adapter
+// (typically ColContractType). It must NOT appear in covariates —
+// stratification substitutes for including it as a predictor. If
+// strataColumn is empty, the fit behaves exactly like the unstratified
+// FitCoxPH and the returned CoxResult's Stratum* fields stay empty.
+func (StatmodelFitter) FitCoxPHStratified(
+	intervals []model.InterAccessInterval,
+	covariates []string,
+	strataColumn string,
+) (*CoxResult, error) {
 	if len(intervals) == 0 {
 		return nil, fmt.Errorf("FitCoxPH: empty intervals")
 	}
 	if len(covariates) == 0 {
 		covariates = DefaultCoxPredictors
+	}
+	for _, c := range covariates {
+		if c == strataColumn {
+			return nil, fmt.Errorf("FitCoxPH: stratification column %q must not appear in predictors", strataColumn)
+		}
 	}
 	for _, it := range intervals {
 		if it.Duration > math.MaxInt64 { // unreachable in practice; keeps the panic in tests only
@@ -160,6 +213,9 @@ func (StatmodelFitter) FitCoxPH(intervals []model.InterAccessInterval, covariate
 	ds := statmodel.NewDataset(cols, names)
 	cfg := duration.DefaultPHRegConfig()
 	cfg.EntryVar = ColEntry
+	if strataColumn != "" {
+		cfg.StrataVar = strataColumn
+	}
 	// Light L2 ridge on every predictor. ContractAge and SlotAge are
 	// structurally correlated (a slot can only exist from deploy block
 	// onwards) so the unregularized Hessian can become nearly singular
@@ -203,14 +259,15 @@ func (StatmodelFitter) FitCoxPH(intervals []model.InterAccessInterval, covariate
 	// Pad to len(covariates) with NaN so consumers can index safely and
 	// the text printer renders "NaN" rather than segfaulting.
 	out := &CoxResult{
-		Predictors: append([]string(nil), covariates...),
-		Coef:       append([]float64(nil), res.Params()...),
-		StdErr:     padOrCopy(res.StdErr(), len(covariates)),
-		PValue:     padOrCopy(res.PValues(), len(covariates)),
-		ZScore:     padOrCopy(res.ZScores(), len(covariates)),
-		LogLike:    res.LogLike(),
-		NumObs:     len(intervals),
-		Scales:     scales,
+		Predictors:    append([]string(nil), covariates...),
+		Coef:          append([]float64(nil), res.Params()...),
+		StdErr:        padOrCopy(res.StdErr(), len(covariates)),
+		PValue:        padOrCopy(res.PValues(), len(covariates)),
+		ZScore:        padOrCopy(res.ZScores(), len(covariates)),
+		LogLike:       res.LogLike(),
+		NumObs:        len(intervals),
+		Scales:        scales,
+		StratumColumn: strataColumn,
 	}
 	// Coef may also be shorter than covariates on a very-early bailout;
 	// pad to keep every slice the same length for consumers.
@@ -230,11 +287,44 @@ func (StatmodelFitter) FitCoxPH(intervals []model.InterAccessInterval, covariate
 			out.NumEvents++
 		}
 	}
-	t, h := ph.BaselineCumHaz(0, out.Coef)
-	out.BaselineTime = append([]float64(nil), t...)
-	out.BaselineCumHaz = append([]float64(nil), h...)
+	if strataColumn == "" {
+		t, h := ph.BaselineCumHaz(0, out.Coef)
+		out.BaselineTime = append([]float64(nil), t...)
+		out.BaselineCumHaz = append([]float64(nil), h...)
+	} else {
+		// Discover the unique stratum values in the training data and
+		// pull a per-stratum baseline cumulative hazard for each.
+		// statmodel assigns stratum indices in ascending value order
+		// of the stratum column, so StratumLabels ends up sorted.
+		strataValues := collectUniqueStrata(intervals, strataColumn)
+		out.StratumLabels = strataValues
+		out.StratumBaselineTimes = make([][]float64, len(strataValues))
+		out.StratumBaselineCumHaz = make([][]float64, len(strataValues))
+		for i := range strataValues {
+			t, h := ph.BaselineCumHaz(i, out.Coef)
+			out.StratumBaselineTimes[i] = append([]float64(nil), t...)
+			out.StratumBaselineCumHaz[i] = append([]float64(nil), h...)
+		}
+	}
 	out.intervals = append([]model.InterAccessInterval(nil), intervals...)
 	return out, nil
+}
+
+// collectUniqueStrata returns the sorted set of stratum-column values
+// present in intervals. Matches statmodel's ascending-sort ordering so
+// the i-th value corresponds to statmodel's stratum index i in
+// BaselineCumHaz(i, params).
+func collectUniqueStrata(intervals []model.InterAccessInterval, col string) []float64 {
+	seen := make(map[float64]struct{})
+	for _, it := range intervals {
+		seen[rawCovariate(it, col)] = struct{}{}
+	}
+	out := make([]float64, 0, len(seen))
+	for v := range seen {
+		out = append(out, v)
+	}
+	sort.Float64s(out)
+	return out
 }
 
 // padOrCopy returns a copy of xs padded out to length n with NaN.
@@ -291,19 +381,31 @@ func (r *CoxResult) linearPredictor(covariates map[string]float64) float64 {
 	return lp
 }
 
-// Survival returns S(t | x) for the raw Cox baseline, clipped to [0, 1].
+// Survival returns S(t | x) for the fitted Cox model, clipped to [0, 1].
 //
 //	S(t | x) = exp(-H_0(t) * exp(x'β))
 //
-// Use this rather than PredictAccessProb when you need the survival
-// curve at arbitrary t (e.g. the tiering policy's conditional-survival
-// search). PredictAccessProb at time τ is equivalent to 1 − Survival(τ).
+// On a stratified fit H_0 is the per-stratum baseline hazard, selected
+// by the interval's value in r.StratumColumn (which must appear in
+// covariates, or defaults to the first-observed stratum if absent).
+//
+// Use Survival rather than PredictAccessProb when you need the survival
+// curve at arbitrary t — e.g. the tiering policy's conditional-survival
+// search. PredictAccessProb at time τ is equivalent to 1 − Survival(τ).
 func (r *CoxResult) Survival(covariates map[string]float64, t float64) float64 {
-	if r == nil || len(r.BaselineTime) == 0 {
+	if r == nil {
 		return 1
 	}
 	lp := r.linearPredictor(covariates)
-	h := baselineCumHazAt(r.BaselineTime, r.BaselineCumHaz, t)
+	var stratumVal float64
+	if r.StratumColumn != "" {
+		stratumVal = covariates[r.StratumColumn]
+	}
+	times, hazards := r.baselineFor(stratumVal)
+	if len(times) == 0 {
+		return 1
+	}
+	h := baselineCumHazAt(times, hazards, t)
 	s := math.Exp(-h * math.Exp(lp))
 	if s < 0 {
 		return 0
@@ -314,15 +416,37 @@ func (r *CoxResult) Survival(covariates map[string]float64, t float64) float64 {
 	return s
 }
 
+// baselineFor resolves the baseline hazard grid to use for a row whose
+// stratum column takes value stratumVal. Unstratified fits return the
+// single BaselineTime / BaselineCumHaz; stratified fits match
+// stratumVal against StratumLabels. Unknown values fall through to the
+// first stratum because the fit saw no data from that category —
+// extrapolating via a real stratum is preferable to returning 0 hazard.
+func (r *CoxResult) baselineFor(stratumVal float64) (times, hazards []float64) {
+	if r.StratumColumn == "" || len(r.StratumLabels) == 0 {
+		return r.BaselineTime, r.BaselineCumHaz
+	}
+	for i, l := range r.StratumLabels {
+		if l == stratumVal {
+			return r.StratumBaselineTimes[i], r.StratumBaselineCumHaz[i]
+		}
+	}
+	return r.StratumBaselineTimes[0], r.StratumBaselineCumHaz[0]
+}
+
 // SurvivalForInterval is the InterAccessInterval analogue of Survival.
-// Uses the full predictor set fit on the model.
+// Uses the full predictor set fit on the model, plus the stratum
+// column (if any) so stratified fits can pick the right baseline.
 func (r *CoxResult) SurvivalForInterval(it model.InterAccessInterval, t float64) float64 {
 	if r == nil {
 		return 1
 	}
-	cov := make(map[string]float64, len(r.Predictors))
+	cov := make(map[string]float64, len(r.Predictors)+1)
 	for _, name := range r.Predictors {
 		cov[name] = rawCovariate(it, name)
+	}
+	if r.StratumColumn != "" {
+		cov[r.StratumColumn] = rawCovariate(it, r.StratumColumn)
 	}
 	return r.Survival(cov, t)
 }
