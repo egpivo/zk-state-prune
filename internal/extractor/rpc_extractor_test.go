@@ -231,6 +231,70 @@ func TestRPCExtractor_RejectsBadConfig(t *testing.T) {
 	}
 }
 
+func TestRPCExtractor_HighWaterAfterEventFlush(t *testing.T) {
+	// Regression: high-water mark must only advance after events for
+	// that block are durable. We simulate a mid-run abort by having
+	// the mock return a 500 on the SECOND block and verify that:
+	//   - events for block 1 are persisted
+	//   - high-water after the failure points at block 1 (not 2)
+	// so a resume re-fetches only block 2 onwards, not skipping it.
+	holderA := "0x000000000000000000000000000000000000000000000000000000000000aaaa"
+	holderB := "0x000000000000000000000000000000000000000000000000000000000000bbbb"
+	erc20 := "0x1111111111111111111111111111111111111111"
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req rpcRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		calls++
+		// Let block 1 go through; fail on block 2's receipts call.
+		blockHex, _ := req.Params[0].(string)
+		n, _ := strconv.ParseUint(strings.TrimPrefix(blockHex, "0x"), 16, 64)
+		if n == 2 && req.Method == "eth_getBlockReceipts" {
+			http.Error(w, "synthetic failure", http.StatusInternalServerError)
+			return
+		}
+		resp := rpcResponse{JSONRPC: "2.0", ID: req.ID}
+		var result any
+		switch req.Method {
+		case "eth_getBlockByNumber":
+			result = rpcBlock{Number: blockHex}
+		case "eth_getBlockReceipts":
+			result = []rpcReceipt{{
+				TransactionHash: "0xab",
+				BlockNumber:     blockHex,
+				Logs: []rpcLog{
+					transferLog(erc20, holderA, holderB, "", "erc20"),
+				},
+			}}
+		}
+		b, _ := json.Marshal(result)
+		resp.Result = b
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	db := openRPCTestDB(t)
+	ex, _ := NewRPCExtractor(RPCConfig{Endpoint: srv.URL, Start: 1, End: 2})
+	err := ex.Extract(ctx, db)
+	if err == nil {
+		t.Fatal("expected error from synthetic failure on block 2")
+	}
+	// Block 1's events should be durable.
+	events, _ := db.CountAccessEvents(ctx)
+	if events != 2 {
+		t.Errorf("block 1 events not persisted: CountAccessEvents=%d want 2", events)
+	}
+	// High-water should be 1 (last fully-flushed block), not 2.
+	hw, ok, err := readHighWater(ctx, db)
+	if err != nil || !ok {
+		t.Fatalf("readHighWater: hw=%d ok=%v err=%v", hw, ok, err)
+	}
+	if hw != 1 {
+		t.Errorf("high-water=%d want 1 — mark must not advance past a failed block", hw)
+	}
+}
+
 func TestRPCExtractor_PropagatesRPCError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req rpcRequest

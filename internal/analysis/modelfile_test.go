@@ -92,6 +92,73 @@ func TestModelFile_RejectsSchemaMismatch(t *testing.T) {
 	}
 }
 
+func TestLoadModelFile_RejectsShapeMismatch(t *testing.T) {
+	// Hand-crafted v3 files that violate size invariants Load should
+	// reject up front rather than letting SurvivalForInterval
+	// index-out-of-range at predict time.
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "coef shorter than predictors",
+			body: `{"schema_version":3,"tau":1,"epsilon":0,"coverage_level":0.9,
+				"pred_x":[0.0],"calibrated_y":[0.0],
+				"cox":{"predictors":["A","B"],"coef":[0.1],"scales":[{"Name":"A","Mean":0,"Std":1}],
+					"baseline_time":[1],"baseline_cum_haz":[0.1]}}`,
+		},
+		{
+			name: "scales shorter than predictors",
+			body: `{"schema_version":3,"tau":1,"epsilon":0,"coverage_level":0.9,
+				"pred_x":[0.0],"calibrated_y":[0.0],
+				"cox":{"predictors":["A","B"],"coef":[0.1,0.2],"scales":[{"Name":"A","Mean":0,"Std":1}],
+					"baseline_time":[1],"baseline_cum_haz":[0.1]}}`,
+		},
+		{
+			name: "baseline time/haz length mismatch",
+			body: `{"schema_version":3,"tau":1,"epsilon":0,"coverage_level":0.9,
+				"pred_x":[0.0],"calibrated_y":[0.0],
+				"cox":{"predictors":["A"],"coef":[0.1],"scales":[{"Name":"A","Mean":0,"Std":1}],
+					"baseline_time":[1,2],"baseline_cum_haz":[0.1]}}`,
+		},
+		{
+			name: "stratum labels without baselines",
+			body: `{"schema_version":3,"tau":1,"epsilon":0,"coverage_level":0.9,
+				"pred_x":[0.0],"calibrated_y":[0.0],
+				"cox":{"predictors":["A"],"coef":[0.1],"scales":[{"Name":"A","Mean":0,"Std":1}],
+					"baseline_time":[],"baseline_cum_haz":[],
+					"stratum_column":"ContractType","stratum_labels":[0,1],
+					"stratum_baseline_times":[[1]],"stratum_baseline_cum_haz":[[0.1]]}}`,
+		},
+		{
+			name: "stratum baseline time/haz length mismatch",
+			body: `{"schema_version":3,"tau":1,"epsilon":0,"coverage_level":0.9,
+				"pred_x":[0.0],"calibrated_y":[0.0],
+				"cox":{"predictors":["A"],"coef":[0.1],"scales":[{"Name":"A","Mean":0,"Std":1}],
+					"baseline_time":[],"baseline_cum_haz":[],
+					"stratum_column":"ContractType","stratum_labels":[0],
+					"stratum_baseline_times":[[1,2]],"stratum_baseline_cum_haz":[[0.1]]}}`,
+		},
+		{
+			name: "zero predictors",
+			body: `{"schema_version":3,"tau":1,"epsilon":0,"coverage_level":0.9,
+				"pred_x":[0.0],"calibrated_y":[0.0],
+				"cox":{"predictors":[],"coef":[],"scales":[],"baseline_time":[1],"baseline_cum_haz":[0.1]}}`,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "bad.json")
+			if err := osWriteFile(path, []byte(c.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadModelFile(path); err == nil {
+				t.Errorf("expected error for %s", c.name)
+			}
+		})
+	}
+}
+
 func TestModelFile_SaveAndLoadErrorPaths(t *testing.T) {
 	if err := SaveModelFile("/tmp/never", nil); err == nil {
 		t.Error("expected nil-model error")

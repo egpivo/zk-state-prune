@@ -151,6 +151,46 @@ func LoadModelFile(path string) (*CalibratedModel, error) {
 	if len(file.PredX) != len(file.CalibratedY) {
 		return nil, fmt.Errorf("LoadModelFile: isotonic grid size mismatch (PredX=%d CalibratedY=%d)", len(file.PredX), len(file.CalibratedY))
 	}
+	cp := file.Cox
+	// Every predict-path index lookup expects Predictors, Coef, and
+	// Scales to be the same length. Cast a mismatched file out early
+	// rather than letting SurvivalForInterval panic later with an
+	// opaque index-out-of-range.
+	nPred := len(cp.Predictors)
+	if nPred == 0 {
+		return nil, fmt.Errorf("LoadModelFile: cox has zero predictors")
+	}
+	if len(cp.Coef) != nPred {
+		return nil, fmt.Errorf("LoadModelFile: cox coef len=%d != predictors=%d", len(cp.Coef), nPred)
+	}
+	if len(cp.Scales) != nPred {
+		return nil, fmt.Errorf("LoadModelFile: cox scales len=%d != predictors=%d", len(cp.Scales), nPred)
+	}
+	// Baseline hazard: either a single grid (unstratified) or a
+	// per-stratum map consistent with StratumLabels.
+	if cp.StratumColumn == "" {
+		if len(cp.BaselineTime) != len(cp.BaselineCumHaz) {
+			return nil, fmt.Errorf("LoadModelFile: baseline time/haz len mismatch (%d vs %d)", len(cp.BaselineTime), len(cp.BaselineCumHaz))
+		}
+		if len(cp.StratumLabels) != 0 || len(cp.StratumBaselineTimes) != 0 || len(cp.StratumBaselineCumHaz) != 0 {
+			return nil, fmt.Errorf("LoadModelFile: unstratified model has non-empty stratum fields")
+		}
+	} else {
+		nStrata := len(cp.StratumLabels)
+		if nStrata == 0 {
+			return nil, fmt.Errorf("LoadModelFile: stratified model (%q) has no stratum labels", cp.StratumColumn)
+		}
+		if len(cp.StratumBaselineTimes) != nStrata || len(cp.StratumBaselineCumHaz) != nStrata {
+			return nil, fmt.Errorf("LoadModelFile: stratified model has %d labels but times=%d, hazards=%d",
+				nStrata, len(cp.StratumBaselineTimes), len(cp.StratumBaselineCumHaz))
+		}
+		for i := 0; i < nStrata; i++ {
+			if len(cp.StratumBaselineTimes[i]) != len(cp.StratumBaselineCumHaz[i]) {
+				return nil, fmt.Errorf("LoadModelFile: stratum %d baseline time/haz len mismatch (%d vs %d)",
+					i, len(cp.StratumBaselineTimes[i]), len(cp.StratumBaselineCumHaz[i]))
+			}
+		}
+	}
 
 	c := file.Cox
 	cox := &CoxResult{

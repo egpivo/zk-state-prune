@@ -214,7 +214,7 @@ func newExtractCmd() *cobra.Command {
 			}
 		},
 	}
-	cmd.Flags().StringVar(&source, "source", "mock", "data source: mock|rpc")
+	cmd.Flags().StringVar(&source, "source", "mock", "data source: mock|rpc (rpc = Transfer-log surrogate, not a full state-diff extractor)")
 	cmd.Flags().StringVar(&output, "output", defaultDBPath, "output SQLite DB path")
 	cmd.Flags().Uint64Var(&seed, "seed", 42, "(mock) PRNG seed for the generator")
 	cmd.Flags().IntVar(&numContracts, "num-contracts", 0, "(mock) override default contract count (0 = use built-in)")
@@ -227,10 +227,14 @@ func newExtractCmd() *cobra.Command {
 }
 
 // refuseOverwriteIfPopulated is the shared safety rail for `extract`
-// against both the mock and rpc sources: on mock it guards the full
-// db.Reset(); on rpc it guards a partial-trace DB that the user may
-// want to keep rather than mix with a fresh range.
-func refuseOverwriteIfPopulated(ctx context.Context, db *storage.DB, path string, force bool) error {
+// against both the mock and rpc sources. On `--force` the mock source
+// relies on its internal db.Reset() to wipe rows; the rpc source
+// does not Reset internally (it resumes incrementally), so we do the
+// wipe here to honour the --force flag's plain-English promise of
+// "overwrite". Without that, --force on rpc would only bypass the
+// count check and leave stale rows + the rpc_high_water mark intact,
+// which is exactly what the user asked not to happen.
+func refuseOverwriteIfPopulated(ctx context.Context, db *storage.DB, path string, force, resetOnForce bool) error {
 	slots, err := db.CountSlots(ctx)
 	if err != nil {
 		return fmt.Errorf("count existing slots: %w", err)
@@ -239,9 +243,16 @@ func refuseOverwriteIfPopulated(ctx context.Context, db *storage.DB, path string
 	if err != nil {
 		return fmt.Errorf("count existing events: %w", err)
 	}
-	if (slots > 0 || events > 0) && !force {
+	populated := slots > 0 || events > 0
+	if populated && !force {
 		return fmt.Errorf("refusing to overwrite %q: %d slots and %d events already present. Use --force to proceed.",
 			path, slots, events)
+	}
+	if populated && force && resetOnForce {
+		slog.Info("forcing overwrite of existing DB", "path", path, "slots", slots, "events", events)
+		if err := db.Reset(ctx); err != nil {
+			return fmt.Errorf("reset db before overwrite: %w", err)
+		}
 	}
 	return nil
 }
@@ -252,7 +263,9 @@ func runMockExtract(ctx context.Context, output string, seed uint64, numContract
 		return err
 	}
 	defer db.Close()
-	if err := refuseOverwriteIfPopulated(ctx, db, output, force); err != nil {
+	// mock extractor calls db.Reset() internally as part of its
+	// idempotency contract, so we don't need to Reset here too.
+	if err := refuseOverwriteIfPopulated(ctx, db, output, force, false); err != nil {
 		return err
 	}
 
@@ -300,7 +313,11 @@ func runRPCExtract(ctx context.Context, output, endpoint string, start, end uint
 		return err
 	}
 	defer db.Close()
-	if err := refuseOverwriteIfPopulated(ctx, db, output, force); err != nil {
+	// rpc extractor resumes incrementally from the high-water mark
+	// rather than wiping on every run, so --force needs to explicitly
+	// Reset() the DB here — otherwise stale rows + the old high-water
+	// would survive what the user thought was an overwrite.
+	if err := refuseOverwriteIfPopulated(ctx, db, output, force, true); err != nil {
 		return err
 	}
 	cfg := extractor.DefaultRPCConfig()
@@ -925,16 +942,35 @@ func newReportCmd() *cobra.Command {
 				}
 				return buildStatisticalPolicy(built.Intervals, 0.3, 1, 0, costs, robust)
 			}
+			// When the user explicitly passes --model, a load failure
+			// should be hard — otherwise the report silently drops
+			// the statistical comparison and the remaining sections
+			// look deceptively complete. When no --model was passed
+			// (built-from-scratch path) a non-fatal warning is fine;
+			// the on-the-fly fit can fail on small or degenerate
+			// datasets and we don't want a single bad split to kill
+			// the whole end-to-end report.
+			statErr, statRErr := "", ""
 			if stat, err := buildStat(false); err != nil {
+				if modelPath != "" {
+					return fmt.Errorf("statistical policy from --model: %w", err)
+				}
 				slog.Warn("statistical policy unavailable for report", "err", err)
+				statErr = err.Error()
 			} else {
 				policies = append(policies, stat)
 			}
 			if statR, err := buildStat(true); err != nil {
+				if modelPath != "" {
+					return fmt.Errorf("statistical-robust policy from --model: %w", err)
+				}
 				slog.Warn("statistical-robust policy unavailable for report", "err", err)
+				statRErr = err.Error()
 			} else {
 				policies = append(policies, statR)
 			}
+			_ = statErr
+			_ = statRErr
 			results, err := pruning.RunAll(policies, built.Intervals, costs)
 			if err != nil {
 				return fmt.Errorf("run all policies: %w", err)

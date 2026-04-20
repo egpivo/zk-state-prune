@@ -51,16 +51,28 @@ func DefaultRPCConfig() RPCConfig {
 	}
 }
 
-// RPCExtractor pulls real state-touch traces from a JSON-RPC-exposed
-// L2 rollup and persists them to the zksp analysis DB. Phase-3 scope:
-// synthesize slot accesses from ERC-20/ERC-721 Transfer events (the
-// one log signature every chain shares by convention). Arbitrary
-// storage writes not surfaced via a Transfer event are invisible
-// here; a deeper extractor would use debug_traceBlockByNumber with a
-// prestate tracer, which the Scroll public endpoint does not expose.
-// The pipeline downstream of this extractor doesn't care where the
-// (slot, event) rows come from, so a richer trace source is a
-// drop-in replacement.
+// RPCExtractor is a TRANSFER-LOG SURROGATE extractor, not a true
+// state-diff / storage-access extractor. It walks blocks over a
+// JSON-RPC endpoint and synthesizes pseudo "balance slot" rows from
+// ERC-20 / ERC-721 Transfer events — the one log signature every
+// EVM-compatible chain shares by convention. The downstream analysis
+// pipeline treats slot_id as an opaque key, so these rows feed the
+// same EDA / survival / tiering passes the mock extractor does, and
+// let us run against real on-chain activity without needing trace
+// APIs most public endpoints don't expose.
+//
+// IT DOES NOT CAPTURE:
+//   - slot writes that don't emit a Transfer (storage rebalances,
+//     admin settings, DEX pool state, governance bookkeeping…),
+//   - slot reads at all,
+//   - the real EVM storage-slot identifiers (we hash
+//     contract||holder as a deterministic surrogate id).
+//
+// For full state-access traces, the right data source is
+// debug_traceBlockByNumber with a prestate/stateDiff tracer on an
+// archive node, or a chain's specialized state-diff endpoint. Those
+// are a drop-in replacement: the Extractor interface is the only
+// contract downstream code depends on.
 type RPCExtractor struct {
 	cfg  RPCConfig
 	last RPCDiagnostics
@@ -220,10 +232,14 @@ func (e *RPCExtractor) Extract(ctx context.Context, db *storage.DB) error {
 							return fmt.Errorf("upsert slot %s: %w", s.slotID, err)
 						}
 					}
-					s.lastAccess = blockNum
-					s.accessCount++
-					contract.totalSlots = uint64(len(slots))
-					contract.activeSlots = contract.totalSlots
+					// No per-slot counters maintained here: the
+					// end-of-loop sweep that used to copy them into
+					// the StateSlot row was deleted (it clobbered
+					// cumulative counts on incremental runs and used
+					// a global slot total instead of a per-contract
+					// one). Analysis passes rebuild counts from
+					// access_events, so the slot row's counters stay
+					// at their initial values.
 					eventBuf = append(eventBuf, model.AccessEvent{
 						SlotID:      slotID,
 						BlockNumber: blockNum,
@@ -239,59 +255,43 @@ func (e *RPCExtractor) Extract(ctx context.Context, db *storage.DB) error {
 			}
 		}
 
-		// Checkpoint the high-water mark after each block so a crash
-		// can resume without re-fetching everything.
+		// Flush all buffered events for this block BEFORE advancing the
+		// high-water mark. If we crash (or the RPC errors) after the
+		// mark is written but before events are persisted, the next
+		// resume would skip this block and the events would be lost
+		// forever — the mark's only job is to certify that everything
+		// from earlier blocks is already durable.
+		if err := flush(); err != nil {
+			return err
+		}
 		if err := writeHighWater(ctx, db, blockNum); err != nil {
 			return fmt.Errorf("write high-water mark: %w", err)
 		}
 		_ = block // block metadata unused for now; kept for future fields
 	}
 
-	if err := flush(); err != nil {
-		return err
-	}
-
-	// Persist contract + slot rows in one pass at the end. Upsert
-	// semantics mean incremental runs correctly refresh lastAccess /
-	// accessCount without duplicating rows.
-	for _, c := range contracts {
-		if err := db.UpsertContract(ctx, model.ContractMeta{
-			Address:      c.address,
-			ContractType: c.category,
-			DeployBlock:  c.deployBlock,
-			TotalSlots:   c.totalSlots,
-			ActiveSlots:  c.activeSlots,
-		}); err != nil {
-			return fmt.Errorf("upsert contract %s: %w", c.address, err)
-		}
-	}
-	for _, s := range slots {
-		if err := db.UpsertSlot(ctx, model.StateSlot{
-			SlotID:       s.slotID,
-			ContractAddr: s.contractAddr,
-			SlotIndex:    s.slotIndex,
-			SlotType:     s.slotType,
-			CreatedAt:    s.createdAt,
-			LastAccess:   s.lastAccess,
-			AccessCount:  s.accessCount,
-			IsActive:     true,
-		}); err != nil {
-			return fmt.Errorf("upsert slot %s: %w", s.slotID, err)
-		}
-	}
+	// Contract + slot rows were upserted inline when first seen (so
+	// FK(event→slot) is always satisfied at flush time). We do NOT
+	// do an end-of-loop sweep to backfill access_count / total_slots:
+	// those fields would be overwritten with this-run-only values,
+	// clobbering the accumulated counts from any earlier incremental
+	// run against the same DB. Every analysis pass rebuilds access
+	// counts directly from the access_events table, so leaving the
+	// slot/contract counters at their initial (0) state is benign
+	// for downstream correctness; Phase 4 can add a SQL-level
+	// incremental update if a diagnostic surfaces that needs them.
 	return nil
 }
 
-// contractState / slotState are extractor-local accumulators; they get
-// copied into the domain types only at the final flush so we avoid
-// building short-lived model.ContractMeta / model.StateSlot values in
-// the hot loop.
+// contractState / slotState are extractor-local "have we seen this
+// already?" flags. They do NOT carry counter state (access_count /
+// last_access / total_slots / active_slots) because mixing per-run
+// counters with persisted DB rows is unsound on incremental resume —
+// analysis passes already recompute counters from access_events.
 type contractState struct {
 	address     string
 	category    model.ContractCategory
 	deployBlock uint64
-	totalSlots  uint64
-	activeSlots uint64
 }
 
 type slotState struct {
@@ -300,8 +300,6 @@ type slotState struct {
 	slotIndex    uint64
 	slotType     model.SlotType
 	createdAt    uint64
-	lastAccess   uint64
-	accessCount  uint64
 }
 
 // isTransferLog recognises the Transfer(address,address,uint256)
