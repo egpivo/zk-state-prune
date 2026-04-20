@@ -231,6 +231,35 @@ func TestRPCExtractor_RejectsBadConfig(t *testing.T) {
 	}
 }
 
+func TestClearRPCState_RemovesHighWater(t *testing.T) {
+	ctx := context.Background()
+	db := openRPCTestDB(t)
+	// Seed a high-water mark directly so we don't need to stand up
+	// an HTTP server for this minimal integrity check.
+	if err := writeHighWater(ctx, db, 42); err != nil {
+		t.Fatalf("writeHighWater: %v", err)
+	}
+	// Sanity: it's there.
+	if hw, ok, err := readHighWater(ctx, db); err != nil || !ok || hw != 42 {
+		t.Fatalf("seed: hw=%d ok=%v err=%v", hw, ok, err)
+	}
+	// Data-table Reset must NOT clear the RPC state on its own (keeps
+	// Reset a pure truncation, not an extractor wipe).
+	if err := db.Reset(ctx); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	if hw, ok, _ := readHighWater(ctx, db); !ok || hw != 42 {
+		t.Errorf("Reset should not touch schema_meta: hw=%d ok=%v", hw, ok)
+	}
+	// ClearRPCState is the explicit opt-in that removes it.
+	if err := ClearRPCState(ctx, db); err != nil {
+		t.Fatalf("ClearRPCState: %v", err)
+	}
+	if _, ok, _ := readHighWater(ctx, db); ok {
+		t.Error("ClearRPCState should remove the high-water key")
+	}
+}
+
 func TestRPCExtractor_HighWaterAfterEventFlush(t *testing.T) {
 	// Regression: high-water mark must only advance after events for
 	// that block are durable. We simulate a mid-run abort by having

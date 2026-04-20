@@ -62,7 +62,7 @@ func seed(t *testing.T, db *storage.DB, slotID string, createdAt uint64, events 
 			TxHash:      "0x00",
 		})
 	}
-	if err := db.InsertAccessEvents(ctx, evs); err != nil {
+	if _, err := db.InsertAccessEvents(ctx, evs); err != nil {
 		t.Fatalf("InsertAccessEvents: %v", err)
 	}
 }

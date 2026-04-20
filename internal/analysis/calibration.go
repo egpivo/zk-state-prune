@@ -54,10 +54,16 @@ type CalibratedModel struct {
 	//   uses at the idle = 0 search sample).
 	//
 	//   ConditionalEpsilon covers the *raw Cox conditional* prediction
-	//   1 − S(u+τ)/S(u) at an arbitrary idle duration u > 0 — the
-	//   quantity the statistical policy actually evaluates at every
-	//   idle u during its T*-search. Split-conformal on (interval, u,
-	//   label_at_u) triples drawn from the cal half.
+	//   1 − S(u+τ)/S(u) for a SINGLE idle duration u drawn from the
+	//   per-row u distribution the cal pass used. It is a marginal
+	//   (finite-sample) upper-bound quantile on one fresh (interval,
+	//   u, label_at_u) triple drawn from the same distribution as
+	//   the cal half. It is NOT a simultaneous-coverage bound across
+	//   all idle samples the statistical policy evaluates during its
+	//   T*-search: the policy probes ~21 u values per interval and
+	//   the marginal coverage claim does not extend to the worst of
+	//   those probes. Treat the robust policy's "valid at every
+	//   idle" as engineering-level defensive, not a theorem.
 	//
 	// Both guarantees are valid only for (i) the target quantity they
 	// were fit against, (ii) data drawn from a distribution
@@ -150,16 +156,23 @@ func (c *CalibratedModel) PredictUpperAccessProbForInterval(it model.InterAccess
 	return upper
 }
 
-// PredictUpperConditionalAccessProb returns a conformal upper bound on
-// the conditional access probability at idle duration u:
+// PredictUpperConditionalAccessProb returns a pessimism-adjusted upper
+// bound on the conditional access probability at idle duration u:
 //
 //	p_upper(u) = min(1, (1 − S(u+τ)/S(u)) + ConditionalEpsilon)
 //
-// This is the valid margin for the robust policy to apply at idle > 0
-// samples during its T*-search. It uses the raw Cox survival (not the
-// isotonic calibration — the isotonic grid is only meaningful at
-// idle = 0). When ConditionalEpsilon is zero (no conditional conformal
-// fit) the function returns the raw point estimate.
+// ConditionalEpsilon was fit as a split-conformal quantile on one u
+// per holdout row, so the coverage claim is MARGINAL (a fresh single
+// probe drawn from the same (row, u) distribution lies in
+// [raw − ε, raw + ε] at the nominal CoverageLevel). It is NOT a
+// simultaneous-coverage bound: the statistical policy probes many u
+// values per interval during its T*-search, and the worst over those
+// probes can exceed the marginal quantile. The robust policy still
+// profits from the extra margin in practice — ε shifts decisions
+// toward keeping slots hot when the model is noisier — but "robust"
+// here means "cheapest valid pessimism layer", not "uniform over the
+// search grid". When ConditionalEpsilon is zero (no conformal fit)
+// the function returns the raw point estimate.
 func (c *CalibratedModel) PredictUpperConditionalAccessProb(it model.InterAccessInterval, idle float64) float64 {
 	if c == nil || c.Base == nil {
 		return 0

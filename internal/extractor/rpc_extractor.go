@@ -90,6 +90,14 @@ type RPCDiagnostics struct {
 	LogsSeen         int
 	TransferLogs     int
 	SlotsCreated     int
+	// EventsAttempted is the number of rows passed into
+	// InsertAccessEvents across all flushes for this run — i.e.
+	// everything the extractor wanted to write. EventsPersisted is
+	// the number actually inserted after the unique index dropped
+	// duplicates on a resume re-fetch. When Attempted > Persisted,
+	// the delta is the number of rows a previous incarnation of
+	// this run had already committed.
+	EventsAttempted  int
 	EventsPersisted  int
 	ContractsCreated int
 	StartBlock       uint64
@@ -145,10 +153,15 @@ func (e *RPCExtractor) Extract(ctx context.Context, db *storage.DB) error {
 		if len(eventBuf) == 0 {
 			return nil
 		}
-		if err := db.InsertAccessEvents(ctx, eventBuf); err != nil {
+		// Count actual inserted rows (INSERT OR IGNORE drops dups on
+		// resume re-fetches) so diagnostics report persisted-rather-
+		// than-attempted.
+		inserted, err := db.InsertAccessEvents(ctx, eventBuf)
+		if err != nil {
 			return err
 		}
-		e.last.EventsPersisted += len(eventBuf)
+		e.last.EventsPersisted += int(inserted)
+		e.last.EventsAttempted += len(eventBuf)
 		eventBuf = eventBuf[:0]
 		return nil
 	}
@@ -462,7 +475,23 @@ func hexU64(v uint64) string {
 
 // ---- high-water mark ---------------------------------------------------
 
-const rpcHighWaterKey = "rpc_high_water_block"
+// RPCHighWaterKey is the schema_meta key the RPC extractor uses to
+// track the last fully-flushed block. Exposed so callers (e.g. the
+// CLI's `--force` path) can clear it explicitly — storage.Reset()
+// intentionally does not touch schema_meta so it remains a pure
+// data-table truncation, not an extractor-state wipe.
+const RPCHighWaterKey = "rpc_high_water_block"
+
+// ClearRPCState removes the RPC extractor's schema_meta keys so a
+// forced re-extraction starts from the user-supplied --start rather
+// than resuming past the old high-water mark.
+func ClearRPCState(ctx context.Context, db *storage.DB) error {
+	if _, err := db.SQL().ExecContext(ctx,
+		`DELETE FROM schema_meta WHERE key = ?`, RPCHighWaterKey); err != nil {
+		return fmt.Errorf("clear rpc state: %w", err)
+	}
+	return nil
+}
 
 // readHighWater returns the last successfully-extracted block number
 // from schema_meta, or (0, false) if the extractor has never run
@@ -471,7 +500,7 @@ const rpcHighWaterKey = "rpc_high_water_block"
 func readHighWater(ctx context.Context, db *storage.DB) (uint64, bool, error) {
 	var v string
 	err := db.SQL().QueryRowContext(ctx,
-		`SELECT value FROM schema_meta WHERE key = ?`, rpcHighWaterKey).
+		`SELECT value FROM schema_meta WHERE key = ?`, RPCHighWaterKey).
 		Scan(&v)
 	if err != nil {
 		// sql.ErrNoRows shows up as a typed error; anything else is fatal.
@@ -491,6 +520,6 @@ func writeHighWater(ctx context.Context, db *storage.DB, block uint64) error {
 	_, err := db.SQL().ExecContext(ctx,
 		`INSERT INTO schema_meta(key, value) VALUES(?, ?)
 		 ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
-		rpcHighWaterKey, strconv.FormatUint(block, 10))
+		RPCHighWaterKey, strconv.FormatUint(block, 10))
 	return err
 }

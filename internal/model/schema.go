@@ -51,6 +51,16 @@ CREATE TABLE IF NOT EXISTS access_events (
 CREATE INDEX IF NOT EXISTS idx_events_slot_block ON access_events(slot_id, block_number);
 CREATE INDEX IF NOT EXISTS idx_events_block      ON access_events(block_number);
 
+-- Idempotency guard on event insertion. Any re-issued (slot_id,
+-- block_number, access_type, tx_hash) tuple collapses to the first
+-- surviving row instead of duplicating. This makes the RPC
+-- extractor's "crash between event flush and high-water write →
+-- resume re-fetches → same events again" path cost-free: on resume
+-- every row in the re-fetched block hits this unique index and is
+-- silently skipped by the INSERT OR IGNORE in storage.DB.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_events_unique
+    ON access_events(slot_id, block_number, access_type, tx_hash);
+
 CREATE TABLE IF NOT EXISTS schema_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL

@@ -130,7 +130,10 @@ func (m *MockExtractor) Extract(ctx context.Context, db *storage.DB) error {
 	const eventBatch = 10_000
 	eventBuf := make([]model.AccessEvent, 0, eventBatch)
 	flush := func() error {
-		if err := db.InsertAccessEvents(ctx, eventBuf); err != nil {
+		// Mock always generates fresh synthetic rows on a Reset()'d
+		// DB, so the inserted-row count equals len(eventBuf); the
+		// return value goes to _.
+		if _, err := db.InsertAccessEvents(ctx, eventBuf); err != nil {
 			return err
 		}
 		eventBuf = eventBuf[:0]

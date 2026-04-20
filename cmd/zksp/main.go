@@ -316,9 +316,19 @@ func runRPCExtract(ctx context.Context, output, endpoint string, start, end uint
 	// rpc extractor resumes incrementally from the high-water mark
 	// rather than wiping on every run, so --force needs to explicitly
 	// Reset() the DB here — otherwise stale rows + the old high-water
-	// would survive what the user thought was an overwrite.
+	// would survive what the user thought was an overwrite. Note
+	// that storage.Reset() deliberately leaves schema_meta alone
+	// (it's a generic data-table truncation, not an extractor-state
+	// wipe), so we also nuke the RPC extractor's high-water key here
+	// or a forced re-run would still resume past the previous mark
+	// and silently skip part of the requested range.
 	if err := refuseOverwriteIfPopulated(ctx, db, output, force, true); err != nil {
 		return err
+	}
+	if force {
+		if err := extractor.ClearRPCState(ctx, db); err != nil {
+			return err
+		}
 	}
 	cfg := extractor.DefaultRPCConfig()
 	cfg.Endpoint = endpoint
@@ -345,6 +355,7 @@ func runRPCExtract(ctx context.Context, output, endpoint string, start, end uint
 		"transfer_logs", d.TransferLogs,
 		"contracts_created", d.ContractsCreated,
 		"slots_created", d.SlotsCreated,
+		"events_attempted", d.EventsAttempted,
 		"events_persisted", d.EventsPersisted)
 	return nil
 }
@@ -706,28 +717,33 @@ func statisticalPolicyFromCalibrated(
 	name := "statistical"
 	var predict pruning.CondAccessProbFunc = rawCondP
 	if robust {
-		// Robust variant. Two separately-fit conformal quantiles
-		// back the policy, each one valid for the exact quantity it
-		// was trained on:
+		// Robust variant. Two separately-fit ε values back the
+		// policy, each one a marginal (not simultaneous) coverage
+		// bound on its own target quantity:
 		//
 		//   - At the idle = 0 sample we use the *calibrated* point
 		//     upper bound p̂(τ) + Epsilon (CalibratedModel.
-		//     PredictUpperAccessProbForInterval), covered by the
-		//     isotonic-grid split-conformal fit in CalibrateAt.
+		//     PredictUpperAccessProbForInterval). Epsilon is the
+		//     split-conformal quantile fit on PAV residuals at
+		//     τ / idle = 0; as a single-point probe at exactly
+		//     that quantity it has a clean finite-sample marginal
+		//     guarantee.
 		//
 		//   - At idle > 0 samples we use the *raw Cox conditional*
 		//     upper bound (1 − S(u+τ)/S(u)) + ConditionalEpsilon
-		//     (PredictUpperConditionalAccessProb), covered by the
-		//     conditional split-conformal fit on (interval, u,
-		//     label_at_u) triples in CalibrateAt's conditional pass.
+		//     (PredictUpperConditionalAccessProb). ConditionalEpsilon
+		//     was fit on ONE deterministically-sampled u per cal
+		//     row, so it covers a fresh single-u probe marginally —
+		//     NOT the worst over the ~21 u values the T*-search
+		//     scans per interval. Treat this as a principled
+		//     pessimism margin rather than a simultaneous bound;
+		//     the Phase-4 upgrade would fit a per-u or max-over-u
+		//     conformal quantile so "robust at every sample" is a
+		//     theorem rather than an engineering approximation.
 		//
-		// Each sample the T*-search evaluates is now backed by a
-		// finite-sample upper bound on its own target quantity, so
-		// the demotion rule's "only demote when we're confident"
-		// reading is valid at every point on the search grid.
 		// Falls back to raw point estimates if the corresponding ε
-		// was not fit (e.g., tiny holdouts where
-		// ConditionalEpsilon stays zero).
+		// is zero (e.g. tiny holdouts where ConditionalEpsilon
+		// couldn't be fit on 10+ unambiguous rows).
 		name = "statistical-robust"
 		predict = func(it model.InterAccessInterval, idle float64) float64 {
 			if idle == 0 {
