@@ -93,36 +93,57 @@ func (d *DB) UpsertSlot(ctx context.Context, s model.StateSlot) error {
 	return nil
 }
 
-// InsertAccessEvents bulk-inserts access events inside a single transaction.
-// Extractors should batch into reasonable chunks (~10k) to keep memory bounded
-// while still amortizing the per-statement overhead.
-func (d *DB) InsertAccessEvents(ctx context.Context, events []model.AccessEvent) error {
+// InsertAccessEvents bulk-inserts access events inside a single
+// transaction and returns the number of rows actually inserted.
+// Rows dropped by the unique-index INSERT OR IGNORE (duplicates from
+// a resume re-fetch) are not counted, so extractor diagnostics can
+// report "events persisted" instead of "events attempted".
+// Extractors should batch into reasonable chunks (~10k) to keep
+// memory bounded while still amortizing the per-statement overhead.
+func (d *DB) InsertAccessEvents(ctx context.Context, events []model.AccessEvent) (int64, error) {
 	if len(events) == 0 {
-		return nil
+		return 0, nil
 	}
 	tx, err := d.sql.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
+		return 0, fmt.Errorf("begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// INSERT OR IGNORE + the unique index on
+	// (slot_id, block_number, access_type, tx_hash) makes event
+	// insertion idempotent: an extractor crash between event flush
+	// and its high-water-mark update will re-fetch the block on
+	// resume and re-emit the same rows; the unique index drops the
+	// duplicates instead of ballooning the event table. The
+	// trade-off is that a legitimate repeat of the exact same tuple
+	// collapses to one row — but in both the mock and the RPC
+	// Transfer-log surrogate every event already carries a distinct
+	// synthetic tx_hash, so collisions are limited to the resume
+	// path we're explicitly de-duping here.
 	stmt, err := tx.PrepareContext(ctx,
-		`INSERT INTO access_events(slot_id, block_number, access_type, tx_hash)
+		`INSERT OR IGNORE INTO access_events(slot_id, block_number, access_type, tx_hash)
 		 VALUES(?, ?, ?, ?)`)
 	if err != nil {
-		return fmt.Errorf("prepare insert: %w", err)
+		return 0, fmt.Errorf("prepare insert: %w", err)
 	}
 	defer stmt.Close()
 
+	var inserted int64
 	for _, e := range events {
-		if _, err := stmt.ExecContext(ctx, e.SlotID, e.BlockNumber, e.AccessType.String(), e.TxHash); err != nil {
-			return fmt.Errorf("insert event slot=%s block=%d: %w", e.SlotID, e.BlockNumber, err)
+		res, err := stmt.ExecContext(ctx, e.SlotID, e.BlockNumber, e.AccessType.String(), e.TxHash)
+		if err != nil {
+			return inserted, fmt.Errorf("insert event slot=%s block=%d: %w", e.SlotID, e.BlockNumber, err)
+		}
+		n, aerr := res.RowsAffected()
+		if aerr == nil {
+			inserted += n
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit: %w", err)
+		return inserted, fmt.Errorf("commit: %w", err)
 	}
-	return nil
+	return inserted, nil
 }
 
 // Reset truncates all data tables (contracts, slots, events) while leaving

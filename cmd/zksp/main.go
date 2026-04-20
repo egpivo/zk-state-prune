@@ -195,84 +195,169 @@ func newExtractCmd() *cobra.Command {
 		numContracts int
 		totalBlocks  uint64
 		force        bool
+		rpcEndpoint  string
+		rpcStart     uint64
+		rpcEnd       uint64
 	)
 	cmd := &cobra.Command{
 		Use:   "extract",
-		Short: "Populate the analysis DB with state-diff data (Phase 1: mock generator only)",
+		Short: "Populate the analysis DB with state-diff data (mock or real RPC)",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if source != "mock" {
-				return fmt.Errorf("source %q not supported in Phase 1 (use mock)", source)
-			}
 			ctx := cmd.Context()
-			db, err := openDB(ctx, output)
-			if err != nil {
-				return err
+			switch source {
+			case "mock":
+				return runMockExtract(ctx, output, seed, numContracts, totalBlocks, force)
+			case "rpc":
+				return runRPCExtract(ctx, output, rpcEndpoint, rpcStart, rpcEnd, force)
+			default:
+				return fmt.Errorf("source %q not supported (use mock|rpc)", source)
 			}
-			defer db.Close()
-
-			// Safety rail: the mock extractor calls db.Reset(ctx) on
-			// entry to honour the Extractor interface's idempotency
-			// contract, which truncates every row in the analysis DB.
-			// Refuse to do that silently when the target DB already
-			// contains data — the user probably pointed us at the
-			// wrong file. --force opts in to the overwrite.
-			existingSlots, err := db.CountSlots(ctx)
-			if err != nil {
-				return fmt.Errorf("count existing slots: %w", err)
-			}
-			existingEvents, err := db.CountAccessEvents(ctx)
-			if err != nil {
-				return fmt.Errorf("count existing events: %w", err)
-			}
-			if (existingSlots > 0 || existingEvents > 0) && !force {
-				return fmt.Errorf("refusing to overwrite %q: %d slots and %d events already present. Use --force to proceed.",
-					output, existingSlots, existingEvents)
-			}
-
-			cfg := extractor.DefaultMockConfig()
-			cfg.Seed = seed
-			if numContracts > 0 {
-				cfg.NumContracts = numContracts
-			}
-			if totalBlocks > 0 {
-				cfg.TotalBlocks = totalBlocks
-				// Rescale the default window so it still fits the
-				// requested horizon. Pre-window fraction stays at 0.2.
-				if cfg.Window.End > totalBlocks || cfg.Window.End == 0 {
-					cfg.Window = model.ObservationWindow{Start: totalBlocks / 5, End: totalBlocks}
-				}
-			}
-
-			slog.Info("extract begin",
-				"output", output,
-				"seed", cfg.Seed,
-				"contracts", cfg.NumContracts,
-				"total_blocks", cfg.TotalBlocks,
-				"window_start", cfg.Window.Start,
-				"window_end", cfg.Window.End)
-
-			ex := extractor.NewMockExtractor(cfg)
-			if err := ex.Extract(ctx, db); err != nil {
-				return fmt.Errorf("extract: %w", err)
-			}
-			d := ex.LastDiagnostics()
-			slog.Info("extract complete",
-				"contracts", d.Contracts,
-				"slots", d.Slots,
-				"events", d.Events,
-				"pre_window_slots", d.PreWindowSlots,
-				"periodic_contracts", d.PeriodicContracts,
-				"events_in_window", d.EventsInWindow)
-			return nil
 		},
 	}
-	cmd.Flags().StringVar(&source, "source", "mock", "data source (Phase 1: mock only)")
+	cmd.Flags().StringVar(&source, "source", "mock", "data source: mock|rpc (rpc = Transfer-log surrogate, not a full state-diff extractor)")
 	cmd.Flags().StringVar(&output, "output", defaultDBPath, "output SQLite DB path")
-	cmd.Flags().Uint64Var(&seed, "seed", 42, "PRNG seed for the mock generator")
-	cmd.Flags().IntVar(&numContracts, "num-contracts", 0, "override default contract count (0 = use built-in)")
-	cmd.Flags().Uint64Var(&totalBlocks, "total-blocks", 0, "override default block horizon (0 = use built-in)")
+	cmd.Flags().Uint64Var(&seed, "seed", 42, "(mock) PRNG seed for the generator")
+	cmd.Flags().IntVar(&numContracts, "num-contracts", 0, "(mock) override default contract count (0 = use built-in)")
+	cmd.Flags().Uint64Var(&totalBlocks, "total-blocks", 0, "(mock) override default block horizon (0 = use built-in)")
 	cmd.Flags().BoolVar(&force, "force", false, "overwrite the output DB even if it already has slots/events")
+	cmd.Flags().StringVar(&rpcEndpoint, "rpc", extractor.ScrollPublicRPC, "(rpc) JSON-RPC endpoint URL")
+	cmd.Flags().Uint64Var(&rpcStart, "start", 0, "(rpc) first block to extract")
+	cmd.Flags().Uint64Var(&rpcEnd, "end", 0, "(rpc) last block to extract (inclusive)")
 	return cmd
+}
+
+// refuseOverwriteIfPopulated is the shared safety rail for `extract`
+// against both the mock and rpc sources. On `--force` the mock source
+// relies on its internal db.Reset() to wipe rows; the rpc source
+// does not Reset internally (it resumes incrementally), so we do the
+// wipe here to honour the --force flag's plain-English promise of
+// "overwrite". Without that, --force on rpc would only bypass the
+// count check and leave stale rows + the rpc_high_water mark intact,
+// which is exactly what the user asked not to happen.
+func refuseOverwriteIfPopulated(ctx context.Context, db *storage.DB, path string, force, resetOnForce bool) error {
+	slots, err := db.CountSlots(ctx)
+	if err != nil {
+		return fmt.Errorf("count existing slots: %w", err)
+	}
+	events, err := db.CountAccessEvents(ctx)
+	if err != nil {
+		return fmt.Errorf("count existing events: %w", err)
+	}
+	populated := slots > 0 || events > 0
+	if populated && !force {
+		return fmt.Errorf("refusing to overwrite %q: %d slots and %d events already present. Use --force to proceed.",
+			path, slots, events)
+	}
+	if populated && force && resetOnForce {
+		slog.Info("forcing overwrite of existing DB", "path", path, "slots", slots, "events", events)
+		if err := db.Reset(ctx); err != nil {
+			return fmt.Errorf("reset db before overwrite: %w", err)
+		}
+	}
+	return nil
+}
+
+func runMockExtract(ctx context.Context, output string, seed uint64, numContracts int, totalBlocks uint64, force bool) error {
+	db, err := openDB(ctx, output)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	// mock extractor calls db.Reset() internally as part of its
+	// idempotency contract, so we don't need to Reset here too.
+	if err := refuseOverwriteIfPopulated(ctx, db, output, force, false); err != nil {
+		return err
+	}
+
+	cfg := extractor.DefaultMockConfig()
+	cfg.Seed = seed
+	if numContracts > 0 {
+		cfg.NumContracts = numContracts
+	}
+	if totalBlocks > 0 {
+		cfg.TotalBlocks = totalBlocks
+		if cfg.Window.End > totalBlocks || cfg.Window.End == 0 {
+			cfg.Window = model.ObservationWindow{Start: totalBlocks / 5, End: totalBlocks}
+		}
+	}
+	slog.Info("extract begin",
+		"source", "mock",
+		"output", output,
+		"seed", cfg.Seed,
+		"contracts", cfg.NumContracts,
+		"total_blocks", cfg.TotalBlocks,
+		"window_start", cfg.Window.Start,
+		"window_end", cfg.Window.End)
+
+	ex := extractor.NewMockExtractor(cfg)
+	if err := ex.Extract(ctx, db); err != nil {
+		return fmt.Errorf("extract: %w", err)
+	}
+	d := ex.LastDiagnostics()
+	slog.Info("extract complete",
+		"contracts", d.Contracts,
+		"slots", d.Slots,
+		"events", d.Events,
+		"pre_window_slots", d.PreWindowSlots,
+		"periodic_contracts", d.PeriodicContracts,
+		"events_in_window", d.EventsInWindow)
+	return nil
+}
+
+func runRPCExtract(ctx context.Context, output, endpoint string, start, end uint64, force bool) error {
+	if end == 0 || end < start {
+		return fmt.Errorf("rpc extract: --end must be > 0 and >= --start (got start=%d end=%d)", start, end)
+	}
+	db, err := openDB(ctx, output)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	// rpc extractor resumes incrementally from the high-water mark
+	// rather than wiping on every run, so --force needs to explicitly
+	// Reset() the DB here — otherwise stale rows + the old high-water
+	// would survive what the user thought was an overwrite. Note
+	// that storage.Reset() deliberately leaves schema_meta alone
+	// (it's a generic data-table truncation, not an extractor-state
+	// wipe), so we also nuke the RPC extractor's high-water key here
+	// or a forced re-run would still resume past the previous mark
+	// and silently skip part of the requested range.
+	if err := refuseOverwriteIfPopulated(ctx, db, output, force, true); err != nil {
+		return err
+	}
+	if force {
+		if err := extractor.ClearRPCState(ctx, db); err != nil {
+			return err
+		}
+	}
+	cfg := extractor.DefaultRPCConfig()
+	cfg.Endpoint = endpoint
+	cfg.Start = start
+	cfg.End = end
+	slog.Info("extract begin",
+		"source", "rpc",
+		"endpoint", cfg.Endpoint,
+		"start", cfg.Start,
+		"end", cfg.End,
+		"output", output)
+	ex, err := extractor.NewRPCExtractor(cfg)
+	if err != nil {
+		return err
+	}
+	if err := ex.Extract(ctx, db); err != nil {
+		return fmt.Errorf("extract: %w", err)
+	}
+	d := ex.LastDiagnostics()
+	slog.Info("extract complete",
+		"blocks_fetched", d.BlocksFetched,
+		"receipts_fetched", d.ReceiptsFetched,
+		"logs_seen", d.LogsSeen,
+		"transfer_logs", d.TransferLogs,
+		"contracts_created", d.ContractsCreated,
+		"slots_created", d.SlotsCreated,
+		"events_attempted", d.EventsAttempted,
+		"events_persisted", d.EventsPersisted)
+	return nil
 }
 
 // -------------------------------------------------------------------- eda
@@ -309,7 +394,7 @@ func newEDACmd() *cobra.Command {
 // -------------------------------------------------------------------- fit
 
 func newFitCmd() *cobra.Command {
-	var dbPath, modelKind, stratify, format string
+	var dbPath, modelKind, stratify, format, savePath string
 	var startBlock, endBlock uint64
 	var holdoutFrac float64
 	var splitSeed uint64
@@ -336,9 +421,12 @@ func newFitCmd() *cobra.Command {
 
 			switch modelKind {
 			case "km":
+				if savePath != "" {
+					return fmt.Errorf("--save is only supported with --model cox")
+				}
 				return runKMFit(out, fitter, built.Intervals, stratify, fmtMode)
 			case "cox":
-				return runCoxFit(out, fitter, built.Intervals, holdoutFrac, splitSeed, tau, fmtMode)
+				return runCoxFit(out, fitter, built.Intervals, holdoutFrac, splitSeed, tau, fmtMode, savePath, stratify)
 			default:
 				return fmt.Errorf("unknown model %q (use km or cox)", modelKind)
 			}
@@ -346,10 +434,11 @@ func newFitCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&dbPath, "db", defaultDBPath, "SQLite DB path")
 	cmd.Flags().StringVar(&modelKind, "model", "km", "model type: km|cox")
-	cmd.Flags().StringVar(&stratify, "stratify", "none", "(km only) stratify by: none|contract-type|slot-type")
+	cmd.Flags().StringVar(&stratify, "stratify", "none", "stratify by: none|contract-type|slot-type (km: one curve per stratum; cox: per-stratum baseline hazard)")
 	cmd.Flags().Float64Var(&holdoutFrac, "holdout", 0.3, "(cox only) holdout fraction for calibration split")
 	cmd.Flags().Uint64Var(&splitSeed, "split-seed", 1, "(cox only) PRNG seed for the train/holdout split")
 	cmd.Flags().Uint64Var(&tau, "tau", 0, "(cox only) calibration horizon in blocks (0 = median training Duration)")
+	cmd.Flags().StringVar(&savePath, "save", "", "(cox only) write the fitted + calibrated model to this path as JSON")
 	addFormatFlag(cmd, &format)
 	addWindowFlags(cmd, &startBlock, &endBlock)
 	return cmd
@@ -414,26 +503,53 @@ type coxFitReport struct {
 // from runCoxFit so both the text and JSON paths can share the work,
 // and so `report --format json` can embed the Cox section without
 // re-routing text output through the CLI.
+// coxStrataColumn translates the user-facing --stratify flag value
+// ("none" / "contract-type" / …) into a dstream adapter column name
+// consumed by FitCoxPHStratified. The empty string means unstratified.
+// Kept in main.go so analysis stays free of CLI-idiom string mapping.
+func coxStrataColumn(stratify string) (string, error) {
+	switch stratify {
+	case "", "none":
+		return "", nil
+	case "contract-type", "contract":
+		return analysis.ColContractType, nil
+	case "slot-type", "slot":
+		return analysis.ColSlotType, nil
+	default:
+		return "", fmt.Errorf("unknown cox stratify mode %q (use none|contract-type|slot-type)", stratify)
+	}
+}
+
+// buildCoxFitReport returns the display-layer coxFitReport plus the
+// CalibratedModel that produced it. The latter is separate from the
+// JSON shape so `fit --save` can round-trip the fitted model to disk
+// without including the bulky training intervals in the sibling JSON
+// report.
 func buildCoxFitReport(
 	fitter analysis.StatmodelFitter,
 	intervals []model.InterAccessInterval,
 	holdoutFrac float64,
 	splitSeed uint64,
 	tauFlag uint64,
-) (*coxFitReport, error) {
+	stratify string,
+) (*coxFitReport, *analysis.CalibratedModel, error) {
 	train, holdout, err := analysis.TrainHoldoutSplitBySlot(intervals, holdoutFrac, splitSeed)
 	if err != nil {
-		return nil, fmt.Errorf("split: %w", err)
+		return nil, nil, fmt.Errorf("split: %w", err)
 	}
-	slog.Info("cox split", "train_intervals", len(train), "holdout_intervals", len(holdout))
+	slog.Info("cox split", "train_intervals", len(train), "holdout_intervals", len(holdout), "stratify", stratify)
 
-	res, err := fitter.FitCoxPH(train, analysis.DefaultCoxPredictors)
+	strataColumn, err := coxStrataColumn(stratify)
 	if err != nil {
-		return nil, fmt.Errorf("fit cox: %w", err)
+		return nil, nil, err
+	}
+	res, err := fitter.FitCoxPHStratified(train, analysis.DefaultCoxPredictors, strataColumn)
+	if err != nil {
+		return nil, nil, fmt.Errorf("fit cox: %w", err)
 	}
 	ph, err := fitter.CheckPH(res)
 	if err != nil {
-		return nil, fmt.Errorf("check PH: %w", err)
+		return nil, nil, fmt.Errorf("check PH: %w", err)
 	}
 	tau := float64(tauFlag)
 	if tau == 0 {
@@ -441,15 +557,15 @@ func buildCoxFitReport(
 	}
 	rawCurve, err := analysis.CalibrationCurveFromCox(res, holdout, tau, 10)
 	if err != nil {
-		return nil, fmt.Errorf("calibration curve: %w", err)
+		return nil, nil, fmt.Errorf("calibration curve: %w", err)
 	}
 	calib, err := fitter.CalibrateAt(res, holdout, tau)
 	if err != nil {
-		return nil, fmt.Errorf("calibrate: %w", err)
+		return nil, nil, fmt.Errorf("calibrate: %w", err)
 	}
 	postCurve, err := calibrationCurveFromCalibrated(calib, holdout, 10)
 	if err != nil {
-		return nil, fmt.Errorf("post-calibration curve: %w", err)
+		return nil, nil, fmt.Errorf("post-calibration curve: %w", err)
 	}
 	return &coxFitReport{
 		Tau:              tau,
@@ -460,7 +576,7 @@ func buildCoxFitReport(
 		RawCurve:         rawCurve,
 		CalibratedCurve:  postCurve,
 		BrierDelta:       postCurve.BrierScore - rawCurve.BrierScore,
-	}, nil
+	}, calib, nil
 }
 
 // printCoxFitReport renders a coxFitReport as the text sequence used by
@@ -491,10 +607,18 @@ func runCoxFit(
 	splitSeed uint64,
 	tauFlag uint64,
 	format outputFormat,
+	savePath string,
+	stratify string,
 ) error {
-	r, err := buildCoxFitReport(fitter, intervals, holdoutFrac, splitSeed, tauFlag)
+	r, calib, err := buildCoxFitReport(fitter, intervals, holdoutFrac, splitSeed, tauFlag, stratify)
 	if err != nil {
 		return err
+	}
+	if savePath != "" {
+		if err := analysis.SaveModelFile(savePath, calib); err != nil {
+			return fmt.Errorf("save model: %w", err)
+		}
+		slog.Info("model saved", "path", savePath, "tau", calib.Tau, "epsilon", calib.Epsilon)
 	}
 	if format.isJSON() {
 		return emitJSON(out, r)
@@ -549,6 +673,23 @@ func buildStatisticalPolicy(
 	if err != nil {
 		return nil, fmt.Errorf("calibrate: %w", err)
 	}
+	return statisticalPolicyFromCalibrated(calib, costs, robust)
+}
+
+// statisticalPolicyFromCalibrated is the shared construction path for
+// "turn a CalibratedModel into a StatisticalPolicy". Used by the
+// fit-on-the-fly flow in buildStatisticalPolicy as well as the CLI's
+// --model path, which loads a previously persisted model and skips the
+// fit pipeline entirely. Keeping the closure logic in one place means
+// the fresh-fit and loaded-model policies behave identically.
+func statisticalPolicyFromCalibrated(
+	calib *analysis.CalibratedModel,
+	costs pruning.CostParams,
+	robust bool,
+) (*pruning.StatisticalPolicy, error) {
+	if calib == nil || calib.Base == nil {
+		return nil, fmt.Errorf("statisticalPolicyFromCalibrated: nil model")
+	}
 	// Build the conditional predictor used by the T*-search. The raw
 	// Cox survival function is evaluated at (idle) and (idle + τ) to
 	// compute the conditional access probability at each search
@@ -576,34 +717,39 @@ func buildStatisticalPolicy(
 	name := "statistical"
 	var predict pruning.CondAccessProbFunc = rawCondP
 	if robust {
-		// Robust variant. The split-conformal Epsilon is a valid
-		// finite-sample upper bound on exactly one quantity: the
-		// *calibrated* point prediction of access within the next τ
-		// blocks, evaluated from idle=0 (the quantity CalibrateAt
-		// fit ε on). Applying that same ε to raw Cox conditional
-		// predictions at arbitrary idle u > 0 would be a category
-		// error — those are different quantities with no coverage
-		// claim.
+		// Robust variant. Two separately-fit ε values back the
+		// policy, each one a marginal (not simultaneous) coverage
+		// bound on its own target quantity:
 		//
-		// So the robust policy differs from the point policy only
-		// at the first search sample (u=0): it uses the calibrated
-		// upper bound `p̂(τ) + ε`, which IS ε-covered, and that
-		// bound alone decides whether to demote a freshly-touched
-		// slot. For subsequent samples (u > 0) both variants fall
-		// back on the raw Cox conditional point estimate. In
-		// practice this means "demote only when the high-confidence
-		// upper bound at the first-access decision is below p*",
-		// which is the one decision point where ε has a defensible
-		// meaning. It is a strictly smaller change relative to the
-		// point policy than the previous blanket +ε heuristic, and
-		// every assertion we make about it is backed by the
-		// split-conformal guarantee.
+		//   - At the idle = 0 sample we use the *calibrated* point
+		//     upper bound p̂(τ) + Epsilon (CalibratedModel.
+		//     PredictUpperAccessProbForInterval). Epsilon is the
+		//     split-conformal quantile fit on PAV residuals at
+		//     τ / idle = 0; as a single-point probe at exactly
+		//     that quantity it has a clean finite-sample marginal
+		//     guarantee.
+		//
+		//   - At idle > 0 samples we use the *raw Cox conditional*
+		//     upper bound (1 − S(u+τ)/S(u)) + ConditionalEpsilon
+		//     (PredictUpperConditionalAccessProb). ConditionalEpsilon
+		//     was fit on ONE deterministically-sampled u per cal
+		//     row, so it covers a fresh single-u probe marginally —
+		//     NOT the worst over the ~21 u values the T*-search
+		//     scans per interval. Treat this as a principled
+		//     pessimism margin rather than a simultaneous bound;
+		//     the Phase-4 upgrade would fit a per-u or max-over-u
+		//     conformal quantile so "robust at every sample" is a
+		//     theorem rather than an engineering approximation.
+		//
+		// Falls back to raw point estimates if the corresponding ε
+		// is zero (e.g. tiny holdouts where ConditionalEpsilon
+		// couldn't be fit on 10+ unambiguous rows).
 		name = "statistical-robust"
 		predict = func(it model.InterAccessInterval, idle float64) float64 {
 			if idle == 0 {
 				return calib.PredictUpperAccessProbForInterval(it)
 			}
-			return rawCondP(it, idle)
+			return calib.PredictUpperConditionalAccessProb(it, idle)
 		}
 	}
 	return pruning.NewStatisticalPolicy(name, predict, calib.Tau, costs)
@@ -648,7 +794,7 @@ func calibrationCurveFromCalibrated(
 // --------------------------------------------------------------- simulate
 
 func newSimulateCmd() *cobra.Command {
-	var dbPath, policyName, format string
+	var dbPath, policyName, format, modelPath string
 	var startBlock, endBlock uint64
 	var ramUnit, missPen float64
 	var holdoutFrac float64
@@ -672,16 +818,37 @@ func newSimulateCmd() *cobra.Command {
 
 			var deps pruning.PolicyDeps
 			if policyName == "statistical" || policyName == "statistical-robust" {
-				p, err := buildStatisticalPolicy(built.Intervals, holdoutFrac, splitSeed, tau, costs, robust || policyName == "statistical-robust")
-				if err != nil {
-					return fmt.Errorf("statistical: %w", err)
+				useRobust := robust || policyName == "statistical-robust"
+				var p *pruning.StatisticalPolicy
+				if modelPath != "" {
+					// Load a previously persisted model and wrap it
+					// in a statistical policy — skipping the full fit
+					// pipeline. This is the "fit once, simulate many
+					// times" deployment flow.
+					loaded, err := analysis.LoadModelFile(modelPath)
+					if err != nil {
+						return fmt.Errorf("load model: %w", err)
+					}
+					p, err = statisticalPolicyFromCalibrated(loaded, costs, useRobust)
+					if err != nil {
+						return fmt.Errorf("statistical from loaded model: %w", err)
+					}
+					slog.Info("statistical policy loaded from file",
+						"model_path", modelPath, "tau", p.Tau())
+				} else {
+					p, err = buildStatisticalPolicy(built.Intervals, holdoutFrac, splitSeed, tau, costs, useRobust)
+					if err != nil {
+						return fmt.Errorf("statistical: %w", err)
+					}
 				}
 				deps.Statistical = p
 				slog.Info("statistical policy ready",
 					"name", p.Name(), "tau", p.Tau(), "p_star", p.PStar(),
 					"ram_unit_cost", costs.RAMUnitCost,
 					"miss_penalty", costs.MissPenalty,
-					"robust", robust || policyName == "statistical-robust")
+					"robust", useRobust)
+			} else if modelPath != "" {
+				return fmt.Errorf("--model is only meaningful with --policy statistical[-robust]")
 			}
 			policy, err := pruning.PolicyByName(policyName, deps)
 			if err != nil {
@@ -701,6 +868,7 @@ func newSimulateCmd() *cobra.Command {
 	cmd.Flags().StringVar(&dbPath, "db", defaultDBPath, "SQLite DB path")
 	cmd.Flags().StringVar(&policyName, "policy", "fixed-30d",
 		"policy: no-prune|fixed-30d|fixed-90d|statistical")
+	cmd.Flags().StringVar(&modelPath, "model", "", "(statistical) load a persisted model from this path instead of refitting")
 	cmd.Flags().Float64Var(&holdoutFrac, "holdout", 0.3, "(statistical) holdout fraction for calibration")
 	cmd.Flags().Uint64Var(&splitSeed, "split-seed", 1, "(statistical) PRNG seed for the train/holdout split")
 	cmd.Flags().Uint64Var(&tau, "tau", 0, "(statistical) horizon in blocks (0 = median training Duration)")
@@ -724,7 +892,7 @@ type fullReport struct {
 }
 
 func newReportCmd() *cobra.Command {
-	var dbPath, format string
+	var dbPath, format, modelPath string
 	var startBlock, endBlock uint64
 	var ramUnit, missPen float64
 	cmd := &cobra.Command{
@@ -774,26 +942,62 @@ func newReportCmd() *cobra.Command {
 
 			// 3. Baseline + statistical + statistical-robust, all scored on
 			// shared CostParams so TotalCost is directly comparable.
+			// If --model is set, both statistical variants reuse the
+			// same persisted model (the robust/point difference is a
+			// policy-layer toggle on top of the same CalibratedModel).
+			// Without --model we refit on the fly, once per variant.
 			costs := costsFromFlags(cmd, ramUnit, missPen)
 			policies := []pruning.Policy{pruning.NoPrune{}, pruning.Fixed30d, pruning.Fixed90d}
-			if stat, err := buildStatisticalPolicy(built.Intervals, 0.3, 1, 0, costs, false); err != nil {
+			buildStat := func(robust bool) (*pruning.StatisticalPolicy, error) {
+				if modelPath != "" {
+					loaded, err := analysis.LoadModelFile(modelPath)
+					if err != nil {
+						return nil, fmt.Errorf("load model: %w", err)
+					}
+					return statisticalPolicyFromCalibrated(loaded, costs, robust)
+				}
+				return buildStatisticalPolicy(built.Intervals, 0.3, 1, 0, costs, robust)
+			}
+			// When the user explicitly passes --model, a load failure
+			// should be hard — otherwise the report silently drops
+			// the statistical comparison and the remaining sections
+			// look deceptively complete. When no --model was passed
+			// (built-from-scratch path) a non-fatal warning is fine;
+			// the on-the-fly fit can fail on small or degenerate
+			// datasets and we don't want a single bad split to kill
+			// the whole end-to-end report.
+			statErr, statRErr := "", ""
+			if stat, err := buildStat(false); err != nil {
+				if modelPath != "" {
+					return fmt.Errorf("statistical policy from --model: %w", err)
+				}
 				slog.Warn("statistical policy unavailable for report", "err", err)
+				statErr = err.Error()
 			} else {
 				policies = append(policies, stat)
 			}
-			if statR, err := buildStatisticalPolicy(built.Intervals, 0.3, 1, 0, costs, true); err != nil {
+			if statR, err := buildStat(true); err != nil {
+				if modelPath != "" {
+					return fmt.Errorf("statistical-robust policy from --model: %w", err)
+				}
 				slog.Warn("statistical-robust policy unavailable for report", "err", err)
+				statRErr = err.Error()
 			} else {
 				policies = append(policies, statR)
 			}
+			_ = statErr
+			_ = statRErr
 			results, err := pruning.RunAll(policies, built.Intervals, costs)
 			if err != nil {
 				return fmt.Errorf("run all policies: %w", err)
 			}
 
 			// 4. Cox PH diagnostics. Failure is non-fatal because
-			// PH check is expected to reject on realistic traces.
-			coxReport, coxErr := buildCoxFitReport(fitter, built.Intervals, 0.3, 1, 0)
+			// PH check is expected to reject on realistic traces. The
+			// CalibratedModel returned alongside is currently unused
+			// here (report doesn't --save); keep it bound to _ so the
+			// compiler doesn't prune the return arity by accident.
+			coxReport, _, coxErr := buildCoxFitReport(fitter, built.Intervals, 0.3, 1, 0, "")
 
 			if fmtMode.isJSON() {
 				return emitJSON(out, fullReport{
@@ -826,6 +1030,7 @@ func newReportCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&dbPath, "db", defaultDBPath, "SQLite DB path")
+	cmd.Flags().StringVar(&modelPath, "model", "", "load a persisted statistical model from this path instead of refitting")
 	addCostFlags(cmd, &ramUnit, &missPen)
 	addFormatFlag(cmd, &format)
 	addWindowFlags(cmd, &startBlock, &endBlock)

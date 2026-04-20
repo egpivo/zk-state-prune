@@ -40,35 +40,45 @@ type CalibratedModel struct {
 	PredX       []float64
 	CalibratedY []float64
 
-	// --- Split-conformal interval (Segment 15) -----------------------
+	// --- Split-conformal intervals -----------------------------------
 	//
-	// Epsilon is the non-conformity quantile CalibrateAt computed on
-	// the conformal half of the holdout. It is the half-width of a
-	// symmetric prediction interval around the calibrated p̂ for one
-	// specific quantity: the probability of access within the next
-	// Tau blocks, evaluated from idle = 0 (i.e. right after the
-	// previous access), using the isotonic-recalibrated prediction.
-	// For that quantity, on an i.i.d. draw from the same
-	// distribution, the true label lies in [p̂ − Epsilon, p̂ + Epsilon]
-	// with marginal coverage ≥ CoverageLevel.
+	// Two ε values, one per predictive quantity, each fit on the same
+	// conformal half of the holdout but with a different label/
+	// prediction pair:
 	//
-	// The guarantee does NOT cover:
-	//   - other horizons (τ' ≠ Tau)
-	//   - conditional predictions at arbitrary idle u > 0 (a
-	//     different quantity the isotonic grid was not fit for)
-	//   - predictions on data drawn from a materially different
-	//     distribution than the holdout
+	//   Epsilon covers the *calibrated point* prediction at horizon Tau
+	//   evaluated from idle = 0 — the isotonic-recalibrated
+	//   probability of access within the next Tau blocks given the
+	//   slot has just been touched. Valid for CalibratedModel.
+	//   PredictUpperAccessProbForInterval (which the robust policy
+	//   uses at the idle = 0 search sample).
 	//
-	// Callers that want a conformal interval for conditional
-	// predictions have to fit their own ε on the target quantity —
-	// the robust CLI path explicitly avoids reusing this Epsilon for
-	// anything other than idle = 0 to stay honest with the claim.
+	//   ConditionalEpsilon covers the *raw Cox conditional* prediction
+	//   1 − S(u+τ)/S(u) for a SINGLE idle duration u drawn from the
+	//   per-row u distribution the cal pass used. It is a marginal
+	//   (finite-sample) upper-bound quantile on one fresh (interval,
+	//   u, label_at_u) triple drawn from the same distribution as
+	//   the cal half. It is NOT a simultaneous-coverage bound across
+	//   all idle samples the statistical policy evaluates during its
+	//   T*-search: the policy probes ~21 u values per interval and
+	//   the marginal coverage claim does not extend to the worst of
+	//   those probes. Treat the robust policy's "valid at every
+	//   idle" as engineering-level defensive, not a theorem.
+	//
+	// Both guarantees are valid only for (i) the target quantity they
+	// were fit against, (ii) data drawn from a distribution
+	// exchangeable with the cal half, and (iii) at the same CoverageLevel.
+	//
+	// ConditionalEpsilon == 0 means conditional conformal was not
+	// fitted (too few unambiguous cal-half samples), in which case the
+	// robust policy falls back to the raw point estimate at idle > 0.
 	//
 	// CoverageLevel is the nominal 1 − α (e.g. 0.9 for α = 0.1). Zero
-	// means conformal prediction was not fitted (intervals are
+	// means conformal prediction was not fitted at all (intervals are
 	// width-zero point estimates).
-	Epsilon       float64
-	CoverageLevel float64
+	Epsilon            float64
+	ConditionalEpsilon float64
+	CoverageLevel      float64
 }
 
 // PredictAccessProb returns the recalibrated probability of access by
@@ -139,10 +149,48 @@ func (c *CalibratedModel) PredictIntervalForInterval(it model.InterAccessInterva
 
 // PredictUpperAccessProbForInterval returns just the upper endpoint of
 // the conformal interval, which is the quantity the robust decision
-// rule plugs into the surrogate for d=cold.
+// rule plugs into the surrogate for d=cold. Uses Epsilon — the ε
+// fit for the calibrated point prediction at τ from idle=0.
 func (c *CalibratedModel) PredictUpperAccessProbForInterval(it model.InterAccessInterval) float64 {
 	_, upper := c.PredictIntervalForInterval(it)
 	return upper
+}
+
+// PredictUpperConditionalAccessProb returns a pessimism-adjusted upper
+// bound on the conditional access probability at idle duration u:
+//
+//	p_upper(u) = min(1, (1 − S(u+τ)/S(u)) + ConditionalEpsilon)
+//
+// ConditionalEpsilon was fit as a split-conformal quantile on one u
+// per holdout row, so the coverage claim is MARGINAL (a fresh single
+// probe drawn from the same (row, u) distribution lies in
+// [raw − ε, raw + ε] at the nominal CoverageLevel). It is NOT a
+// simultaneous-coverage bound: the statistical policy probes many u
+// values per interval during its T*-search, and the worst over those
+// probes can exceed the marginal quantile. The robust policy still
+// profits from the extra margin in practice — ε shifts decisions
+// toward keeping slots hot when the model is noisier — but "robust"
+// here means "cheapest valid pessimism layer", not "uniform over the
+// search grid". When ConditionalEpsilon is zero (no conformal fit)
+// the function returns the raw point estimate.
+func (c *CalibratedModel) PredictUpperConditionalAccessProb(it model.InterAccessInterval, idle float64) float64 {
+	if c == nil || c.Base == nil {
+		return 0
+	}
+	sU := c.Base.SurvivalForInterval(it, idle)
+	if sU <= 0 {
+		return 1
+	}
+	sUTau := c.Base.SurvivalForInterval(it, idle+c.Tau)
+	p := 1 - sUTau/sU
+	if p < 0 {
+		p = 0
+	}
+	p += c.ConditionalEpsilon
+	if p > 1 {
+		p = 1
+	}
+	return p
 }
 
 // isotonicLookup is a placeholder right-continuous step lookup used until
@@ -628,11 +676,7 @@ func (StatmodelFitter) CalibrateAt(
 		return nil, fmt.Errorf("CalibrateAt: empty holdout")
 	}
 
-	type point struct {
-		p, y   float64
-		slotID string
-	}
-	all := make([]point, 0, len(holdout))
+	all := make([]calPoint, 0, len(holdout))
 	for _, it := range holdout {
 		var label float64
 		switch {
@@ -643,10 +687,10 @@ func (StatmodelFitter) CalibrateAt(
 		default:
 			continue
 		}
-		all = append(all, point{
-			p:      res.PredictAccessProbForInterval(it, tau),
-			y:      label,
-			slotID: it.SlotID,
+		all = append(all, calPoint{
+			p:  res.PredictAccessProbForInterval(it, tau),
+			y:  label,
+			it: it,
 		})
 	}
 	if len(all) < 10 {
@@ -657,9 +701,9 @@ func (StatmodelFitter) CalibrateAt(
 	// fits PAV, odd bucket measures residuals. Done before the sort
 	// below so each half is independent of the predicted-probability
 	// order.
-	var isoPts, calPts []point
+	var isoPts, calPts []calPoint
 	for _, p := range all {
-		if slotIDBucket(p.slotID) == 0 {
+		if slotIDBucket(p.it.SlotID) == 0 {
 			isoPts = append(isoPts, p)
 		} else {
 			calPts = append(calPts, p)
@@ -702,14 +746,122 @@ func (StatmodelFitter) CalibrateAt(
 	}
 	epsilon := resid[k]
 
+	// Conditional split-conformal (Segment 19). Fit a second ε on the
+	// raw Cox conditional prediction 1 − S(u+τ)/S(u) at an arbitrary
+	// idle u > 0, so the robust policy can apply a valid margin at
+	// every T*-search sample, not just idle = 0. Uses the same cal
+	// half as above but scores a different (prediction, label) pair
+	// per row — each row contributes exactly one residual, sampled at
+	// a deterministic u drawn from the slot id.
+	condEpsilon := fitConditionalEpsilon(res, calPts, tau, defaultCoverage)
+
 	return &CalibratedModel{
-		Base:          res,
-		Tau:           tau,
-		PredX:         xIso,
-		CalibratedY:   yHatIso,
-		Epsilon:       epsilon,
-		CoverageLevel: defaultCoverage,
+		Base:               res,
+		Tau:                tau,
+		PredX:              xIso,
+		CalibratedY:        yHatIso,
+		Epsilon:            epsilon,
+		ConditionalEpsilon: condEpsilon,
+		CoverageLevel:      defaultCoverage,
 	}, nil
+}
+
+// fitConditionalEpsilon computes the split-conformal quantile for the
+// conditional access probability at arbitrary idle u, using one
+// deterministically-sampled u per cal row. Returns 0 if fewer than 10
+// rows end up with unambiguous labels — a signal to the consumer that
+// the conditional margin could not be fit (common on small holdouts
+// or datasets where every row falls into the "don't know beyond
+// Duration" bucket).
+//
+// Per-row label rules given u < Duration (rows with u ≥ Duration are
+// dropped — the conditional "slot still idle at u" fails):
+//
+//   - u + τ ≤ Duration: label = 0 for every row. Observed rows have
+//     their event at t = Duration > u+τ (outside horizon); censored
+//     rows have no event at all in [0, Duration].
+//   - u + τ > Duration AND IsObserved: label = 1 (event at Duration
+//     falls inside (u, u+τ]).
+//   - u + τ > Duration AND !IsObserved: drop. The horizon extends past
+//     our observation end — we don't know what happens in (Duration,
+//     u+τ], so neither 0 nor 1 is defensible.
+func fitConditionalEpsilon(base *CoxResult, calPts []calPoint, tau, coverage float64) float64 {
+	resid := make([]float64, 0, len(calPts))
+	for _, p := range calPts {
+		it := p.it
+		u := conformalIdleSample(it.SlotID, it.Duration)
+		if u >= it.Duration {
+			continue
+		}
+		reach := u + uint64(tau+0.5)
+		var label float64
+		switch {
+		case reach <= it.Duration:
+			label = 0
+		case it.IsObserved:
+			label = 1
+		default:
+			continue
+		}
+		sU := base.SurvivalForInterval(it, float64(u))
+		if sU <= 0 {
+			continue
+		}
+		sUTau := base.SurvivalForInterval(it, float64(u)+tau)
+		pred := 1 - sUTau/sU
+		if pred < 0 {
+			pred = 0
+		}
+		if pred > 1 {
+			pred = 1
+		}
+		d := label - pred
+		if d < 0 {
+			d = -d
+		}
+		resid = append(resid, d)
+	}
+	if len(resid) < 10 {
+		return 0
+	}
+	sort.Float64s(resid)
+	alpha := 1 - coverage
+	k := int(math.Ceil((1-alpha)*float64(len(resid)+1))) - 1
+	if k < 0 {
+		k = 0
+	}
+	if k >= len(resid) {
+		k = len(resid) - 1
+	}
+	return resid[k]
+}
+
+// conformalIdleSample deterministically derives an idle duration in
+// [0, duration) from a slot id. Uses the same FNV-1a base as
+// slotIDBucket but with an extra "u" salt so the conditional sample
+// is independent of the iso/cal partition choice.
+func conformalIdleSample(slotID string, duration uint64) uint64 {
+	if duration == 0 {
+		return 0
+	}
+	var h uint32 = 2166136261
+	for i := 0; i < len(slotID); i++ {
+		h ^= uint32(slotID[i])
+		h *= 16777619
+	}
+	h ^= 'u'
+	h *= 16777619
+	return uint64(h) % duration
+}
+
+// calPoint is the per-row record the calibration pipeline carries
+// through CalibrateAt: the raw Cox-predicted point probability at τ,
+// the binary label at τ, and the source interval so downstream passes
+// (iso-fit, conformal-residual, conditional-conformal) can re-derive
+// whatever quantity they need.
+type calPoint struct {
+	p, y float64
+	it   model.InterAccessInterval
 }
 
 // slotIDBucket deterministically hashes a slot id to {0, 1}. Used by
