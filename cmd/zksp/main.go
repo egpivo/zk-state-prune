@@ -684,7 +684,6 @@ func newReportCmd() *cobra.Command {
 				})
 			}
 			return renderReportText(out, rep, curves, results, coxReport, coxErr)
-			return nil
 		},
 	}
 	cmd.Flags().StringVar(&dbPath, "db", defaultDBPath, "SQLite DB path")
