@@ -1,5 +1,11 @@
 # zk-state-prune
 
+[![CI](https://github.com/egpivo/zk-state-prune/actions/workflows/ci.yml/badge.svg)](https://github.com/egpivo/zk-state-prune/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/egpivo/zk-state-prune/graph/badge.svg?token=siqgL91f4o)](https://codecov.io/gh/egpivo/zk-state-prune)
+[![Go Report Card](https://goreportcard.com/badge/github.com/egpivo/zk-state-prune)](https://goreportcard.com/report/github.com/egpivo/zk-state-prune)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/egpivo/zk-state-prune)](https://github.com/egpivo/zk-state-prune/blob/main/go.mod)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **Cost-aware hot/cold tiering for ZK rollup state, driven by survival analysis.**
 
 `zk-state-prune` (binary: `zksp`) is a Go framework that treats on-chain
