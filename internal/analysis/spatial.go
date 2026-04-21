@@ -56,9 +56,51 @@ func RunSpatial(ctx context.Context, db *storage.DB, window model.ObservationWin
 	if window.End <= window.Start {
 		return nil, fmt.Errorf("RunSpatial: invalid window [%d, %d)", window.Start, window.End)
 	}
+	byContract, err := collectContractSlotBlocks(ctx, db, window)
+	if err != nil {
+		return nil, err
+	}
 
-	// Collect in-window access blocks per slot, grouped by contract.
-	byContract := make(map[string]map[string][]uint64) // contract → slot → blocks
+	r := rand.New(rand.NewPCG(17, 23))
+	perContract := make(map[string]float64, len(byContract))
+	scores := make([]float64, 0, len(byContract))
+	for addr, slots := range byContract {
+		score, ok := meanJaccardForContract(slots, r)
+		if !ok {
+			continue
+		}
+		perContract[addr] = score
+		scores = append(scores, score)
+	}
+
+	out := &SpatialReport{
+		Window:       window,
+		NumContracts: len(scores),
+		PerContract:  perContract,
+	}
+	if len(scores) > 0 {
+		sort.Float64s(scores)
+		var sum float64
+		for _, s := range scores {
+			sum += s
+		}
+		out.MeanJaccard = sum / float64(len(scores))
+		out.MedianJaccard = scores[len(scores)/2]
+	}
+	return out, nil
+}
+
+// collectContractSlotBlocks streams the storage iterator and builds a
+// contract → slot → sorted-access-blocks map for every slot that has
+// at least one access inside the window. Same-block duplicates are
+// dropped to match BuildIntervals so the Jaccard set semantics agree
+// with survival input.
+func collectContractSlotBlocks(
+	ctx context.Context,
+	db *storage.DB,
+	window model.ObservationWindow,
+) (map[string]map[string][]uint64, error) {
+	byContract := make(map[string]map[string][]uint64)
 	err := db.IterateSlotEvents(ctx, func(sm storage.SlotWithMeta, events []model.AccessEvent) error {
 		blocks := make([]uint64, 0, len(events))
 		var prev uint64
@@ -67,7 +109,6 @@ func RunSpatial(ctx context.Context, db *storage.DB, window model.ObservationWin
 			if !window.Contains(e.BlockNumber) {
 				continue
 			}
-			// Dedupe same-block touches to match BuildIntervals.
 			if havePrev && e.BlockNumber == prev {
 				continue
 			}
@@ -88,68 +129,50 @@ func RunSpatial(ctx context.Context, db *storage.DB, window model.ObservationWin
 	if err != nil {
 		return nil, fmt.Errorf("iterate slots: %w", err)
 	}
+	return byContract, nil
+}
 
-	r := rand.New(rand.NewPCG(17, 23))
-	perContract := make(map[string]float64, len(byContract))
-	scores := make([]float64, 0, len(byContract))
-	for addr, slots := range byContract {
-		if len(slots) < 2 {
-			continue
-		}
-		keys := make([]string, 0, len(slots))
-		for k := range slots {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
+// meanJaccardForContract computes the mean pairwise Jaccard score over
+// this contract's slot access sets. Enumerates all pairs when the
+// count is small; otherwise samples up to spatialMaxPairs uniformly.
+// Returns (0, false) when the contract has fewer than 2 slots or the
+// sample produced no valid pairs.
+func meanJaccardForContract(slots map[string][]uint64, r *rand.Rand) (float64, bool) {
+	if len(slots) < 2 {
+		return 0, false
+	}
+	keys := make([]string, 0, len(slots))
+	for k := range slots {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
 
-		// Enumerate all pairs up to spatialMaxPairs; if the contract
-		// has more potential pairs than the cap we sample uniformly
-		// from the full set.
-		nSlots := len(keys)
-		totalPairs := nSlots * (nSlots - 1) / 2
-		var sum float64
-		var count int
-		if totalPairs <= spatialMaxPairs {
-			for i := 0; i < nSlots; i++ {
-				for j := i + 1; j < nSlots; j++ {
-					sum += jaccardUint64(slots[keys[i]], slots[keys[j]])
-					count++
-				}
-			}
-		} else {
-			for n := 0; n < spatialMaxPairs; n++ {
-				i := r.IntN(nSlots)
-				j := r.IntN(nSlots)
-				if i == j {
-					j = (j + 1) % nSlots
-				}
+	nSlots := len(keys)
+	totalPairs := nSlots * (nSlots - 1) / 2
+	var sum float64
+	var count int
+	if totalPairs <= spatialMaxPairs {
+		for i := 0; i < nSlots; i++ {
+			for j := i + 1; j < nSlots; j++ {
 				sum += jaccardUint64(slots[keys[i]], slots[keys[j]])
 				count++
 			}
 		}
-		if count == 0 {
-			continue
+	} else {
+		for n := 0; n < spatialMaxPairs; n++ {
+			i := r.IntN(nSlots)
+			j := r.IntN(nSlots)
+			if i == j {
+				j = (j + 1) % nSlots
+			}
+			sum += jaccardUint64(slots[keys[i]], slots[keys[j]])
+			count++
 		}
-		score := sum / float64(count)
-		perContract[addr] = score
-		scores = append(scores, score)
 	}
-
-	out := &SpatialReport{
-		Window:       window,
-		NumContracts: len(scores),
-		PerContract:  perContract,
+	if count == 0 {
+		return 0, false
 	}
-	if len(scores) > 0 {
-		sort.Float64s(scores)
-		var sum float64
-		for _, s := range scores {
-			sum += s
-		}
-		out.MeanJaccard = sum / float64(len(scores))
-		out.MedianJaccard = scores[len(scores)/2]
-	}
-	return out, nil
+	return sum / float64(count), true
 }
 
 // jaccardUint64 is |A ∩ B| / |A ∪ B| for two sorted (or to-be-sorted)

@@ -188,21 +188,11 @@ func (StatmodelFitter) FitCoxPHStratified(
 	covariates []string,
 	strataColumn string,
 ) (*CoxResult, error) {
-	if len(intervals) == 0 {
-		return nil, fmt.Errorf("FitCoxPH: empty intervals")
+	if err := validateCoxInputs(intervals, covariates, strataColumn); err != nil {
+		return nil, err
 	}
 	if len(covariates) == 0 {
 		covariates = DefaultCoxPredictors
-	}
-	for _, c := range covariates {
-		if c == strataColumn {
-			return nil, fmt.Errorf("FitCoxPH: stratification column %q must not appear in predictors", strataColumn)
-		}
-	}
-	for _, it := range intervals {
-		if it.Duration > math.MaxInt64 { // unreachable in practice; keeps the panic in tests only
-			return nil, fmt.Errorf("FitCoxPH: duration overflow at slot %s", it.SlotID)
-		}
 	}
 
 	// Materialize a fresh column set so we can standardize in place
@@ -210,35 +200,75 @@ func (StatmodelFitter) FitCoxPHStratified(
 	cols, names := buildCoxColumns(intervals)
 	scales := standardizeColumns(cols, names, covariates)
 
+	ph, err := newPHRegForCov(cols, names, covariates, strataColumn)
+	if err != nil {
+		return nil, err
+	}
+	res, err := fitAndValidate(ph)
+	if err != nil {
+		return nil, err
+	}
+
+	out := assembleCoxResult(res, covariates, scales, strataColumn, len(intervals))
+	for _, it := range intervals {
+		if it.IsObserved {
+			out.NumEvents++
+		}
+	}
+	fillBaselineHazards(out, ph, intervals, strataColumn)
+	out.intervals = append([]model.InterAccessInterval(nil), intervals...)
+	return out, nil
+}
+
+// validateCoxInputs rejects shapes that PHReg can't handle (empty
+// intervals, predictor/stratum collision, duration overflow). Empty
+// covariates is fine — the caller substitutes DefaultCoxPredictors
+// after the validation barrier.
+func validateCoxInputs(intervals []model.InterAccessInterval, covariates []string, strataColumn string) error {
+	if len(intervals) == 0 {
+		return fmt.Errorf("FitCoxPH: empty intervals")
+	}
+	for _, c := range covariates {
+		if c == strataColumn {
+			return fmt.Errorf("FitCoxPH: stratification column %q must not appear in predictors", strataColumn)
+		}
+	}
+	for _, it := range intervals {
+		if it.Duration > math.MaxInt64 { // unreachable in practice; keeps the panic in tests only
+			return fmt.Errorf("FitCoxPH: duration overflow at slot %s", it.SlotID)
+		}
+	}
+	return nil
+}
+
+// newPHRegForCov assembles the statmodel duration.PHReg handle. The
+// L2 ridge is tiny (1e-6) — enough to keep gonum's optimizer stable
+// when ContractAge/SlotAge correlate, small enough to leave
+// coefficients essentially unchanged on well-conditioned data.
+func newPHRegForCov(cols [][]float64, names, covariates []string, strataColumn string) (*duration.PHReg, error) {
 	ds := statmodel.NewDataset(cols, names)
 	cfg := duration.DefaultPHRegConfig()
 	cfg.EntryVar = ColEntry
 	if strataColumn != "" {
 		cfg.StrataVar = strataColumn
 	}
-	// Light L2 ridge on every predictor. ContractAge and SlotAge are
-	// structurally correlated (a slot can only exist from deploy block
-	// onwards) so the unregularized Hessian can become nearly singular
-	// on smaller datasets, especially after a train/holdout split.
-	// A 1e-6 penalty is small enough to leave coefficient estimates
-	// essentially unchanged on well-conditioned data but large enough
-	// to keep the optimizer stable when the covariates crowd together.
 	cfg.L2Penalty = make(map[string]float64, len(covariates))
 	for _, p := range covariates {
 		cfg.L2Penalty[p] = 1e-6
 	}
-
 	ph, err := duration.NewPHReg(ds, ColDuration, ColStatus, covariates, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("NewPHReg: %w", err)
 	}
-	// gonum's optimizer occasionally returns a "linesearch: failed to
-	// converge" error together with a partial PHResults: the gradient
-	// has essentially vanished but a zero-length step couldn't satisfy
-	// the Wolfe conditions. Those partial fits are almost always
-	// usable, so we accept any non-nil result and only error out when
-	// the library returns nil (the fit truly failed). A slog warning
-	// keeps the event visible downstream without killing the pipeline.
+	return ph, nil
+}
+
+// fitAndValidate runs the PHReg fit and tolerates partial results
+// (gonum's "linesearch: failed to converge" usually leaves usable
+// coefficients). Errors only when Fit returns nil (truly failed) or
+// when a coefficient is non-finite — downstream consumers can't
+// handle NaN / Inf in the hazard exponent.
+func fitAndValidate(ph *duration.PHReg) (*duration.PHResults, error) {
 	res, fitErr := ph.Fit()
 	if res == nil {
 		return nil, fmt.Errorf("Fit: %w", fitErr)
@@ -246,18 +276,26 @@ func (StatmodelFitter) FitCoxPHStratified(
 	if fitErr != nil {
 		slog.Warn("cox optimizer returned non-fatal error, using partial fit", "err", fitErr)
 	}
-	// Guard against NaN / Inf in the partial coefficients that would
-	// poison every downstream consumer (calibration, conformal…).
 	for i, c := range res.Params() {
 		if math.IsNaN(c) || math.IsInf(c, 0) {
 			return nil, fmt.Errorf("Fit: coef[%d] not finite (%v); err=%v", i, c, fitErr)
 		}
 	}
+	return res, nil
+}
 
-	// Partial fits populate Params() but leave StdErr()/PValues()/ZScores()
-	// empty because the optimizer bailed before the covariance step.
-	// Pad to len(covariates) with NaN so consumers can index safely and
-	// the text printer renders "NaN" rather than segfaulting.
+// assembleCoxResult packs PHReg output into the CoxResult shape
+// downstream consumers expect, padding StdErr / PValue / ZScore /
+// Coef with NaN when a partial fit left them short. NumEvents and
+// the baseline hazards are filled in by the caller — they depend on
+// the training intervals, not on res.
+func assembleCoxResult(
+	res *duration.PHResults,
+	covariates []string,
+	scales []CovarScale,
+	strataColumn string,
+	nObs int,
+) *CoxResult {
 	out := &CoxResult{
 		Predictors:    append([]string(nil), covariates...),
 		Coef:          append([]float64(nil), res.Params()...),
@@ -265,12 +303,10 @@ func (StatmodelFitter) FitCoxPHStratified(
 		PValue:        padOrCopy(res.PValues(), len(covariates)),
 		ZScore:        padOrCopy(res.ZScores(), len(covariates)),
 		LogLike:       res.LogLike(),
-		NumObs:        len(intervals),
+		NumObs:        nObs,
 		Scales:        scales,
 		StratumColumn: strataColumn,
 	}
-	// Coef may also be shorter than covariates on a very-early bailout;
-	// pad to keep every slice the same length for consumers.
 	if len(out.Coef) < len(covariates) {
 		padded := make([]float64, len(covariates))
 		for i := range padded {
@@ -282,32 +318,33 @@ func (StatmodelFitter) FitCoxPHStratified(
 		}
 		out.Coef = padded
 	}
-	for _, it := range intervals {
-		if it.IsObserved {
-			out.NumEvents++
-		}
-	}
+	return out
+}
+
+// fillBaselineHazards pulls the baseline cumulative hazard grid out
+// of PHReg — a single (time, cumhaz) pair for unstratified fits, or
+// per-stratum grids aligned with StratumLabels when strataColumn is
+// set.
+func fillBaselineHazards(out *CoxResult, ph *duration.PHReg, intervals []model.InterAccessInterval, strataColumn string) {
 	if strataColumn == "" {
 		t, h := ph.BaselineCumHaz(0, out.Coef)
 		out.BaselineTime = append([]float64(nil), t...)
 		out.BaselineCumHaz = append([]float64(nil), h...)
-	} else {
-		// Discover the unique stratum values in the training data and
-		// pull a per-stratum baseline cumulative hazard for each.
-		// statmodel assigns stratum indices in ascending value order
-		// of the stratum column, so StratumLabels ends up sorted.
-		strataValues := collectUniqueStrata(intervals, strataColumn)
-		out.StratumLabels = strataValues
-		out.StratumBaselineTimes = make([][]float64, len(strataValues))
-		out.StratumBaselineCumHaz = make([][]float64, len(strataValues))
-		for i := range strataValues {
-			t, h := ph.BaselineCumHaz(i, out.Coef)
-			out.StratumBaselineTimes[i] = append([]float64(nil), t...)
-			out.StratumBaselineCumHaz[i] = append([]float64(nil), h...)
-		}
+		return
 	}
-	out.intervals = append([]model.InterAccessInterval(nil), intervals...)
-	return out, nil
+	// Discover the unique stratum values in the training data and
+	// pull a per-stratum baseline cumulative hazard for each.
+	// statmodel assigns stratum indices in ascending value order
+	// of the stratum column, so StratumLabels ends up sorted.
+	strataValues := collectUniqueStrata(intervals, strataColumn)
+	out.StratumLabels = strataValues
+	out.StratumBaselineTimes = make([][]float64, len(strataValues))
+	out.StratumBaselineCumHaz = make([][]float64, len(strataValues))
+	for i := range strataValues {
+		t, h := ph.BaselineCumHaz(i, out.Coef)
+		out.StratumBaselineTimes[i] = append([]float64(nil), t...)
+		out.StratumBaselineCumHaz[i] = append([]float64(nil), h...)
+	}
 }
 
 // collectUniqueStrata returns the sorted set of stratum-column values

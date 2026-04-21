@@ -317,13 +317,9 @@ func CalibrationCurveFromPredict(
 		nBins = 10
 	}
 
-	type row struct {
-		p  float64
-		it model.InterAccessInterval
-	}
-	rows := make([]row, 0, len(holdout))
+	rows := make([]calibRow, 0, len(holdout))
 	for _, it := range holdout {
-		rows = append(rows, row{
+		rows = append(rows, calibRow{
 			p:  predict(it),
 			it: it,
 		})
@@ -344,44 +340,10 @@ func CalibrationCurveFromPredict(
 		if b == nBins-1 {
 			hi = len(rows)
 		}
-		var sumP float64
-		ivs := make([]model.InterAccessInterval, 0, hi-lo)
-		for j := lo; j < hi; j++ {
-			r := rows[j]
-			sumP += r.p
-			ivs = append(ivs, r.it)
-			// Row-level Brier contribution for rows with unambiguous
-			// labels. Censored-before-τ rows are still in the bin (KM
-			// consumes them) but contribute no Brier term.
-			switch {
-			case r.it.IsObserved && r.it.Duration <= uint64(tau):
-				d := r.p - 1
-				brier += d * d
-				brierN++
-			case r.it.Duration > uint64(tau):
-				d := r.p - 0
-				brier += d * d
-				brierN++
-			}
-		}
-		n := hi - lo
-		predictedMean := sumP / float64(n)
-
-		// Bin-wise KM. If the fit fails (extremely small bin, pathological
-		// data) we fall back to 0 so the reliability diagram still prints
-		// rather than blowing up the whole report.
-		observedRate := 0.0
-		if km, err := fitter.FitKaplanMeier(ivs); err == nil && km != nil {
-			observedRate = 1 - km.SurvAt(tau)
-			if observedRate < 0 {
-				observedRate = 0
-			}
-		}
-		bins = append(bins, CalibrationBin{
-			PredictedMean: predictedMean,
-			ObservedRate:  observedRate,
-			N:             n,
-		})
+		bin, binBrier, binBrierN := summarizeCalibrationBin(fitter, rows[lo:hi], tau)
+		bins = append(bins, bin)
+		brier += binBrier
+		brierN += binBrierN
 	}
 
 	brierScore := 0.0
@@ -396,6 +358,67 @@ func CalibrationCurveFromPredict(
 		BrierN:     brierN,
 		NumDropped: 0,
 	}, nil
+}
+
+// calibRow is the (predicted probability, interval) pair
+// CalibrationCurveFromPredict builds before sorting + binning.
+// Exported from the enclosing function via a file-level type so the
+// extracted bin-summary helper can take it as a parameter.
+type calibRow struct {
+	p  float64
+	it model.InterAccessInterval
+}
+
+// summarizeCalibrationBin reduces one bin's rows to:
+//   - a CalibrationBin (mean predicted probability + bin-wise KM
+//     observed rate at τ),
+//   - the sum of per-row Brier contributions over unambiguous labels,
+//   - the count of those contributions.
+//
+// Censored-before-τ rows still participate in the KM fit (they carry
+// partial information) but contribute no Brier term.
+func summarizeCalibrationBin(fitter StatmodelFitter, rows []calibRow, tau float64) (CalibrationBin, float64, int) {
+	var sumP, brier float64
+	brierN := 0
+	ivs := make([]model.InterAccessInterval, 0, len(rows))
+	for _, r := range rows {
+		sumP += r.p
+		ivs = append(ivs, r.it)
+		switch {
+		case r.it.IsObserved && r.it.Duration <= uint64(tau):
+			d := r.p - 1
+			brier += d * d
+			brierN++
+		case r.it.Duration > uint64(tau):
+			d := r.p
+			brier += d * d
+			brierN++
+		}
+	}
+	predictedMean := sumP / float64(len(rows))
+	observedRate := binwiseKMRate(fitter, ivs, tau)
+	return CalibrationBin{
+		PredictedMean: predictedMean,
+		ObservedRate:  observedRate,
+		N:             len(rows),
+	}, brier, brierN
+}
+
+// binwiseKMRate fits a KM curve to a single bin's intervals and
+// reports 1 − S(τ) as the bin's observed access-by-τ rate. Returns 0
+// on a fit failure (extremely small bin, pathological data) so the
+// reliability diagram still prints rather than blowing up the whole
+// report.
+func binwiseKMRate(fitter StatmodelFitter, ivs []model.InterAccessInterval, tau float64) float64 {
+	km, err := fitter.FitKaplanMeier(ivs)
+	if err != nil || km == nil {
+		return 0
+	}
+	rate := 1 - km.SurvAt(tau)
+	if rate < 0 {
+		return 0
+	}
+	return rate
 }
 
 // CheckPH runs a Schoenfeld-residuals proportional-hazards test on a
@@ -445,9 +468,33 @@ func (StatmodelFitter) CheckPH(res *CoxResult) (*PHTestResult, error) {
 		return nil, fmt.Errorf("CheckPH: CoxResult has no retained intervals")
 	}
 	K := len(res.Predictors)
-	n := len(res.intervals)
 
-	// Step 1: standardize and linear predictor.
+	z, lp := standardizeAndLinearPredictor(res)
+	order := orderByDurationAsc(res.intervals)
+	events := schoenfeldResiduals(res, order, z, lp)
+
+	if len(events) < 5 {
+		return nil, fmt.Errorf("CheckPH: too few observed events for PH test (%d)", len(events))
+	}
+	return combineGlobalPValue(res.Predictors, events, K), nil
+}
+
+// phEvent is one observed-event's Schoenfeld residual vector keyed
+// by event time. Exported only at the file level so the helpers
+// below can return it.
+type phEvent struct {
+	time float64
+	r    []float64
+}
+
+// standardizeAndLinearPredictor applies the exact same (raw −
+// mean)/std transform the Cox fit used, then computes the per-row
+// linear predictor lp_i = Σ_k β_k · z_ik. Missing scales fall back
+// to (0, 1) so untrained covariates contribute nothing rather than
+// blowing up with a divide-by-zero.
+func standardizeAndLinearPredictor(res *CoxResult) ([][]float64, []float64) {
+	n := len(res.intervals)
+	K := len(res.Predictors)
 	z := make([][]float64, n)
 	lp := make([]float64, n)
 	for i, it := range res.intervals {
@@ -467,74 +514,103 @@ func (StatmodelFitter) CheckPH(res *CoxResult) (*PHTestResult, error) {
 		}
 		z[i] = zi
 	}
+	return z, lp
+}
 
-	// Step 2: sort indices ascending by Duration. Tie order doesn't
-	// matter so SliceStable is the cheap choice.
-	order := make([]int, n)
+// orderByDurationAsc returns the permutation that sorts intervals by
+// Duration ascending. Stable so tie groups preserve their original
+// order; the Schoenfeld walker relies on all ties being adjacent,
+// not on their internal ordering.
+func orderByDurationAsc(intervals []model.InterAccessInterval) []int {
+	order := make([]int, len(intervals))
 	for i := range order {
 		order[i] = i
 	}
 	sort.SliceStable(order, func(a, b int) bool {
-		return res.intervals[order[a]].Duration < res.intervals[order[b]].Duration
+		return intervals[order[a]].Duration < intervals[order[b]].Duration
 	})
+	return order
+}
 
-	// Step 3: walk backward grouping by tied time, computing residuals.
-	// residTime[e] is the time of the e-th observed event in the order
-	// it was processed (high-to-low time). resid[e] is the K-vector of
-	// raw Schoenfeld residuals for that event. The orientation is
-	// arbitrary — the correlation with rank does not care.
-	type ev struct {
-		time float64
-		r    []float64
-	}
-	events := make([]ev, 0, n)
+// schoenfeldResiduals walks order backward grouping by tied event
+// time, updating the risk-set sums before reading any member of a
+// tie group so tied events see their peers in their own risk set.
+// Returns one phEvent per observed event (censored rows contribute
+// to sumW but are not emitted).
+func schoenfeldResiduals(res *CoxResult, order []int, z [][]float64, lp []float64) []phEvent {
+	K := len(res.Predictors)
+	n := len(order)
+	events := make([]phEvent, 0, n)
 
 	sumW := 0.0
 	sumWX := make([]float64, K)
 	i := n - 1
 	for i >= 0 {
-		// Find the tie group [j+1, i] sharing this time.
-		j := i
-		curT := res.intervals[order[i]].Duration
-		for j >= 0 && res.intervals[order[j]].Duration == curT {
-			j--
-		}
-		// Add every member of the tie group to the running sums
-		// before reading any of them — a tied event must see its
-		// peers in its own risk set.
-		for m := j + 1; m <= i; m++ {
-			ii := order[m]
-			w := math.Exp(lp[ii])
-			sumW += w
-			for k := 0; k < K; k++ {
-				sumWX[k] += w * z[ii][k]
-			}
-		}
+		j := tieGroupStart(res.intervals, order, i)
+		accumulateRiskSet(res, order, z, lp, j+1, i, &sumW, sumWX)
 		if sumW > 0 {
-			xbar := make([]float64, K)
-			for k := 0; k < K; k++ {
-				xbar[k] = sumWX[k] / sumW
-			}
-			for m := j + 1; m <= i; m++ {
-				ii := order[m]
-				if !res.intervals[ii].IsObserved {
-					continue
-				}
-				r := make([]float64, K)
-				for k := 0; k < K; k++ {
-					r[k] = z[ii][k] - xbar[k]
-				}
-				events = append(events, ev{time: float64(curT), r: r})
-			}
+			appendEventResiduals(res, order, z, sumW, sumWX, j+1, i, &events)
 		}
 		i = j
 	}
+	return events
+}
 
-	if len(events) < 5 {
-		return nil, fmt.Errorf("CheckPH: too few observed events for PH test (%d)", len(events))
+// tieGroupStart returns j such that [j+1, i] covers every index in
+// order sharing intervals[order[i]].Duration. Callers advance i to
+// j on the next iteration.
+func tieGroupStart(intervals []model.InterAccessInterval, order []int, i int) int {
+	j := i
+	curT := intervals[order[i]].Duration
+	for j >= 0 && intervals[order[j]].Duration == curT {
+		j--
 	}
+	return j
+}
 
-	// Step 4: per-covariate Pearson correlation against time rank.
+// accumulateRiskSet adds [lo, hi] rows to the running (sumW, sumWX)
+// risk-set sums. Must be called before appendEventResiduals for a
+// given tie group so each event sees its peers.
+func accumulateRiskSet(res *CoxResult, order []int, z [][]float64, lp []float64, lo, hi int, sumW *float64, sumWX []float64) {
+	K := len(res.Predictors)
+	for m := lo; m <= hi; m++ {
+		ii := order[m]
+		w := math.Exp(lp[ii])
+		*sumW += w
+		for k := 0; k < K; k++ {
+			sumWX[k] += w * z[ii][k]
+		}
+	}
+}
+
+// appendEventResiduals emits one phEvent per observed row in
+// [lo, hi], skipping censored rows. The residual is z_ik − x̄_k(t_i)
+// where the bar is the Cox-weighted risk-set mean.
+func appendEventResiduals(res *CoxResult, order []int, z [][]float64, sumW float64, sumWX []float64, lo, hi int, events *[]phEvent) {
+	K := len(res.Predictors)
+	xbar := make([]float64, K)
+	for k := 0; k < K; k++ {
+		xbar[k] = sumWX[k] / sumW
+	}
+	curT := res.intervals[order[hi]].Duration
+	for m := lo; m <= hi; m++ {
+		ii := order[m]
+		if !res.intervals[ii].IsObserved {
+			continue
+		}
+		r := make([]float64, K)
+		for k := 0; k < K; k++ {
+			r[k] = z[ii][k] - xbar[k]
+		}
+		*events = append(*events, phEvent{time: float64(curT), r: r})
+	}
+}
+
+// combineGlobalPValue runs the per-covariate Pearson correlation
+// against event-time rank, reports a per-covariate p-value, and
+// combines them via Fisher's method (df = 2K) into a global chi²
+// test. Clamps p away from zero so -2 ln(p) stays finite.
+func combineGlobalPValue(predictors []string, events []phEvent, K int) *PHTestResult {
 	times := make([]float64, len(events))
 	for e := range events {
 		times[e] = events[e].time
@@ -542,7 +618,7 @@ func (StatmodelFitter) CheckPH(res *CoxResult) (*PHTestResult, error) {
 	ranks := averageRanks(times)
 
 	out := &PHTestResult{
-		Predictors:         append([]string(nil), res.Predictors...),
+		Predictors:         append([]string(nil), predictors...),
 		PerCovariatePValue: make(map[string]float64, K),
 	}
 	chi2 := 0.0
@@ -553,18 +629,15 @@ func (StatmodelFitter) CheckPH(res *CoxResult) (*PHTestResult, error) {
 		}
 		rho := pearsonCorrelation(col, ranks)
 		p := correlationPValue(rho, len(events))
-		out.PerCovariatePValue[res.Predictors[k]] = p
-		// Fisher's method needs strictly positive p; clamp away from
-		// zero to keep -2 ln(p) finite.
+		out.PerCovariatePValue[predictors[k]] = p
 		if p < 1e-300 {
 			p = 1e-300
 		}
 		chi2 += -2 * math.Log(p)
 	}
-	// Step 5: global p from Fisher's combined statistic, df = 2K.
 	chi := distuv.ChiSquared{K: float64(2 * K)}
 	out.GlobalPValue = chi.Survival(chi2)
-	return out, nil
+	return out
 }
 
 // pearsonCorrelation is a small zero-mean / unit-norm Pearson coefficient
@@ -676,75 +749,21 @@ func (StatmodelFitter) CalibrateAt(
 		return nil, fmt.Errorf("CalibrateAt: empty holdout")
 	}
 
-	all := make([]calPoint, 0, len(holdout))
-	for _, it := range holdout {
-		var label float64
-		switch {
-		case it.IsObserved && it.Duration <= uint64(tau):
-			label = 1
-		case it.Duration > uint64(tau):
-			label = 0
-		default:
-			continue
-		}
-		all = append(all, calPoint{
-			p:  res.PredictAccessProbForInterval(it, tau),
-			y:  label,
-			it: it,
-		})
-	}
+	all := labelHoldoutForTau(res, holdout, tau)
 	if len(all) < 10 {
 		return nil, fmt.Errorf("CalibrateAt: only %d non-ambiguous holdout rows (need >= 10 for split conformal)", len(all))
 	}
-
-	// Deterministic 50/50 partition on SlotID → even hash bucket
-	// fits PAV, odd bucket measures residuals. Done before the sort
-	// below so each half is independent of the predicted-probability
-	// order.
-	var isoPts, calPts []calPoint
-	for _, p := range all {
-		if slotIDBucket(p.it.SlotID) == 0 {
-			isoPts = append(isoPts, p)
-		} else {
-			calPts = append(calPts, p)
-		}
-	}
+	isoPts, calPts := partitionBySlotIDBucket(all)
 	if len(isoPts) < 5 || len(calPts) < 5 {
 		return nil, fmt.Errorf("CalibrateAt: split-conformal partition too small (iso=%d, cal=%d)", len(isoPts), len(calPts))
 	}
 
-	// Fit the PAV isotonic map on the iso half.
-	sort.Slice(isoPts, func(i, j int) bool { return isoPts[i].p < isoPts[j].p })
-	xIso := make([]float64, len(isoPts))
-	yIso := make([]float64, len(isoPts))
-	for i, p := range isoPts {
-		xIso[i] = p.p
-		yIso[i] = p.y
-	}
-	yHatIso := poolAdjacentViolators(yIso)
+	xIso, yHatIso := fitIsotonicGrid(isoPts)
 
 	// Compute conformal residuals on the cal half by looking up each
 	// row's prediction on the PAV grid fitted above.
 	const defaultCoverage = 0.9
-	resid := make([]float64, len(calPts))
-	for i, p := range calPts {
-		fitted := isotonicLookup(xIso, yHatIso, p.p)
-		d := p.y - fitted
-		if d < 0 {
-			d = -d
-		}
-		resid[i] = d
-	}
-	sort.Float64s(resid)
-	alpha := 1 - defaultCoverage
-	k := int(math.Ceil((1-alpha)*float64(len(resid)+1))) - 1
-	if k < 0 {
-		k = 0
-	}
-	if k >= len(resid) {
-		k = len(resid) - 1
-	}
-	epsilon := resid[k]
+	epsilon := splitConformalQuantile(calPts, xIso, yHatIso, defaultCoverage)
 
 	// Conditional split-conformal (Segment 19). Fit a second ε on the
 	// raw Cox conditional prediction 1 − S(u+τ)/S(u) at an arbitrary
@@ -764,6 +783,92 @@ func (StatmodelFitter) CalibrateAt(
 		ConditionalEpsilon: condEpsilon,
 		CoverageLevel:      defaultCoverage,
 	}, nil
+}
+
+// labelHoldoutForTau turns holdout intervals into (prediction, label,
+// interval) triples usable for calibration:
+//
+//   - label = 1 if the event fell inside [0, τ],
+//   - label = 0 if Duration > τ (slot unambiguously survived the
+//     horizon),
+//   - drop otherwise (censored-before-τ — we don't know whether the
+//     event would have landed in the horizon).
+func labelHoldoutForTau(res *CoxResult, holdout []model.InterAccessInterval, tau float64) []calPoint {
+	out := make([]calPoint, 0, len(holdout))
+	for _, it := range holdout {
+		var label float64
+		switch {
+		case it.IsObserved && it.Duration <= uint64(tau):
+			label = 1
+		case it.Duration > uint64(tau):
+			label = 0
+		default:
+			continue
+		}
+		out = append(out, calPoint{
+			p:  res.PredictAccessProbForInterval(it, tau),
+			y:  label,
+			it: it,
+		})
+	}
+	return out
+}
+
+// partitionBySlotIDBucket splits calPoints deterministically on a
+// SlotID hash: even bucket → PAV fit half, odd bucket → residual
+// measurement half. Slot-level (not row-level) partitioning keeps
+// conformal independence when a slot contributes multiple intervals.
+func partitionBySlotIDBucket(all []calPoint) (iso, cal []calPoint) {
+	for _, p := range all {
+		if slotIDBucket(p.it.SlotID) == 0 {
+			iso = append(iso, p)
+		} else {
+			cal = append(cal, p)
+		}
+	}
+	return iso, cal
+}
+
+// fitIsotonicGrid runs the Pool Adjacent Violators algorithm on the
+// (predicted, label) pairs after sorting by prediction. The returned
+// xIso / yHatIso are the x-sorted predictions and their PAV-fitted y
+// values, suitable for step-function lookup via isotonicLookup.
+func fitIsotonicGrid(isoPts []calPoint) (xIso, yHatIso []float64) {
+	sort.Slice(isoPts, func(i, j int) bool { return isoPts[i].p < isoPts[j].p })
+	xIso = make([]float64, len(isoPts))
+	yIso := make([]float64, len(isoPts))
+	for i, p := range isoPts {
+		xIso[i] = p.p
+		yIso[i] = p.y
+	}
+	yHatIso = poolAdjacentViolators(yIso)
+	return xIso, yHatIso
+}
+
+// splitConformalQuantile computes the conformal ε: the ceil((1-α)·
+// (n+1))-th smallest |y − ŷ| residual on the cal half, where the
+// fitted value is looked up on the isotonic grid. Returns the
+// quantile of the residual distribution at the requested coverage.
+func splitConformalQuantile(calPts []calPoint, xIso, yHatIso []float64, coverage float64) float64 {
+	resid := make([]float64, len(calPts))
+	for i, p := range calPts {
+		fitted := isotonicLookup(xIso, yHatIso, p.p)
+		d := p.y - fitted
+		if d < 0 {
+			d = -d
+		}
+		resid[i] = d
+	}
+	sort.Float64s(resid)
+	alpha := 1 - coverage
+	k := int(math.Ceil((1-alpha)*float64(len(resid)+1))) - 1
+	if k < 0 {
+		k = 0
+	}
+	if k >= len(resid) {
+		k = len(resid) - 1
+	}
+	return resid[k]
 }
 
 // fitConditionalEpsilon computes the split-conformal quantile for the
