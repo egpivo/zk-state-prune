@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -66,6 +67,43 @@ type DistributionSummary struct {
 	// fitted above the median. Power-law tails give α ~ 1-3; values much
 	// larger than that indicate an exponential-like tail. Zero if Count<10.
 	PowerLawAlphaMLE float64
+}
+
+// MarshalJSON renders a DistributionSummary for encoding/json, routing
+// NaN / ±Inf float fields through nil so the encoder doesn't refuse
+// to serialize. Degenerate sub-distributions (e.g. a stratum with 1-2
+// intervals where gonum returns NaN for mean/std) would otherwise
+// crash the whole EDA JSON output.
+func (d DistributionSummary) MarshalJSON() ([]byte, error) {
+	scalar := func(v float64) *float64 {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return nil
+		}
+		vv := v
+		return &vv
+	}
+	type alias struct {
+		Count            int      `json:"Count"`
+		Mean             *float64 `json:"Mean"`
+		StdDev           *float64 `json:"StdDev"`
+		Min              *float64 `json:"Min"`
+		P50              *float64 `json:"P50"`
+		P90              *float64 `json:"P90"`
+		P99              *float64 `json:"P99"`
+		Max              *float64 `json:"Max"`
+		PowerLawAlphaMLE *float64 `json:"PowerLawAlphaMLE"`
+	}
+	return json.Marshal(alias{
+		Count:            d.Count,
+		Mean:             scalar(d.Mean),
+		StdDev:           scalar(d.StdDev),
+		Min:              scalar(d.Min),
+		P50:              scalar(d.P50),
+		P90:              scalar(d.P90),
+		P99:              scalar(d.P99),
+		Max:              scalar(d.Max),
+		PowerLawAlphaMLE: scalar(d.PowerLawAlphaMLE),
+	})
 }
 
 // ContractTypeSummary aggregates per-category metrics that inform
