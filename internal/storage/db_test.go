@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -215,6 +216,178 @@ func TestInsertAccessEvents_IsIdempotent(t *testing.T) {
 	}
 	if got, _ := db.CountAccessEvents(ctx); got != 3 {
 		t.Errorf("CountAccessEvents after fresh insert = %d, want 3", got)
+	}
+}
+
+func TestIterateSlotEvents_OrdersAndGroupsBySlot(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "iter.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	if err := db.UpsertContract(ctx, model.ContractMeta{
+		Address: "0xaa", ContractType: model.ContractERC20, DeployBlock: 10,
+	}); err != nil {
+		t.Fatalf("UpsertContract: %v", err)
+	}
+	for _, s := range []model.StateSlot{
+		{SlotID: "a-slot", ContractAddr: "0xaa", SlotIndex: 0, SlotType: model.SlotTypeBalance, CreatedAt: 10, LastAccess: 300, IsActive: true},
+		{SlotID: "b-slot", ContractAddr: "0xaa", SlotIndex: 1, SlotType: model.SlotTypeMapping, CreatedAt: 10, LastAccess: 150, IsActive: true},
+		{SlotID: "c-empty", ContractAddr: "0xaa", SlotIndex: 2, SlotType: model.SlotTypeFixed, CreatedAt: 10, LastAccess: 10, IsActive: true},
+	} {
+		if err := db.UpsertSlot(ctx, s); err != nil {
+			t.Fatalf("UpsertSlot %s: %v", s.SlotID, err)
+		}
+	}
+	// Events inserted out of chronological order to exercise ORDER BY.
+	events := []model.AccessEvent{
+		{SlotID: "a-slot", BlockNumber: 300, AccessType: model.AccessRead, TxHash: "0x3"},
+		{SlotID: "a-slot", BlockNumber: 100, AccessType: model.AccessWrite, TxHash: "0x1"},
+		{SlotID: "b-slot", BlockNumber: 150, AccessType: model.AccessRead, TxHash: "0x4"},
+		{SlotID: "a-slot", BlockNumber: 200, AccessType: model.AccessRead, TxHash: "0x2"},
+	}
+	if _, err := db.InsertAccessEvents(ctx, events); err != nil {
+		t.Fatalf("InsertAccessEvents: %v", err)
+	}
+
+	type observed struct {
+		slotID string
+		blocks []uint64
+		cat    model.ContractCategory
+		slot   model.SlotType
+	}
+	var got []observed
+	err = db.IterateSlotEvents(ctx, func(meta SlotWithMeta, evs []model.AccessEvent) error {
+		o := observed{
+			slotID: meta.Slot.SlotID,
+			cat:    meta.Category,
+			slot:   meta.Slot.SlotType,
+		}
+		for _, e := range evs {
+			o.blocks = append(o.blocks, e.BlockNumber)
+		}
+		got = append(got, o)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("IterateSlotEvents: %v", err)
+	}
+
+	if len(got) != 3 {
+		t.Fatalf("got %d slots, want 3", len(got))
+	}
+	byID := map[string]observed{}
+	for _, o := range got {
+		byID[o.slotID] = o
+	}
+	// a-slot: events must be chronologically ordered.
+	a := byID["a-slot"]
+	wantA := []uint64{100, 200, 300}
+	if len(a.blocks) != len(wantA) {
+		t.Fatalf("a-slot blocks=%v, want %v", a.blocks, wantA)
+	}
+	for i, b := range a.blocks {
+		if b != wantA[i] {
+			t.Errorf("a-slot blocks[%d]=%d, want %d", i, b, wantA[i])
+		}
+	}
+	// Meta is threaded through from the JOIN.
+	if a.cat != model.ContractERC20 {
+		t.Errorf("a-slot category=%v, want ContractERC20", a.cat)
+	}
+	if a.slot != model.SlotTypeBalance {
+		t.Errorf("a-slot slot type=%v, want SlotTypeBalance", a.slot)
+	}
+	// Slot with zero events still receives a callback with an empty slice.
+	c, ok := byID["c-empty"]
+	if !ok {
+		t.Fatalf("c-empty did not receive a callback (fully-censored slots must still be emitted)")
+	}
+	if len(c.blocks) != 0 {
+		t.Errorf("c-empty events=%v, want empty", c.blocks)
+	}
+}
+
+func TestIterateSlotEvents_PropagatesCallbackError(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "iter_err.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	if err := db.UpsertContract(ctx, model.ContractMeta{Address: "0xaa", ContractType: model.ContractERC20}); err != nil {
+		t.Fatalf("UpsertContract: %v", err)
+	}
+	if err := db.UpsertSlot(ctx, model.StateSlot{
+		SlotID: "s1", ContractAddr: "0xaa", SlotType: model.SlotTypeBalance,
+		CreatedAt: 1, LastAccess: 1, IsActive: true,
+	}); err != nil {
+		t.Fatalf("UpsertSlot: %v", err)
+	}
+	if _, err := db.InsertAccessEvents(ctx, []model.AccessEvent{
+		{SlotID: "s1", BlockNumber: 10, AccessType: model.AccessWrite, TxHash: "0x1"},
+	}); err != nil {
+		t.Fatalf("InsertAccessEvents: %v", err)
+	}
+
+	sentinel := fmt.Errorf("sentinel")
+	err = db.IterateSlotEvents(ctx, func(SlotWithMeta, []model.AccessEvent) error {
+		return sentinel
+	})
+	if err == nil {
+		t.Fatalf("IterateSlotEvents: want error, got nil")
+	}
+}
+
+func TestReset_TruncatesAllDataTables(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "reset.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	if err := db.UpsertContract(ctx, model.ContractMeta{Address: "0xaa", ContractType: model.ContractERC20}); err != nil {
+		t.Fatalf("UpsertContract: %v", err)
+	}
+	if err := db.UpsertSlot(ctx, model.StateSlot{
+		SlotID: "s1", ContractAddr: "0xaa", SlotType: model.SlotTypeBalance,
+		CreatedAt: 1, LastAccess: 1, IsActive: true,
+	}); err != nil {
+		t.Fatalf("UpsertSlot: %v", err)
+	}
+	if _, err := db.InsertAccessEvents(ctx, []model.AccessEvent{
+		{SlotID: "s1", BlockNumber: 10, AccessType: model.AccessWrite, TxHash: "0x1"},
+	}); err != nil {
+		t.Fatalf("InsertAccessEvents: %v", err)
+	}
+
+	if err := db.Reset(ctx); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	if got, _ := db.CountSlots(ctx); got != 0 {
+		t.Errorf("CountSlots after Reset = %d, want 0", got)
+	}
+	if got, _ := db.CountAccessEvents(ctx); got != 0 {
+		t.Errorf("CountAccessEvents after Reset = %d, want 0", got)
+	}
+	var contracts int64
+	if err := db.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM contracts`).Scan(&contracts); err != nil {
+		t.Fatalf("count contracts: %v", err)
+	}
+	if contracts != 0 {
+		t.Errorf("contracts after Reset = %d, want 0", contracts)
+	}
+	// Schema (and schema_meta) must survive Reset.
+	var version string
+	if err := db.SQL().QueryRowContext(ctx, `SELECT value FROM schema_meta WHERE key='version'`).Scan(&version); err != nil {
+		t.Fatalf("read version after Reset: %v", err)
+	}
+	if version == "" {
+		t.Errorf("schema_meta version cleared by Reset")
 	}
 }
 

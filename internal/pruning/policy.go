@@ -61,8 +61,8 @@ type Policy interface {
 // rate (zero).
 type NoPrune struct{}
 
-func (NoPrune) Name() string                                       { return "no-prune" }
-func (NoPrune) HotBlocks(it model.InterAccessInterval) uint64      { return it.Duration }
+func (NoPrune) Name() string                                  { return "no-prune" }
+func (NoPrune) HotBlocks(it model.InterAccessInterval) uint64 { return it.Duration }
 
 // FixedIdle demotes any slot that has been idle for at least IdleBlocks
 // blocks. This is the strawman that statistical policies must beat.

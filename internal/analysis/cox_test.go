@@ -24,10 +24,10 @@ func syntheticCoxIntervals(n int) []model.InterAccessInterval {
 		base := 100.0 / float64(ac+1)
 		dur := uint64(math.Max(1, base+r.NormFloat64()*2))
 		out = append(out, model.InterAccessInterval{
-			SlotID:       fmt.Sprintf("s%d", i),
-			Duration:     dur,
-			IsObserved:   true,
-			AccessCount:  ac,
+			SlotID:      fmt.Sprintf("s%d", i),
+			Duration:    dur,
+			IsObserved:  true,
+			AccessCount: ac,
 			// Distinct values so the test does not stumble into the
 			// same collinearity pitfall the Phase-1 mock has.
 			ContractAge:  uint64(i * 10),
@@ -165,4 +165,3 @@ func TestFitCoxPH_OnMockEndToEnd(t *testing.T) {
 		}
 	}
 }
-

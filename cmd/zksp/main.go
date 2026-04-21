@@ -15,16 +15,16 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
-	"math"
 	"os"
 	"os/signal"
 	"sort"
 	"syscall"
-	"text/tabwriter"
 
 	"github.com/spf13/cobra"
 
 	"github.com/egpivo/zk-state-prune/internal/analysis"
+	"github.com/egpivo/zk-state-prune/internal/app"
+	"github.com/egpivo/zk-state-prune/internal/app/render"
 	"github.com/egpivo/zk-state-prune/internal/config"
 	"github.com/egpivo/zk-state-prune/internal/extractor"
 	"github.com/egpivo/zk-state-prune/internal/model"
@@ -380,9 +380,9 @@ func newEDACmd() *cobra.Command {
 				return fmt.Errorf("eda: %w", err)
 			}
 			if outputFormat(format).isJSON() {
-				return emitJSON(os.Stdout, rep)
+				return emitJSON(cmd.OutOrStdout(), rep)
 			}
-			return printEDAReport(os.Stdout, rep)
+			return render.EDA(cmd.OutOrStdout(), rep)
 		},
 	}
 	cmd.Flags().StringVar(&dbPath, "db", defaultDBPath, "SQLite DB path")
@@ -416,7 +416,7 @@ func newFitCmd() *cobra.Command {
 			}
 
 			fitter := analysis.NewStatmodelFitter()
-			out := os.Stdout
+			out := cmd.OutOrStdout()
 			fmtMode := outputFormat(format)
 
 			switch modelKind {
@@ -480,122 +480,12 @@ func runKMFit(out io.Writer, fitter analysis.SurvivalFitter, intervals []model.I
 	if format.isJSON() {
 		return emitJSON(out, curves)
 	}
-	return printKM(out, curves)
+	return render.KM(out, curves)
 }
 
-// coxFitReport bundles the stages of a Cox fit into one JSON-marshalable
-// object so `fit --model cox --format json` can emit the whole pipeline
-// in a single payload rather than separate sections of text.
-type coxFitReport struct {
-	Tau              float64                    `json:"tau"`
-	TrainIntervals   int                        `json:"train_intervals"`
-	HoldoutIntervals int                        `json:"holdout_intervals"`
-	Cox              *analysis.CoxResult        `json:"cox"`
-	PH               *analysis.PHTestResult     `json:"ph_test"`
-	RawCurve         *analysis.CalibrationCurve `json:"raw_calibration"`
-	CalibratedCurve  *analysis.CalibrationCurve `json:"isotonic_calibration"`
-	BrierDelta       float64                    `json:"brier_delta"`
-}
-
-// buildCoxFitReport drives the Cox PH pipeline — split → fit → PH check
-// → raw calibration curve → isotonic recalibration → post calibration
-// curve — and returns the stages packed into a coxFitReport. Separated
-// from runCoxFit so both the text and JSON paths can share the work,
-// and so `report --format json` can embed the Cox section without
-// re-routing text output through the CLI.
-// coxStrataColumn translates the user-facing --stratify flag value
-// ("none" / "contract-type" / …) into a dstream adapter column name
-// consumed by FitCoxPHStratified. The empty string means unstratified.
-// Kept in main.go so analysis stays free of CLI-idiom string mapping.
-func coxStrataColumn(stratify string) (string, error) {
-	switch stratify {
-	case "", "none":
-		return "", nil
-	case "contract-type", "contract":
-		return analysis.ColContractType, nil
-	case "slot-type", "slot":
-		return analysis.ColSlotType, nil
-	default:
-		return "", fmt.Errorf("unknown cox stratify mode %q (use none|contract-type|slot-type)", stratify)
-	}
-}
-
-// buildCoxFitReport returns the display-layer coxFitReport plus the
-// CalibratedModel that produced it. The latter is separate from the
-// JSON shape so `fit --save` can round-trip the fitted model to disk
-// without including the bulky training intervals in the sibling JSON
-// report.
-func buildCoxFitReport(
-	fitter analysis.StatmodelFitter,
-	intervals []model.InterAccessInterval,
-	holdoutFrac float64,
-	splitSeed uint64,
-	tauFlag uint64,
-	stratify string,
-) (*coxFitReport, *analysis.CalibratedModel, error) {
-	train, holdout, err := analysis.TrainHoldoutSplitBySlot(intervals, holdoutFrac, splitSeed)
-	if err != nil {
-		return nil, nil, fmt.Errorf("split: %w", err)
-	}
-	slog.Info("cox split", "train_intervals", len(train), "holdout_intervals", len(holdout), "stratify", stratify)
-
-	strataColumn, err := coxStrataColumn(stratify)
-	if err != nil {
-		return nil, nil, err
-	}
-	res, err := fitter.FitCoxPHStratified(train, analysis.DefaultCoxPredictors, strataColumn)
-	if err != nil {
-		return nil, nil, fmt.Errorf("fit cox: %w", err)
-	}
-	ph, err := fitter.CheckPH(res)
-	if err != nil {
-		return nil, nil, fmt.Errorf("check PH: %w", err)
-	}
-	tau := float64(tauFlag)
-	if tau == 0 {
-		tau = medianDuration(train)
-	}
-	rawCurve, err := analysis.CalibrationCurveFromCox(res, holdout, tau, 10)
-	if err != nil {
-		return nil, nil, fmt.Errorf("calibration curve: %w", err)
-	}
-	calib, err := fitter.CalibrateAt(res, holdout, tau)
-	if err != nil {
-		return nil, nil, fmt.Errorf("calibrate: %w", err)
-	}
-	postCurve, err := calibrationCurveFromCalibrated(calib, holdout, 10)
-	if err != nil {
-		return nil, nil, fmt.Errorf("post-calibration curve: %w", err)
-	}
-	return &coxFitReport{
-		Tau:              tau,
-		TrainIntervals:   len(train),
-		HoldoutIntervals: len(holdout),
-		Cox:              res,
-		PH:               ph,
-		RawCurve:         rawCurve,
-		CalibratedCurve:  postCurve,
-		BrierDelta:       postCurve.BrierScore - rawCurve.BrierScore,
-	}, calib, nil
-}
-
-// printCoxFitReport renders a coxFitReport as the text sequence used by
-// `fit --model cox` and the Cox section of `report`.
-func printCoxFitReport(out io.Writer, r *coxFitReport) {
-	if r == nil {
-		return
-	}
-	_ = printCoxSummary(out, r.Cox)
-	fmt.Fprintln(out, "\n-- proportional-hazards check (Schoenfeld) --")
-	_ = printPHTest(out, r.PH)
-	fmt.Fprintf(out, "\n-- calibration @ tau=%.0f blocks --\n", r.Tau)
-	fmt.Fprintln(out, "raw Cox:")
-	_ = printCalibrationCurve(out, r.RawCurve)
-	fmt.Fprintln(out, "\nisotonic-recalibrated:")
-	_ = printCalibrationCurve(out, r.CalibratedCurve)
-	fmt.Fprintf(out, "\nBrier: raw=%.4f → calibrated=%.4f (delta=%+.4f)\n",
-		r.RawCurve.BrierScore, r.CalibratedCurve.BrierScore, r.BrierDelta)
-}
+// (app.CoxFitReport and the BuildCoxFitReport / CoxStrataColumn
+// helpers live in internal/app; the text renderer is in
+// internal/app/render. main.go only chooses between JSON and text.)
 
 // runCoxFit is the `fit --model cox` handler. Thin adapter over
 // buildCoxFitReport that chooses the output path based on --format.
@@ -610,7 +500,7 @@ func runCoxFit(
 	savePath string,
 	stratify string,
 ) error {
-	r, calib, err := buildCoxFitReport(fitter, intervals, holdoutFrac, splitSeed, tauFlag, stratify)
+	r, calib, err := app.BuildCoxFitReport(fitter, intervals, holdoutFrac, splitSeed, tauFlag, stratify)
 	if err != nil {
 		return err
 	}
@@ -623,173 +513,13 @@ func runCoxFit(
 	if format.isJSON() {
 		return emitJSON(out, r)
 	}
-	printCoxFitReport(out, r)
+	render.CoxFit(out, r)
 	return nil
 }
 
-// buildStatisticalPolicy fits + calibrates a Cox model on the provided
-// intervals and wraps the result in a pruning.StatisticalPolicy. The
-// fit uses a 70/30 (or caller-specified) train/holdout split; the
-// calibration runs on the holdout side so the isotonic map sees data
-// the Cox fit didn't.
-//
-// When robust is true the policy uses the *upper* endpoint of the
-// split-conformal interval around the calibrated probability instead
-// of the point estimate. That implements
-//
-//	d_i* = argmin_d max_{p ∈ U_i} [c(d) + ℓ(d) · p]
-//
-// which prefers keeping a slot hot under uncertainty: the cold action
-// only wins when the high-confidence upper bound is still below p*.
-// Label: "statistical-robust" so it shows up distinctly from
-// "statistical" in the comparison table.
-//
-// Phase-2 simplification: we then run the policy against the FULL
-// interval set (in the caller), accepting a small leakage on the train
-// side, in exchange for a fair side-by-side comparison with the fixed
-// baselines that also see every row.
-func buildStatisticalPolicy(
-	intervals []model.InterAccessInterval,
-	holdoutFrac float64,
-	splitSeed uint64,
-	tauFlag uint64,
-	costs pruning.CostParams,
-	robust bool,
-) (*pruning.StatisticalPolicy, error) {
-	train, holdout, err := analysis.TrainHoldoutSplitBySlot(intervals, holdoutFrac, splitSeed)
-	if err != nil {
-		return nil, fmt.Errorf("split: %w", err)
-	}
-	fitter := analysis.NewStatmodelFitter()
-	res, err := fitter.FitCoxPH(train, analysis.DefaultCoxPredictors)
-	if err != nil {
-		return nil, fmt.Errorf("fit cox: %w", err)
-	}
-	tau := float64(tauFlag)
-	if tau == 0 {
-		tau = medianDuration(train)
-	}
-	calib, err := fitter.CalibrateAt(res, holdout, tau)
-	if err != nil {
-		return nil, fmt.Errorf("calibrate: %w", err)
-	}
-	return statisticalPolicyFromCalibrated(calib, costs, robust)
-}
-
-// statisticalPolicyFromCalibrated is the shared construction path for
-// "turn a CalibratedModel into a StatisticalPolicy". Used by the
-// fit-on-the-fly flow in buildStatisticalPolicy as well as the CLI's
-// --model path, which loads a previously persisted model and skips the
-// fit pipeline entirely. Keeping the closure logic in one place means
-// the fresh-fit and loaded-model policies behave identically.
-func statisticalPolicyFromCalibrated(
-	calib *analysis.CalibratedModel,
-	costs pruning.CostParams,
-	robust bool,
-) (*pruning.StatisticalPolicy, error) {
-	if calib == nil || calib.Base == nil {
-		return nil, fmt.Errorf("statisticalPolicyFromCalibrated: nil model")
-	}
-	// Build the conditional predictor used by the T*-search. The raw
-	// Cox survival function is evaluated at (idle) and (idle + τ) to
-	// compute the conditional access probability at each search
-	// sample. The isotonic calibration only maps single-horizon
-	// predictions at τ from idle=0, so we do NOT apply it at u>0 —
-	// that's a different quantity the recalibration grid wasn't fit
-	// for.
-	cox := calib.Base
-	rawCondP := func(it model.InterAccessInterval, idle float64) float64 {
-		sU := cox.SurvivalForInterval(it, idle)
-		if sU <= 0 {
-			return 1
-		}
-		sUTau := cox.SurvivalForInterval(it, idle+calib.Tau)
-		p := 1 - sUTau/sU
-		if p < 0 {
-			return 0
-		}
-		if p > 1 {
-			return 1
-		}
-		return p
-	}
-
-	name := "statistical"
-	var predict pruning.CondAccessProbFunc = rawCondP
-	if robust {
-		// Robust variant. Two separately-fit ε values back the
-		// policy, each one a marginal (not simultaneous) coverage
-		// bound on its own target quantity:
-		//
-		//   - At the idle = 0 sample we use the *calibrated* point
-		//     upper bound p̂(τ) + Epsilon (CalibratedModel.
-		//     PredictUpperAccessProbForInterval). Epsilon is the
-		//     split-conformal quantile fit on PAV residuals at
-		//     τ / idle = 0; as a single-point probe at exactly
-		//     that quantity it has a clean finite-sample marginal
-		//     guarantee.
-		//
-		//   - At idle > 0 samples we use the *raw Cox conditional*
-		//     upper bound (1 − S(u+τ)/S(u)) + ConditionalEpsilon
-		//     (PredictUpperConditionalAccessProb). ConditionalEpsilon
-		//     was fit on ONE deterministically-sampled u per cal
-		//     row, so it covers a fresh single-u probe marginally —
-		//     NOT the worst over the ~21 u values the T*-search
-		//     scans per interval. Treat this as a principled
-		//     pessimism margin rather than a simultaneous bound;
-		//     the Phase-4 upgrade would fit a per-u or max-over-u
-		//     conformal quantile so "robust at every sample" is a
-		//     theorem rather than an engineering approximation.
-		//
-		// Falls back to raw point estimates if the corresponding ε
-		// is zero (e.g. tiny holdouts where ConditionalEpsilon
-		// couldn't be fit on 10+ unambiguous rows).
-		name = "statistical-robust"
-		predict = func(it model.InterAccessInterval, idle float64) float64 {
-			if idle == 0 {
-				return calib.PredictUpperAccessProbForInterval(it)
-			}
-			return calib.PredictUpperConditionalAccessProb(it, idle)
-		}
-	}
-	return pruning.NewStatisticalPolicy(name, predict, calib.Tau, costs)
-}
-
-// medianDuration is a tiny in-place median for picking a default cox tau.
-func medianDuration(ivs []model.InterAccessInterval) float64 {
-	if len(ivs) == 0 {
-		return 1
-	}
-	xs := make([]float64, len(ivs))
-	for i, it := range ivs {
-		xs[i] = float64(it.Duration)
-	}
-	sort.Float64s(xs)
-	v := xs[len(xs)/2]
-	if v <= 0 {
-		v = 1
-	}
-	return v
-}
-
-// calibrationCurveFromCalibrated is a CLI-side convenience that routes
-// the calibrated model's PredictAccessProbForInterval through the
-// shared CalibrationCurveFromPredict helper, so the post-isotonic
-// reliability diagram uses the exact same bin-wise KM policy as the
-// raw Cox version.
-func calibrationCurveFromCalibrated(
-	calib *analysis.CalibratedModel,
-	holdout []model.InterAccessInterval,
-	nBins int,
-) (*analysis.CalibrationCurve, error) {
-	if calib == nil || calib.Base == nil {
-		return nil, fmt.Errorf("calibrationCurveFromCalibrated: nil calibrated model")
-	}
-	predict := func(it model.InterAccessInterval) float64 {
-		return calib.PredictAccessProbForInterval(it)
-	}
-	return analysis.CalibrationCurveFromPredict(predict, holdout, calib.Tau, nBins)
-}
+// (buildStatisticalPolicy / statisticalPolicyFromCalibrated /
+// medianDuration / calibrationCurveFromCalibrated live in
+// internal/app. The CLI call sites below invoke them via app.*.)
 
 // --------------------------------------------------------------- simulate
 
@@ -829,14 +559,14 @@ func newSimulateCmd() *cobra.Command {
 					if err != nil {
 						return fmt.Errorf("load model: %w", err)
 					}
-					p, err = statisticalPolicyFromCalibrated(loaded, costs, useRobust)
+					p, err = app.StatisticalPolicyFromCalibrated(loaded, costs, useRobust)
 					if err != nil {
 						return fmt.Errorf("statistical from loaded model: %w", err)
 					}
 					slog.Info("statistical policy loaded from file",
 						"model_path", modelPath, "tau", p.Tau())
 				} else {
-					p, err = buildStatisticalPolicy(built.Intervals, holdoutFrac, splitSeed, tau, costs, useRobust)
+					p, err = app.BuildStatisticalPolicy(built.Intervals, holdoutFrac, splitSeed, tau, costs, useRobust)
 					if err != nil {
 						return fmt.Errorf("statistical: %w", err)
 					}
@@ -860,9 +590,9 @@ func newSimulateCmd() *cobra.Command {
 				return fmt.Errorf("simulate: %w", err)
 			}
 			if outputFormat(format).isJSON() {
-				return emitJSON(os.Stdout, []*pruning.SimResult{res})
+				return emitJSON(cmd.OutOrStdout(), []*pruning.SimResult{res})
 			}
-			return printSimResults(os.Stdout, []*pruning.SimResult{res})
+			return render.SimResults(cmd.OutOrStdout(), []*pruning.SimResult{res})
 		},
 	}
 	cmd.Flags().StringVar(&dbPath, "db", defaultDBPath, "SQLite DB path")
@@ -888,7 +618,7 @@ type fullReport struct {
 	EDA      *analysis.EDAReport  `json:"eda"`
 	KMCurves []*analysis.KMResult `json:"km_curves"`
 	Tiering  []*pruning.SimResult `json:"tiering"`
-	Cox      *coxFitReport        `json:"cox,omitempty"`
+	Cox      *app.CoxFitReport    `json:"cox,omitempty"`
 }
 
 func newReportCmd() *cobra.Command {
@@ -906,7 +636,7 @@ func newReportCmd() *cobra.Command {
 			}
 			defer db.Close()
 			window := model.ObservationWindow{Start: startBlock, End: endBlock}
-			out := os.Stdout
+			out := cmd.OutOrStdout()
 			fmtMode := outputFormat(format)
 
 			// 1. EDA (full, with spatial + temporal)
@@ -954,9 +684,9 @@ func newReportCmd() *cobra.Command {
 					if err != nil {
 						return nil, fmt.Errorf("load model: %w", err)
 					}
-					return statisticalPolicyFromCalibrated(loaded, costs, robust)
+					return app.StatisticalPolicyFromCalibrated(loaded, costs, robust)
 				}
-				return buildStatisticalPolicy(built.Intervals, 0.3, 1, 0, costs, robust)
+				return app.BuildStatisticalPolicy(built.Intervals, 0.3, 1, 0, costs, robust)
 			}
 			// When the user explicitly passes --model, a load failure
 			// should be hard — otherwise the report silently drops
@@ -997,7 +727,7 @@ func newReportCmd() *cobra.Command {
 			// CalibratedModel returned alongside is currently unused
 			// here (report doesn't --save); keep it bound to _ so the
 			// compiler doesn't prune the return arity by accident.
-			coxReport, _, coxErr := buildCoxFitReport(fitter, built.Intervals, 0.3, 1, 0, "")
+			coxReport, _, coxErr := app.BuildCoxFitReport(fitter, built.Intervals, 0.3, 1, 0, "")
 
 			if fmtMode.isJSON() {
 				return emitJSON(out, fullReport{
@@ -1009,22 +739,22 @@ func newReportCmd() *cobra.Command {
 			}
 
 			fmt.Fprintln(out, "=== EDA ===")
-			if err := printEDAReport(out, rep); err != nil {
+			if err := render.EDA(out, rep); err != nil {
 				return err
 			}
 			fmt.Fprintln(out, "\n=== Kaplan–Meier ===")
-			if err := printKM(out, curves); err != nil {
+			if err := render.KM(out, curves); err != nil {
 				return err
 			}
 			fmt.Fprintln(out, "\n=== Tiering policies ===")
-			if err := printSimResults(out, results); err != nil {
+			if err := render.SimResults(out, results); err != nil {
 				return err
 			}
 			fmt.Fprintln(out, "\n=== Cox PH (70/30 split) ===")
 			if coxErr != nil {
 				fmt.Fprintf(out, "cox section skipped: %v\n", coxErr)
 			} else {
-				printCoxFitReport(out, coxReport)
+				render.CoxFit(out, coxReport)
 			}
 			return nil
 		},
@@ -1037,130 +767,4 @@ func newReportCmd() *cobra.Command {
 	return cmd
 }
 
-// --------------------------------------------------------------- printers
-
-func printEDAReport(w io.Writer, r *analysis.EDAReport) error {
-	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(tw, "window\t[%d, %d)\n", r.Window.Start, r.Window.End)
-	fmt.Fprintf(tw, "slots\t%d\n", r.SlotCount)
-	fmt.Fprintf(tw, "intervals\t%d\n", r.TotalIntervals)
-	fmt.Fprintf(tw, "right_censored\t%d (%.1f%%)\n", r.RightCensoredCount, 100*r.RightCensoredRate)
-	fmt.Fprintf(tw, "left_truncated_slots\t%d (%.1f%%)\n", r.LeftTruncatedCount, 100*r.LeftTruncatedRate)
-	fmt.Fprintf(tw, "slots_no_events\t%d\n", r.SlotsWithNoEvents)
-	fmt.Fprintf(tw, "slots_skipped\t%d\n", r.SlotsSkipped)
-	if err := tw.Flush(); err != nil {
-		return err
-	}
-	fmt.Fprintln(w, "\n-- access frequency per slot --")
-	printDistribution(w, r.Frequency)
-	fmt.Fprintln(w, "\n-- inter-access time (observed only) --")
-	printDistribution(w, r.InterAccessTime)
-	fmt.Fprintln(w, "\n-- by contract type --")
-	tw = tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "category\tslots\tintervals\tcensored%\tIAT_p50\tIAT_p99")
-	cats := make([]string, 0, len(r.ByContractType))
-	idx := make(map[string]model.ContractCategory)
-	for k := range r.ByContractType {
-		s := k.String()
-		cats = append(cats, s)
-		idx[s] = k
-	}
-	sort.Strings(cats)
-	for _, name := range cats {
-		s := r.ByContractType[idx[name]]
-		fmt.Fprintf(tw, "%s\t%d\t%d\t%.1f\t%.0f\t%.0f\n",
-			name, s.Slots, s.Intervals, 100*s.RightCensoredRate,
-			s.InterAccessTime.P50, s.InterAccessTime.P99)
-	}
-	if err := tw.Flush(); err != nil {
-		return err
-	}
-	if r.Spatial != nil {
-		fmt.Fprintln(w, "\n-- intra-contract co-access (Jaccard) --")
-		fmt.Fprintf(w, "contracts_measured=%d  mean=%.3f  median=%.3f\n",
-			r.Spatial.NumContracts, r.Spatial.MeanJaccard, r.Spatial.MedianJaccard)
-	}
-	if r.Temporal != nil {
-		fmt.Fprintln(w, "\n-- temporal periodicity (autocorrelation peak) --")
-		fmt.Fprintf(w, "contracts_measured=%d  periodic=%d  periodic_fraction=%.3f\n",
-			r.Temporal.NumContracts, r.Temporal.PeriodicContracts, r.Temporal.PeriodicFraction)
-	}
-	return nil
-}
-
-func printDistribution(w io.Writer, d analysis.DistributionSummary) {
-	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(tw, "n\t%d\n", d.Count)
-	fmt.Fprintf(tw, "mean\t%.2f\n", d.Mean)
-	fmt.Fprintf(tw, "stddev\t%.2f\n", d.StdDev)
-	fmt.Fprintf(tw, "min/p50/p90/p99/max\t%.0f / %.0f / %.0f / %.0f / %.0f\n",
-		d.Min, d.P50, d.P90, d.P99, d.Max)
-	if d.PowerLawAlphaMLE > 0 {
-		fmt.Fprintf(tw, "power_law_alpha_hill\t%.2f\n", d.PowerLawAlphaMLE)
-	}
-	_ = tw.Flush()
-}
-
-func printKM(w io.Writer, curves []*analysis.KMResult) error {
-	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "stratum\tn\tevents\tcensored\tmedian\tS(t=1k)\tS(t=10k)\tS(t=100k)")
-	for _, c := range curves {
-		median := "NA"
-		if !math.IsNaN(c.MedianSurv) {
-			median = fmt.Sprintf("%.0f", c.MedianSurv)
-		}
-		fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%s\t%.3f\t%.3f\t%.3f\n",
-			c.Label, c.N, c.NumEvents, c.NumCensored, median,
-			c.SurvAt(1_000), c.SurvAt(10_000), c.SurvAt(100_000))
-	}
-	return tw.Flush()
-}
-
-func printCoxSummary(w io.Writer, r *analysis.CoxResult) error {
-	fmt.Fprintf(w, "n=%d  events=%d  loglik=%.2f\n", r.NumObs, r.NumEvents, r.LogLike)
-	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "predictor\tcoef\tstd_err\tz\tp")
-	for i, name := range r.Predictors {
-		fmt.Fprintf(tw, "%s\t%+.4f\t%.4f\t%+.2f\t%.4f\n",
-			name, r.Coef[i], r.StdErr[i], r.ZScore[i], r.PValue[i])
-	}
-	return tw.Flush()
-}
-
-func printPHTest(w io.Writer, r *analysis.PHTestResult) error {
-	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "predictor\tp_value\tPH ok @ 0.05")
-	for _, name := range r.Predictors {
-		p := r.PerCovariatePValue[name]
-		mark := "yes"
-		if p < 0.05 {
-			mark = "NO"
-		}
-		fmt.Fprintf(tw, "%s\t%.4f\t%s\n", name, p, mark)
-	}
-	fmt.Fprintf(tw, "global\t%.4f\t%s\n", r.GlobalPValue,
-		map[bool]string{true: "yes", false: "NO"}[r.GlobalPValue >= 0.05])
-	return tw.Flush()
-}
-
-func printCalibrationCurve(w io.Writer, c *analysis.CalibrationCurve) error {
-	fmt.Fprintf(w, "kept=%d  dropped=%d  brier=%.4f\n", c.NumKept, c.NumDropped, c.BrierScore)
-	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "bin\tn\tpredicted\tobserved")
-	for i, b := range c.Bins {
-		fmt.Fprintf(tw, "%d\t%d\t%.3f\t%.3f\n", i+1, b.N, b.PredictedMean, b.ObservedRate)
-	}
-	return tw.Flush()
-}
-
-func printSimResults(w io.Writer, results []*pruning.SimResult) error {
-	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "policy\tslots\tobs\tRAM%\thot_hit%\tmisses\tRAM_cost\tmiss_cost\ttotal_cost")
-	for _, r := range results {
-		fmt.Fprintf(tw, "%s\t%d\t%d\t%.2f\t%.2f\t%d\t%.2f\t%.2f\t%.2f\n",
-			r.Policy, r.TotalSlots, r.ObservedIntervals,
-			100*r.RAMRatio, 100*r.HotHitCoverage, r.Reactivations,
-			r.RAMCost, r.MissPenaltyAgg, r.TotalCost)
-	}
-	return tw.Flush()
-}
+// (all text renderers now live in internal/app/render.)

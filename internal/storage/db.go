@@ -212,8 +212,8 @@ func (d *DB) IterateSlotEvents(
 
 	seen := make(map[string]bool, len(meta))
 	var (
-		curID  string
-		buf    []model.AccessEvent
+		curID string
+		buf   []model.AccessEvent
 	)
 	flush := func() error {
 		if curID == "" {
