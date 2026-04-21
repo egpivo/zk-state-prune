@@ -27,8 +27,8 @@ type MockConfig struct {
 	// AccessRate is per-slot per-block intensity, drawn from a Pareto.
 	// Heavy tail (small alpha) means most slots are nearly dead while a
 	// handful are extremely hot, mirroring real on-chain access patterns.
-	AccessRateXmin  float64
-	AccessRateAlpha float64
+	AccessRateXmin   float64
+	AccessRateAlpha  float64
 	MaxEventsPerSlot int
 
 	IntraContractCorrelation float64

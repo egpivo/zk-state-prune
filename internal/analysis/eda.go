@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -25,10 +26,10 @@ import (
 type EDAReport struct {
 	Window model.ObservationWindow
 
-	Frequency        DistributionSummary
-	InterAccessTime  DistributionSummary
-	ByContractType   map[model.ContractCategory]ContractTypeSummary
-	BySlotType       map[model.SlotType]SlotTypeSummary
+	Frequency       DistributionSummary
+	InterAccessTime DistributionSummary
+	ByContractType  map[model.ContractCategory]ContractTypeSummary
+	BySlotType      map[model.SlotType]SlotTypeSummary
 
 	// Censoring diagnostics. Rate is a fraction in [0,1].
 	TotalIntervals     int
@@ -54,36 +55,73 @@ type EDAReport struct {
 // DistributionSummary is a compact first-moment / tail summary. We keep it
 // small on purpose: this is Phase 1 EDA, not a histogram dump.
 type DistributionSummary struct {
-	Count      int
-	Mean       float64
-	StdDev     float64
-	Min        float64
-	P50        float64
-	P90        float64
-	P99        float64
-	Max        float64
+	Count  int
+	Mean   float64
+	StdDev float64
+	Min    float64
+	P50    float64
+	P90    float64
+	P99    float64
+	Max    float64
 	// PowerLawAlphaMLE is the Hill-estimator exponent α for the upper tail,
 	// fitted above the median. Power-law tails give α ~ 1-3; values much
 	// larger than that indicate an exponential-like tail. Zero if Count<10.
 	PowerLawAlphaMLE float64
 }
 
+// MarshalJSON renders a DistributionSummary for encoding/json, routing
+// NaN / ±Inf float fields through nil so the encoder doesn't refuse
+// to serialize. Degenerate sub-distributions (e.g. a stratum with 1-2
+// intervals where gonum returns NaN for mean/std) would otherwise
+// crash the whole EDA JSON output.
+func (d DistributionSummary) MarshalJSON() ([]byte, error) {
+	scalar := func(v float64) *float64 {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return nil
+		}
+		vv := v
+		return &vv
+	}
+	type alias struct {
+		Count            int      `json:"Count"`
+		Mean             *float64 `json:"Mean"`
+		StdDev           *float64 `json:"StdDev"`
+		Min              *float64 `json:"Min"`
+		P50              *float64 `json:"P50"`
+		P90              *float64 `json:"P90"`
+		P99              *float64 `json:"P99"`
+		Max              *float64 `json:"Max"`
+		PowerLawAlphaMLE *float64 `json:"PowerLawAlphaMLE"`
+	}
+	return json.Marshal(alias{
+		Count:            d.Count,
+		Mean:             scalar(d.Mean),
+		StdDev:           scalar(d.StdDev),
+		Min:              scalar(d.Min),
+		P50:              scalar(d.P50),
+		P90:              scalar(d.P90),
+		P99:              scalar(d.P99),
+		Max:              scalar(d.Max),
+		PowerLawAlphaMLE: scalar(d.PowerLawAlphaMLE),
+	})
+}
+
 // ContractTypeSummary aggregates per-category metrics that inform
 // stratification choices for the survival model.
 type ContractTypeSummary struct {
-	Slots              int
-	Intervals          int
-	AccessFrequency    DistributionSummary
-	InterAccessTime    DistributionSummary
-	RightCensoredRate  float64
+	Slots             int
+	Intervals         int
+	AccessFrequency   DistributionSummary
+	InterAccessTime   DistributionSummary
+	RightCensoredRate float64
 }
 
 // SlotTypeSummary is the same idea but cut by slot kind (balance, mapping…).
 type SlotTypeSummary struct {
-	Slots              int
-	Intervals          int
-	InterAccessTime    DistributionSummary
-	RightCensoredRate  float64
+	Slots             int
+	Intervals         int
+	InterAccessTime   DistributionSummary
+	RightCensoredRate float64
 }
 
 // RunEDAFull runs the full EDA pass plus spatial and temporal analyses.

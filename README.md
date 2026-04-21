@@ -1,81 +1,127 @@
 # zk-state-prune
 
-**Statistical state lifecycle modeling & tiering for ZK Rollups.**
+[![CI](https://github.com/egpivo/zk-state-prune/actions/workflows/ci.yml/badge.svg)](https://github.com/egpivo/zk-state-prune/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/egpivo/zk-state-prune/graph/badge.svg?token=siqgL91f4o)](https://codecov.io/gh/egpivo/zk-state-prune)
+[![Go Report Card](https://goreportcard.com/badge/github.com/egpivo/zk-state-prune)](https://goreportcard.com/report/github.com/egpivo/zk-state-prune)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/egpivo/zk-state-prune)](https://github.com/egpivo/zk-state-prune/blob/main/go.mod)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-`zk-state-prune` (binary: `zksp`) is a Go framework that uses survival analysis
-and spatiotemporal modeling to predict the probability that a state slot in a
-ZK rollup will be accessed again, and derives data-driven hot/cold tiering
-policies from those predictions. The goal is to replace fixed-rule state
-expiry with statistical models that **reduce sequencer lookup latency, witness
-generation memory, and hot-state footprint, while keeping miss rates low.**
-This is a slot-level surrogate optimization for balancing hot-state pressure
-against fetch penalty — not an end-to-end proving cost model.
+**Cost-aware hot/cold tiering for ZK rollup state, driven by survival analysis.**
 
-## Motivation
+`zk-state-prune` (binary: `zksp`) is a Go framework that treats on-chain
+state access as a survival process, fits a calibrated per-slot
+access-probability model, and picks a tiering decision per slot from a
+cost surrogate. Its purpose is to replace fixed-idle-window "prune every
+slot after N blocks" heuristics with a policy that balances hot-state
+RAM against cold-tier miss penalty at the scale of a live rollup.
 
-A live ZK rollup serves reads against a hot working set on the sequencer side
-and proves transitions over a witness that materializes whichever slots a
-block touches. Both costs scale with the size of the live state: the larger
-the hot set, the more sequencer RAM and the bigger the witness for a typical
-block. Today's mitigations are blunt: drop (or evict to cold storage) every
-slot after a fixed idle window, or keep everything live. The first risks a
-miss on slots that are still hot — paying a fetch penalty on the critical
-path; the second pays RAM for slots that are statistically dead.
+## What it does
 
-This project treats slot access as a **survival process**: given a slot that
-has been idle for `t` blocks, what is the probability it will be touched in
-the next `h` blocks? With a calibrated survival function `S(t)` we can demote
-a slot exactly when its expected miss penalty falls below the cost of keeping
-it hot. The decision rule is a per-slot surrogate
-`d_i* = argmin_d c(d) + ℓ(d) · p_i(τ)` where `c(d)` is the per-tier holding
-cost, `ℓ(d)` the miss penalty for that tier, and `p_i(τ) = 1 − S_i(τ)` is the
-calibrated access-by-horizon probability.
+For each storage slot the pipeline answers one question: *given the
+slot has been idle for `u` blocks, what is the probability it is
+accessed within the next `τ` blocks?* That probability `p_i(τ)` is
+plugged into the per-slot surrogate
 
-## Approach
+```
+d_i* = argmin_d   c(d)  +  ℓ(d) · p_i(τ)
+```
 
-1. **Extract** state-diff streams (or generate realistic synthetic ones) into a
-   local SQLite store.
-2. **EDA**: characterize access-frequency, inter-access-time, and
-   spatial-clustering distributions per contract type and slot type.
-3. **Fit** survival models — Kaplan–Meier as a non-parametric baseline, Cox
-   proportional-hazards for covariate effects (contract type, slot type, age),
-   with Schoenfeld-residual PH check and isotonic recalibration on a 70/30
-   holdout.
-4. **Simulate** several tiering policies (no-prune, fixed-30d, fixed-90d, and
-   the statistical surrogate) over historical traces and score them on
-   **RAM ratio, hot-hit coverage, miss penalty, and total cost**.
-5. **Report** comparative results.
+where `c(d)` is the per-tier holding cost (RAM / block) and `ℓ(d)` is
+the miss penalty. The threshold collapses to a single
+`p* = (c_ram · τ) / ℓ_miss`; the policy demotes a slot at the first
+idle duration where the conditional access probability drops below
+`p*`.
+
+## Pipeline
+
+```
+extract  →  EDA  →  survival fit  →  calibration  →  tiering simulation
+```
+
+- **Extract** — two sources share an `Extractor` interface:
+  - *mock generator* with power-law access rates, intra-contract
+    co-access, sinusoidal seasonality, and configurable censoring;
+  - *Scroll mainnet RPC* (**Transfer-log surrogate** — ERC-20 / ERC-721
+    Transfer events only; not a full state-diff. See
+    `internal/extractor/rpc_extractor.go` for the honest scope).
+- **EDA** — first-moment + tail summary of access frequency and
+  inter-access time (Hill-estimator α for the upper tail), per-contract
+  and per-slot-type breakdowns, censoring diagnostics. Also: two
+  descriptive signals used as model-calibration sanity checks:
+  - *spatial*: per-contract pairwise Jaccard on slot access-block sets
+    (intra-contract co-access);
+  - *temporal*: per-contract autocorrelation-peak detection on a binned
+    event series.
+- **Survival fit** — Kaplan–Meier (stratifiable) and Cox PH, with
+  Schoenfeld residual PH-assumption check, 70/30 train/holdout split,
+  split-conformal ε, and isotonic recalibration. Cox supports
+  stratification by contract type so per-category baseline hazards
+  absorb non-proportional aging.
+- **Calibration** — bin-wise KM for the observed reliability-diagram
+  axis (no censored rows dropped); conformal ε fit on a disjoint
+  half of the holdout. A second conditional ε is fit on
+  `(interval, u, label_at_u)` triples so the robust policy has an
+  honest pessimism margin at arbitrary idle.
+- **Tiering simulation** — pure function over pre-built inter-access
+  intervals. Reports `RAMRatio`, `HotHitCoverage`, miss count, and
+  `TotalCost` per policy. Fixed-rule baselines (`fixed-30d`,
+  `fixed-90d`) compared head-to-head against `statistical` (point) and
+  `statistical-robust` (conformal upper bound).
 
 ## CLI
 
 ```
-zksp extract  --source <rpc|file|mock> --output <db_path>
-zksp eda      --db <db_path> --output <report_dir>
-zksp fit      --db <db_path> --model <km|cox>
-zksp simulate --db <db_path> --policy <no-prune|fixed-30d|fixed-90d>   # statistical: Phase 2
-zksp report   --db <db_path> --output <report_dir>
+zksp extract  --source mock|rpc          --output <db>
+zksp eda      --db <db>                  [--format text|json]
+zksp fit      --db <db> --model km|cox   [--stratify contract-type]
+                                         [--save <path.json>]
+zksp simulate --db <db> --policy no-prune|fixed-30d|fixed-90d|statistical
+                                         [--model <path.json>]
+                                         [--robust]
+                                         [--ram-unit-cost N --miss-penalty N]
+zksp report   --db <db>                  [--model <path.json>]
+                                         [--format text|json]
 ```
 
-## Build
+Config via `--config configs/default.yaml` overrides hardcoded
+defaults; flags override config. `zksp extract --force` wipes the
+target DB and clears the RPC high-water mark.
+
+## Build & test
 
 ```
-make build      # → bin/zksp
-make test
-make lint
+make build   # → bin/zksp
+make test    # go test ./...
+make lint    # golangci-lint
 ```
 
-Requires Go 1.25+ (transitively pulled in by `modernc.org/sqlite`).
-No C dependencies (pure-Go SQLite).
+Go 1.25+ (transitively required by `modernc.org/sqlite`). Pure Go, no
+C dependencies.
 
-## Roadmap
+## Status
 
-- **Phase 1 (complete)**: scaffolding, core types, mock extractor, EDA,
-  Kaplan–Meier, Cox PH with Schoenfeld PH check and isotonic recalibration,
-  fixed-rule tiering baselines.
-- **Phase 2**: spatial correlation analysis, cost-aware statistical tiering
-  policy wired against `c(d) + ℓ(d) · p_i(τ)`, conformal uncertainty bands.
-- **Phase 3**: real RPC extractor for an L2 (e.g. zkSync, Scroll), large-scale
-  simulation, calibration on real traces.
+- **Phase 1** — scaffolding, mock extractor, EDA, Kaplan–Meier, fixed
+  tiering baselines, end-to-end tests.
+- **Phase 2** — cost-aware surrogate (`c(d) + ℓ(d)·p_i(τ)`), Cox PH +
+  Schoenfeld + isotonic, JSON output, YAML config loading, spatial &
+  temporal EDA signals, split-conformal point ε.
+- **Phase 3** — persisted fitted models, stratified Cox PH, conditional
+  split-conformal ε for the robust policy, Scroll mainnet RPC
+  extractor (Transfer-log surrogate).
+
+## Known limitations
+
+- The RPC extractor only sees slot touches that emit an ERC-20 / ERC-721
+  Transfer event. All reads and non-Transfer writes (DEX pools,
+  governance bookkeeping, arbitrary SSTORE, view-only calls) are
+  invisible. A full state-diff source would be a drop-in Extractor
+  replacement via `debug_traceBlockByNumber` + prestate tracer.
+- Spatial / temporal signals are *descriptive*; they are not fed back
+  to the Cox fit as covariates. Doing so is a Phase 4 candidate.
+- Conditional conformal ε has marginal (single-probe) coverage, not
+  simultaneous coverage over the T\*-search grid. The robust policy
+  treats it as a principled pessimism margin; a per-`u` or max-over-`u`
+  conformal fit is the tighter upgrade.
 
 ## License
 

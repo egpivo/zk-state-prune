@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel stale runs on the same branch when a new commit lands.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: format + vet + test + coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      # Format check — fails if any .go file is not gofmt'd. We print
+      # the offending paths so the CI log tells the committer exactly
+      # what to fix instead of just reporting a non-zero exit.
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::the following files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      # Tests with race detector + coverage profile. -count=1 disables
+      # Go's test cache so a flaky test can't hide behind a cached pass.
+      - name: Test with coverage
+        run: go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+
+      # Print the total so it's visible in the raw logs even when
+      # Codecov is down.
+      - name: Coverage total
+        run: go tool cover -func=coverage.out | tail -1
+
+      # Upload the profile to Codecov. On public repos the upload is
+      # tokenless via OIDC; for private repos / forks, set
+      # CODECOV_TOKEN in repo secrets. fail_ci_if_error=false keeps a
+      # Codecov outage from blocking merges — the test step above is
+      # the real gate.
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.out
+          flags: unittests
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
