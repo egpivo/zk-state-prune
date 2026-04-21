@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel stale runs on the same branch when a new commit lands.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: format + vet + test + coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      # Format check — fails if any .go file is not gofmt'd. We print
+      # the offending paths so the CI log tells the committer exactly
+      # what to fix instead of just reporting a non-zero exit.
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::the following files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      # Tests with race detector + coverage profile. -count=1 disables
+      # Go's test cache so a flaky test can't hide behind a cached pass.
+      - name: Test with coverage
+        run: go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+
+      # Write the per-package and total coverage to the GitHub job
+      # summary so the PR page shows the number without anyone having
+      # to open the logs.
+      - name: Coverage summary
+        run: |
+          {
+            echo "## Coverage"
+            echo ""
+            echo '```'
+            go tool cover -func=coverage.out | awk '
+              /^total:/ { total=$NF; next }
+              { pkg=$1; sub(/\/[^\/]+\.go:[0-9]+:/, "", pkg); stmts[pkg]++; if ($NF != "0.0%") hit[pkg]++ }
+              END {
+                for (p in stmts) printf "%-55s %4d/%-4d (%.0f%%)\n", p, hit[p]+0, stmts[p], 100*(hit[p]+0)/stmts[p]
+                print ""
+                printf "total: %s\n", total
+              }' | sort
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          go tool cover -func=coverage.out | tail -1
+
+      - name: Upload coverage profile
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-profile
+          path: coverage.out
+          retention-days: 14

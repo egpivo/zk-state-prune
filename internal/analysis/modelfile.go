@@ -194,10 +194,10 @@ func LoadModelFile(path string) (*CalibratedModel, error) {
 
 	c := file.Cox
 	cox := &CoxResult{
-		Predictors:     c.Predictors,
-		Coef:           c.Coef,
-		Scales:         c.Scales,
-		BaselineTime:   c.BaselineTime,
+		Predictors:            c.Predictors,
+		Coef:                  c.Coef,
+		Scales:                c.Scales,
+		BaselineTime:          c.BaselineTime,
 		BaselineCumHaz:        c.BaselineCumHaz,
 		StdErr:                denullableFloats(c.StdErr, len(c.Coef)),
 		PValue:                denullableFloats(c.PValue, len(c.Coef)),

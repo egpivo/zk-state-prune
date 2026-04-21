@@ -84,12 +84,12 @@ type RPCExtractor struct {
 // CLI / tests can print "here's what the run produced" without
 // peeking inside the extractor.
 type RPCDiagnostics struct {
-	BlocksRequested  int
-	BlocksFetched    int
-	ReceiptsFetched  int
-	LogsSeen         int
-	TransferLogs     int
-	SlotsCreated     int
+	BlocksRequested int
+	BlocksFetched   int
+	ReceiptsFetched int
+	LogsSeen        int
+	TransferLogs    int
+	SlotsCreated    int
 	// EventsAttempted is the number of rows passed into
 	// InsertAccessEvents across all flushes for this run — i.e.
 	// everything the extractor wanted to write. EventsPersisted is
@@ -400,8 +400,8 @@ type rpcBlock struct {
 }
 
 type rpcReceipt struct {
-	TransactionHash string  `json:"transactionHash"`
-	BlockNumber     string  `json:"blockNumber"`
+	TransactionHash string   `json:"transactionHash"`
+	BlockNumber     string   `json:"blockNumber"`
 	Logs            []rpcLog `json:"logs"`
 }
 

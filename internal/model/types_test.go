@@ -103,7 +103,7 @@ func TestObservationWindow_ContainsAndSpan(t *testing.T) {
 		want bool
 	}{
 		{99, false},
-		{100, true},  // inclusive start
+		{100, true}, // inclusive start
 		{150, true},
 		{199, true},
 		{200, false}, // exclusive end

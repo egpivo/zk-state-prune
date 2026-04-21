@@ -57,8 +57,8 @@ type CoxResult struct {
 	StratumLabels []float64
 	// StratumBaselineTimes[i] / StratumBaselineCumHaz[i] are the
 	// per-stratum baseline hazard grids. Same length as StratumLabels.
-	StratumBaselineTimes    [][]float64
-	StratumBaselineCumHaz   [][]float64
+	StratumBaselineTimes  [][]float64
+	StratumBaselineCumHaz [][]float64
 
 	// intervals is the training set, retained so post-fit diagnostics
 	// (CheckPH, calibration) don't have to be re-loaded from the DB.

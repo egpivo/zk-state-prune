@@ -26,10 +26,10 @@ import (
 type EDAReport struct {
 	Window model.ObservationWindow
 
-	Frequency        DistributionSummary
-	InterAccessTime  DistributionSummary
-	ByContractType   map[model.ContractCategory]ContractTypeSummary
-	BySlotType       map[model.SlotType]SlotTypeSummary
+	Frequency       DistributionSummary
+	InterAccessTime DistributionSummary
+	ByContractType  map[model.ContractCategory]ContractTypeSummary
+	BySlotType      map[model.SlotType]SlotTypeSummary
 
 	// Censoring diagnostics. Rate is a fraction in [0,1].
 	TotalIntervals     int
@@ -55,14 +55,14 @@ type EDAReport struct {
 // DistributionSummary is a compact first-moment / tail summary. We keep it
 // small on purpose: this is Phase 1 EDA, not a histogram dump.
 type DistributionSummary struct {
-	Count      int
-	Mean       float64
-	StdDev     float64
-	Min        float64
-	P50        float64
-	P90        float64
-	P99        float64
-	Max        float64
+	Count  int
+	Mean   float64
+	StdDev float64
+	Min    float64
+	P50    float64
+	P90    float64
+	P99    float64
+	Max    float64
 	// PowerLawAlphaMLE is the Hill-estimator exponent α for the upper tail,
 	// fitted above the median. Power-law tails give α ~ 1-3; values much
 	// larger than that indicate an exponential-like tail. Zero if Count<10.
@@ -109,19 +109,19 @@ func (d DistributionSummary) MarshalJSON() ([]byte, error) {
 // ContractTypeSummary aggregates per-category metrics that inform
 // stratification choices for the survival model.
 type ContractTypeSummary struct {
-	Slots              int
-	Intervals          int
-	AccessFrequency    DistributionSummary
-	InterAccessTime    DistributionSummary
-	RightCensoredRate  float64
+	Slots             int
+	Intervals         int
+	AccessFrequency   DistributionSummary
+	InterAccessTime   DistributionSummary
+	RightCensoredRate float64
 }
 
 // SlotTypeSummary is the same idea but cut by slot kind (balance, mapping…).
 type SlotTypeSummary struct {
-	Slots              int
-	Intervals          int
-	InterAccessTime    DistributionSummary
-	RightCensoredRate  float64
+	Slots             int
+	Intervals         int
+	InterAccessTime   DistributionSummary
+	RightCensoredRate float64
 }
 
 // RunEDAFull runs the full EDA pass plus spatial and temporal analyses.

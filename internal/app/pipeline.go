@@ -5,6 +5,7 @@
 //   - parsing flags into typed arguments,
 //   - opening / closing the DB,
 //   - choosing between text and JSON rendering.
+//
 // Everything statistical — split → fit → PH check → calibrate →
 // assemble policy — is here and independently exercisable.
 package app
