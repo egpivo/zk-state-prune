@@ -145,51 +145,8 @@ func LoadModelFile(path string) (*CalibratedModel, error) {
 	if err := json.Unmarshal(b, &file); err != nil {
 		return nil, fmt.Errorf("LoadModelFile: parse %s: %w", path, err)
 	}
-	if !modelFileSchemaVersionsSupported[file.SchemaVersion] {
-		return nil, fmt.Errorf("LoadModelFile: schema_version=%d not supported by this reader (current: %d)", file.SchemaVersion, modelFileSchemaVersionCurrent)
-	}
-	if len(file.PredX) != len(file.CalibratedY) {
-		return nil, fmt.Errorf("LoadModelFile: isotonic grid size mismatch (PredX=%d CalibratedY=%d)", len(file.PredX), len(file.CalibratedY))
-	}
-	cp := file.Cox
-	// Every predict-path index lookup expects Predictors, Coef, and
-	// Scales to be the same length. Cast a mismatched file out early
-	// rather than letting SurvivalForInterval panic later with an
-	// opaque index-out-of-range.
-	nPred := len(cp.Predictors)
-	if nPred == 0 {
-		return nil, fmt.Errorf("LoadModelFile: cox has zero predictors")
-	}
-	if len(cp.Coef) != nPred {
-		return nil, fmt.Errorf("LoadModelFile: cox coef len=%d != predictors=%d", len(cp.Coef), nPred)
-	}
-	if len(cp.Scales) != nPred {
-		return nil, fmt.Errorf("LoadModelFile: cox scales len=%d != predictors=%d", len(cp.Scales), nPred)
-	}
-	// Baseline hazard: either a single grid (unstratified) or a
-	// per-stratum map consistent with StratumLabels.
-	if cp.StratumColumn == "" {
-		if len(cp.BaselineTime) != len(cp.BaselineCumHaz) {
-			return nil, fmt.Errorf("LoadModelFile: baseline time/haz len mismatch (%d vs %d)", len(cp.BaselineTime), len(cp.BaselineCumHaz))
-		}
-		if len(cp.StratumLabels) != 0 || len(cp.StratumBaselineTimes) != 0 || len(cp.StratumBaselineCumHaz) != 0 {
-			return nil, fmt.Errorf("LoadModelFile: unstratified model has non-empty stratum fields")
-		}
-	} else {
-		nStrata := len(cp.StratumLabels)
-		if nStrata == 0 {
-			return nil, fmt.Errorf("LoadModelFile: stratified model (%q) has no stratum labels", cp.StratumColumn)
-		}
-		if len(cp.StratumBaselineTimes) != nStrata || len(cp.StratumBaselineCumHaz) != nStrata {
-			return nil, fmt.Errorf("LoadModelFile: stratified model has %d labels but times=%d, hazards=%d",
-				nStrata, len(cp.StratumBaselineTimes), len(cp.StratumBaselineCumHaz))
-		}
-		for i := 0; i < nStrata; i++ {
-			if len(cp.StratumBaselineTimes[i]) != len(cp.StratumBaselineCumHaz[i]) {
-				return nil, fmt.Errorf("LoadModelFile: stratum %d baseline time/haz len mismatch (%d vs %d)",
-					i, len(cp.StratumBaselineTimes[i]), len(cp.StratumBaselineCumHaz[i]))
-			}
-		}
+	if err := validateModelFile(&file); err != nil {
+		return nil, err
 	}
 
 	c := file.Cox
@@ -219,6 +176,71 @@ func LoadModelFile(path string) (*CalibratedModel, error) {
 		PredX:              file.PredX,
 		CalibratedY:        file.CalibratedY,
 	}, nil
+}
+
+// validateModelFile rejects a parsed ModelFile whose invariants are
+// broken: unsupported schema version, misaligned isotonic grid,
+// predictor/coef/scales length mismatch, or a baseline-hazard layout
+// that doesn't match StratumColumn. Kept separate from LoadModelFile
+// so the happy path stays easy to read — and so LoadModelFile itself
+// stays under the gocyclo threshold.
+func validateModelFile(file *ModelFile) error {
+	if !modelFileSchemaVersionsSupported[file.SchemaVersion] {
+		return fmt.Errorf("LoadModelFile: schema_version=%d not supported by this reader (current: %d)",
+			file.SchemaVersion, modelFileSchemaVersionCurrent)
+	}
+	if len(file.PredX) != len(file.CalibratedY) {
+		return fmt.Errorf("LoadModelFile: isotonic grid size mismatch (PredX=%d CalibratedY=%d)",
+			len(file.PredX), len(file.CalibratedY))
+	}
+	cp := file.Cox
+	// Every predict-path index lookup expects Predictors, Coef, and
+	// Scales to be the same length. Cast a mismatched file out early
+	// rather than letting SurvivalForInterval panic later with an
+	// opaque index-out-of-range.
+	nPred := len(cp.Predictors)
+	if nPred == 0 {
+		return fmt.Errorf("LoadModelFile: cox has zero predictors")
+	}
+	if len(cp.Coef) != nPred {
+		return fmt.Errorf("LoadModelFile: cox coef len=%d != predictors=%d", len(cp.Coef), nPred)
+	}
+	if len(cp.Scales) != nPred {
+		return fmt.Errorf("LoadModelFile: cox scales len=%d != predictors=%d", len(cp.Scales), nPred)
+	}
+	return validateBaselineHazards(&cp)
+}
+
+// validateBaselineHazards checks the baseline-hazard layout based on
+// whether the model is stratified. Unstratified: single (time, cumhaz)
+// grid, no stratum fields. Stratified: per-stratum grids aligned with
+// StratumLabels.
+func validateBaselineHazards(cp *coxPersist) error {
+	if cp.StratumColumn == "" {
+		if len(cp.BaselineTime) != len(cp.BaselineCumHaz) {
+			return fmt.Errorf("LoadModelFile: baseline time/haz len mismatch (%d vs %d)",
+				len(cp.BaselineTime), len(cp.BaselineCumHaz))
+		}
+		if len(cp.StratumLabels) != 0 || len(cp.StratumBaselineTimes) != 0 || len(cp.StratumBaselineCumHaz) != 0 {
+			return fmt.Errorf("LoadModelFile: unstratified model has non-empty stratum fields")
+		}
+		return nil
+	}
+	nStrata := len(cp.StratumLabels)
+	if nStrata == 0 {
+		return fmt.Errorf("LoadModelFile: stratified model (%q) has no stratum labels", cp.StratumColumn)
+	}
+	if len(cp.StratumBaselineTimes) != nStrata || len(cp.StratumBaselineCumHaz) != nStrata {
+		return fmt.Errorf("LoadModelFile: stratified model has %d labels but times=%d, hazards=%d",
+			nStrata, len(cp.StratumBaselineTimes), len(cp.StratumBaselineCumHaz))
+	}
+	for i := 0; i < nStrata; i++ {
+		if len(cp.StratumBaselineTimes[i]) != len(cp.StratumBaselineCumHaz[i]) {
+			return fmt.Errorf("LoadModelFile: stratum %d baseline time/haz len mismatch (%d vs %d)",
+				i, len(cp.StratumBaselineTimes[i]), len(cp.StratumBaselineCumHaz[i]))
+		}
+	}
+	return nil
 }
 
 // cloneFloat2D deep-copies a [][]float64 so the persisted struct

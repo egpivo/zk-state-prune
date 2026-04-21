@@ -145,129 +145,20 @@ func (e *RPCExtractor) Extract(ctx context.Context, db *storage.DB) error {
 		start = hw + 1
 	}
 
-	contracts := make(map[string]*contractState)
-	slots := make(map[string]*slotState)
-	eventBuf := make([]model.AccessEvent, 0, e.cfg.BatchSize)
-
-	flush := func() error {
-		if len(eventBuf) == 0 {
-			return nil
-		}
-		// Count actual inserted rows (INSERT OR IGNORE drops dups on
-		// resume re-fetches) so diagnostics report persisted-rather-
-		// than-attempted.
-		inserted, err := db.InsertAccessEvents(ctx, eventBuf)
-		if err != nil {
-			return err
-		}
-		e.last.EventsPersisted += int(inserted)
-		e.last.EventsAttempted += len(eventBuf)
-		eventBuf = eventBuf[:0]
-		return nil
+	state := &rpcRunState{
+		contracts: make(map[string]*contractState),
+		slots:     make(map[string]*slotState),
+		eventBuf:  make([]model.AccessEvent, 0, e.cfg.BatchSize),
 	}
+	flush := func() error { return state.flush(ctx, db, &e.last) }
 
 	for blockNum := start; blockNum <= e.cfg.End; blockNum++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		e.last.BlocksRequested++
-
-		block, err := e.fetchBlock(ctx, blockNum)
-		if err != nil {
-			return fmt.Errorf("block %d: %w", blockNum, err)
+		if err := e.processBlock(ctx, db, blockNum, state, flush); err != nil {
+			return err
 		}
-		e.last.BlocksFetched++
-
-		receipts, err := e.fetchBlockReceipts(ctx, blockNum)
-		if err != nil {
-			return fmt.Errorf("receipts for block %d: %w", blockNum, err)
-		}
-		e.last.ReceiptsFetched += len(receipts)
-
-		for _, rec := range receipts {
-			for _, lg := range rec.Logs {
-				e.last.LogsSeen++
-				if !isTransferLog(lg) {
-					continue
-				}
-				e.last.TransferLogs++
-
-				category := classifyFromLog(lg)
-				contract := contracts[lg.Address]
-				if contract == nil {
-					contract = &contractState{
-						address:     lg.Address,
-						category:    category,
-						deployBlock: blockNum,
-					}
-					contracts[lg.Address] = contract
-					e.last.ContractsCreated++
-					// Upsert the parent contract row right now so
-					// FK(slot → contract) is satisfied the moment
-					// we hit this contract's first slot.
-					if err := db.UpsertContract(ctx, model.ContractMeta{
-						Address:      contract.address,
-						ContractType: contract.category,
-						DeployBlock:  contract.deployBlock,
-					}); err != nil {
-						return fmt.Errorf("upsert contract %s: %w", contract.address, err)
-					}
-				}
-				// Synthesize one slot per (contract, holder) pair.
-				// Holder = topics[1] (from) first, then topics[2] (to) —
-				// each side's balance slot is touched.
-				for _, holderTopic := range lg.Topics[1:3] {
-					slotID := slotIDFor(lg.Address, holderTopic)
-					s := slots[slotID]
-					if s == nil {
-						s = &slotState{
-							slotID:       slotID,
-							contractAddr: lg.Address,
-							slotIndex:    slotIndexFor(lg.Address, holderTopic),
-							slotType:     model.SlotTypeBalance,
-							createdAt:    blockNum,
-						}
-						slots[slotID] = s
-						e.last.SlotsCreated++
-						// Upsert the slot before buffering its
-						// events so FK(event → slot) is always
-						// satisfied when the batch flushes.
-						if err := db.UpsertSlot(ctx, model.StateSlot{
-							SlotID:       s.slotID,
-							ContractAddr: s.contractAddr,
-							SlotIndex:    s.slotIndex,
-							SlotType:     s.slotType,
-							CreatedAt:    s.createdAt,
-							LastAccess:   blockNum,
-							AccessCount:  0,
-							IsActive:     true,
-						}); err != nil {
-							return fmt.Errorf("upsert slot %s: %w", s.slotID, err)
-						}
-					}
-					// No per-slot counters maintained here: the
-					// end-of-loop sweep that used to copy them into
-					// the StateSlot row was deleted (it clobbered
-					// cumulative counts on incremental runs and used
-					// a global slot total instead of a per-contract
-					// one). Analysis passes rebuild counts from
-					// access_events, so the slot row's counters stay
-					// at their initial values.
-					eventBuf = append(eventBuf, model.AccessEvent{
-						SlotID:      slotID,
-						BlockNumber: blockNum,
-						AccessType:  model.AccessWrite,
-						TxHash:      rec.TransactionHash,
-					})
-					if len(eventBuf) >= e.cfg.BatchSize {
-						if err := flush(); err != nil {
-							return err
-						}
-					}
-				}
-			}
-		}
-
 		// Flush all buffered events for this block BEFORE advancing the
 		// high-water mark. If we crash (or the RPC errors) after the
 		// mark is written but before events are persisted, the next
@@ -280,19 +171,163 @@ func (e *RPCExtractor) Extract(ctx context.Context, db *storage.DB) error {
 		if err := writeHighWater(ctx, db, blockNum); err != nil {
 			return fmt.Errorf("write high-water mark: %w", err)
 		}
-		_ = block // block metadata unused for now; kept for future fields
 	}
+	return nil
+}
 
-	// Contract + slot rows were upserted inline when first seen (so
-	// FK(event→slot) is always satisfied at flush time). We do NOT
-	// do an end-of-loop sweep to backfill access_count / total_slots:
-	// those fields would be overwritten with this-run-only values,
-	// clobbering the accumulated counts from any earlier incremental
-	// run against the same DB. Every analysis pass rebuilds access
-	// counts directly from the access_events table, so leaving the
-	// slot/contract counters at their initial (0) state is benign
-	// for downstream correctness; Phase 4 can add a SQL-level
-	// incremental update if a diagnostic surfaces that needs them.
+// rpcRunState carries the per-run mutable state that used to live as
+// closures inside Extract: the first-seen maps for contracts + slots
+// (so we only upsert each once) and the event buffer that flushes to
+// storage.InsertAccessEvents in BatchSize chunks.
+type rpcRunState struct {
+	contracts map[string]*contractState
+	slots     map[string]*slotState
+	eventBuf  []model.AccessEvent
+}
+
+// flush persists the buffered events. INSERT OR IGNORE means resume
+// re-fetches collapse silently, so we track persisted separately from
+// attempted for the run diagnostics.
+func (s *rpcRunState) flush(ctx context.Context, db *storage.DB, diag *RPCDiagnostics) error {
+	if len(s.eventBuf) == 0 {
+		return nil
+	}
+	inserted, err := db.InsertAccessEvents(ctx, s.eventBuf)
+	if err != nil {
+		return err
+	}
+	diag.EventsPersisted += int(inserted)
+	diag.EventsAttempted += len(s.eventBuf)
+	s.eventBuf = s.eventBuf[:0]
+	return nil
+}
+
+// processBlock fetches one block + its receipts, walks every Transfer
+// log, and appends the synthesized (slot, event) rows to state. flush
+// is called whenever the buffer crosses BatchSize.
+func (e *RPCExtractor) processBlock(
+	ctx context.Context,
+	db *storage.DB,
+	blockNum uint64,
+	state *rpcRunState,
+	flush func() error,
+) error {
+	e.last.BlocksRequested++
+	if _, err := e.fetchBlock(ctx, blockNum); err != nil {
+		return fmt.Errorf("block %d: %w", blockNum, err)
+	}
+	e.last.BlocksFetched++
+	receipts, err := e.fetchBlockReceipts(ctx, blockNum)
+	if err != nil {
+		return fmt.Errorf("receipts for block %d: %w", blockNum, err)
+	}
+	e.last.ReceiptsFetched += len(receipts)
+
+	for _, rec := range receipts {
+		for _, lg := range rec.Logs {
+			e.last.LogsSeen++
+			if !isTransferLog(lg) {
+				continue
+			}
+			e.last.TransferLogs++
+			if err := e.handleTransferLog(ctx, db, blockNum, rec.TransactionHash, lg, state, flush); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// handleTransferLog upserts the contract (if first-seen) plus each
+// holder's synthesized balance slot (if first-seen) and appends one
+// write event per holder. Both upserts MUST happen before the events
+// buffer so a mid-batch flush doesn't violate FK(event → slot).
+func (e *RPCExtractor) handleTransferLog(
+	ctx context.Context,
+	db *storage.DB,
+	blockNum uint64,
+	txHash string,
+	lg rpcLog,
+	state *rpcRunState,
+	flush func() error,
+) error {
+	if err := e.upsertContractIfNew(ctx, db, lg, blockNum, state); err != nil {
+		return err
+	}
+	// Synthesize one slot per (contract, holder) pair.
+	// Holder = topics[1] (from) first, then topics[2] (to) —
+	// each side's balance slot is touched.
+	for _, holderTopic := range lg.Topics[1:3] {
+		slotID := slotIDFor(lg.Address, holderTopic)
+		if err := e.upsertSlotIfNew(ctx, db, lg.Address, holderTopic, blockNum, state); err != nil {
+			return err
+		}
+		state.eventBuf = append(state.eventBuf, model.AccessEvent{
+			SlotID:      slotID,
+			BlockNumber: blockNum,
+			AccessType:  model.AccessWrite,
+			TxHash:      txHash,
+		})
+		if len(state.eventBuf) >= e.cfg.BatchSize {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (e *RPCExtractor) upsertContractIfNew(
+	ctx context.Context, db *storage.DB, lg rpcLog, blockNum uint64, state *rpcRunState,
+) error {
+	if state.contracts[lg.Address] != nil {
+		return nil
+	}
+	c := &contractState{
+		address:     lg.Address,
+		category:    classifyFromLog(lg),
+		deployBlock: blockNum,
+	}
+	state.contracts[lg.Address] = c
+	e.last.ContractsCreated++
+	if err := db.UpsertContract(ctx, model.ContractMeta{
+		Address:      c.address,
+		ContractType: c.category,
+		DeployBlock:  c.deployBlock,
+	}); err != nil {
+		return fmt.Errorf("upsert contract %s: %w", c.address, err)
+	}
+	return nil
+}
+
+func (e *RPCExtractor) upsertSlotIfNew(
+	ctx context.Context, db *storage.DB, contractAddr, holderTopic string, blockNum uint64, state *rpcRunState,
+) error {
+	slotID := slotIDFor(contractAddr, holderTopic)
+	if state.slots[slotID] != nil {
+		return nil
+	}
+	s := &slotState{
+		slotID:       slotID,
+		contractAddr: contractAddr,
+		slotIndex:    slotIndexFor(contractAddr, holderTopic),
+		slotType:     model.SlotTypeBalance,
+		createdAt:    blockNum,
+	}
+	state.slots[slotID] = s
+	e.last.SlotsCreated++
+	if err := db.UpsertSlot(ctx, model.StateSlot{
+		SlotID:       s.slotID,
+		ContractAddr: s.contractAddr,
+		SlotIndex:    s.slotIndex,
+		SlotType:     s.slotType,
+		CreatedAt:    s.createdAt,
+		LastAccess:   blockNum,
+		AccessCount:  0,
+		IsActive:     true,
+	}); err != nil {
+		return fmt.Errorf("upsert slot %s: %w", s.slotID, err)
+	}
 	return nil
 }
 

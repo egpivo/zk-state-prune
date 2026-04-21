@@ -222,6 +222,22 @@ func TestCalibrationCurveFromCox_BinWiseKMKeepsCensoredRows(t *testing.T) {
 }
 
 func TestCalibrationCurve_OnMockTrainHoldoutEndToEnd(t *testing.T) {
+	train, holdout := setupMockTrainHoldout(t)
+	assertTrainHoldoutSlotDisjoint(t, train, holdout)
+
+	res, err := NewStatmodelFitter().FitCoxPH(train, DefaultCoxPredictors)
+	if err != nil {
+		t.Fatalf("FitCoxPH: %v", err)
+	}
+	curve, err := CalibrationCurveFromCox(res, holdout, 2000, 5)
+	if err != nil {
+		t.Fatalf("CalibrationCurveFromCox: %v", err)
+	}
+	assertCalibrationCurveSane(t, curve)
+}
+
+func setupMockTrainHoldout(t *testing.T) (train, holdout []model.InterAccessInterval) {
+	t.Helper()
 	ctx := context.Background()
 	db := openDB(t)
 	cfg := extractor.DefaultMockConfig()
@@ -240,11 +256,15 @@ func TestCalibrationCurve_OnMockTrainHoldoutEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildIntervals: %v", err)
 	}
-	train, holdout, err := TrainHoldoutSplitBySlot(built.Intervals, 0.3, 99)
+	train, holdout, err = TrainHoldoutSplitBySlot(built.Intervals, 0.3, 99)
 	if err != nil {
 		t.Fatalf("split: %v", err)
 	}
-	// Sanity: no slot id appears in both sides.
+	return train, holdout
+}
+
+func assertTrainHoldoutSlotDisjoint(t *testing.T, train, holdout []model.InterAccessInterval) {
+	t.Helper()
 	trainSlots := make(map[string]bool)
 	for _, it := range train {
 		trainSlots[it.SlotID] = true
@@ -254,15 +274,10 @@ func TestCalibrationCurve_OnMockTrainHoldoutEndToEnd(t *testing.T) {
 			t.Fatalf("leakage: slot %q in both", it.SlotID)
 		}
 	}
+}
 
-	res, err := NewStatmodelFitter().FitCoxPH(train, DefaultCoxPredictors)
-	if err != nil {
-		t.Fatalf("FitCoxPH: %v", err)
-	}
-	curve, err := CalibrationCurveFromCox(res, holdout, 2000, 5)
-	if err != nil {
-		t.Fatalf("CalibrationCurveFromCox: %v", err)
-	}
+func assertCalibrationCurveSane(t *testing.T, curve *CalibrationCurve) {
+	t.Helper()
 	if curve.NumKept == 0 {
 		t.Fatal("kept zero rows")
 	}

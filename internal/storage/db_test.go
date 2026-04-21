@@ -219,7 +219,18 @@ func TestInsertAccessEvents_IsIdempotent(t *testing.T) {
 	}
 }
 
-func TestIterateSlotEvents_OrdersAndGroupsBySlot(t *testing.T) {
+// observedSlot is the flattened (metadata + blocks) record
+// IterateSlotEvents hands back to its callback, collapsed into a
+// single comparable shape for the subtests below.
+type observedSlot struct {
+	slotID string
+	blocks []uint64
+	cat    model.ContractCategory
+	slot   model.SlotType
+}
+
+func seedIterateSlotEventsFixture(t *testing.T) *DB {
+	t.Helper()
 	ctx := context.Background()
 	db, err := Open(ctx, filepath.Join(t.TempDir(), "iter.db"))
 	if err != nil {
@@ -242,25 +253,22 @@ func TestIterateSlotEvents_OrdersAndGroupsBySlot(t *testing.T) {
 		}
 	}
 	// Events inserted out of chronological order to exercise ORDER BY.
-	events := []model.AccessEvent{
+	if _, err := db.InsertAccessEvents(ctx, []model.AccessEvent{
 		{SlotID: "a-slot", BlockNumber: 300, AccessType: model.AccessRead, TxHash: "0x3"},
 		{SlotID: "a-slot", BlockNumber: 100, AccessType: model.AccessWrite, TxHash: "0x1"},
 		{SlotID: "b-slot", BlockNumber: 150, AccessType: model.AccessRead, TxHash: "0x4"},
 		{SlotID: "a-slot", BlockNumber: 200, AccessType: model.AccessRead, TxHash: "0x2"},
-	}
-	if _, err := db.InsertAccessEvents(ctx, events); err != nil {
+	}); err != nil {
 		t.Fatalf("InsertAccessEvents: %v", err)
 	}
+	return db
+}
 
-	type observed struct {
-		slotID string
-		blocks []uint64
-		cat    model.ContractCategory
-		slot   model.SlotType
-	}
-	var got []observed
-	err = db.IterateSlotEvents(ctx, func(meta SlotWithMeta, evs []model.AccessEvent) error {
-		o := observed{
+func collectIterateSlotEvents(t *testing.T, db *DB) map[string]observedSlot {
+	t.Helper()
+	var got []observedSlot
+	err := db.IterateSlotEvents(context.Background(), func(meta SlotWithMeta, evs []model.AccessEvent) error {
+		o := observedSlot{
 			slotID: meta.Slot.SlotID,
 			cat:    meta.Category,
 			slot:   meta.Slot.SlotType,
@@ -274,15 +282,18 @@ func TestIterateSlotEvents_OrdersAndGroupsBySlot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("IterateSlotEvents: %v", err)
 	}
-
 	if len(got) != 3 {
 		t.Fatalf("got %d slots, want 3", len(got))
 	}
-	byID := map[string]observed{}
+	byID := map[string]observedSlot{}
 	for _, o := range got {
 		byID[o.slotID] = o
 	}
-	// a-slot: events must be chronologically ordered.
+	return byID
+}
+
+func assertASlotChronologicallyOrdered(t *testing.T, byID map[string]observedSlot) {
+	t.Helper()
 	a := byID["a-slot"]
 	wantA := []uint64{100, 200, 300}
 	if len(a.blocks) != len(wantA) {
@@ -293,14 +304,21 @@ func TestIterateSlotEvents_OrdersAndGroupsBySlot(t *testing.T) {
 			t.Errorf("a-slot blocks[%d]=%d, want %d", i, b, wantA[i])
 		}
 	}
-	// Meta is threaded through from the JOIN.
+}
+
+func assertMetaThreadedThrough(t *testing.T, byID map[string]observedSlot) {
+	t.Helper()
+	a := byID["a-slot"]
 	if a.cat != model.ContractERC20 {
 		t.Errorf("a-slot category=%v, want ContractERC20", a.cat)
 	}
 	if a.slot != model.SlotTypeBalance {
 		t.Errorf("a-slot slot type=%v, want SlotTypeBalance", a.slot)
 	}
-	// Slot with zero events still receives a callback with an empty slice.
+}
+
+func assertEmptySlotEmitted(t *testing.T, byID map[string]observedSlot) {
+	t.Helper()
 	c, ok := byID["c-empty"]
 	if !ok {
 		t.Fatalf("c-empty did not receive a callback (fully-censored slots must still be emitted)")
@@ -308,6 +326,20 @@ func TestIterateSlotEvents_OrdersAndGroupsBySlot(t *testing.T) {
 	if len(c.blocks) != 0 {
 		t.Errorf("c-empty events=%v, want empty", c.blocks)
 	}
+}
+
+func TestIterateSlotEvents_OrdersAndGroupsBySlot(t *testing.T) {
+	db := seedIterateSlotEventsFixture(t)
+	byID := collectIterateSlotEvents(t, db)
+	t.Run("a-slot events chronologically ordered", func(t *testing.T) {
+		assertASlotChronologicallyOrdered(t, byID)
+	})
+	t.Run("meta threaded through JOIN", func(t *testing.T) {
+		assertMetaThreadedThrough(t, byID)
+	})
+	t.Run("empty-event slot still gets callback", func(t *testing.T) {
+		assertEmptySlotEmitted(t, byID)
+	})
 }
 
 func TestIterateSlotEvents_PropagatesCallbackError(t *testing.T) {

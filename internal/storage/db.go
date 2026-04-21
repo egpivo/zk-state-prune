@@ -200,15 +200,30 @@ func (d *DB) IterateSlotEvents(
 	if err != nil {
 		return err
 	}
+	seen, err := d.streamSlotEvents(ctx, meta, fn)
+	if err != nil {
+		return err
+	}
+	return emitUnseenSlots(ctx, order, seen, meta, fn)
+}
 
-	evRows, err := d.sql.QueryContext(ctx, `
+// streamSlotEvents scans access_events in (slot_id, block_number) order,
+// buffering rows per slot and flushing each buffer to fn when the slot id
+// changes. Returns the set of slot ids that produced at least one event
+// so the caller can emit empty callbacks for the rest.
+func (d *DB) streamSlotEvents(
+	ctx context.Context,
+	meta map[string]SlotWithMeta,
+	fn func(SlotWithMeta, []model.AccessEvent) error,
+) (map[string]bool, error) {
+	rows, err := d.sql.QueryContext(ctx, `
 		SELECT slot_id, block_number, access_type, tx_hash
 		  FROM access_events
 		 ORDER BY slot_id, block_number`)
 	if err != nil {
-		return fmt.Errorf("query events: %w", err)
+		return nil, fmt.Errorf("query events: %w", err)
 	}
-	defer evRows.Close()
+	defer rows.Close()
 
 	seen := make(map[string]bool, len(meta))
 	var (
@@ -228,34 +243,44 @@ func (d *DB) IterateSlotEvents(
 		return fn(m, buf)
 	}
 
-	for evRows.Next() {
+	for rows.Next() {
 		if err := ctx.Err(); err != nil {
-			return err
+			return nil, err
 		}
 		var e model.AccessEvent
 		var at string
-		if err := evRows.Scan(&e.SlotID, &e.BlockNumber, &at, &e.TxHash); err != nil {
-			return fmt.Errorf("scan event: %w", err)
+		if err := rows.Scan(&e.SlotID, &e.BlockNumber, &at, &e.TxHash); err != nil {
+			return nil, fmt.Errorf("scan event: %w", err)
 		}
 		e.AccessType = model.ParseAccessType(at)
 		if e.SlotID != curID {
 			if err := flush(); err != nil {
-				return err
+				return nil, err
 			}
 			curID = e.SlotID
 			buf = buf[:0]
 		}
 		buf = append(buf, e)
 	}
-	if err := evRows.Err(); err != nil {
-		return fmt.Errorf("iter events: %w", err)
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iter events: %w", err)
 	}
 	if err := flush(); err != nil {
-		return err
+		return nil, err
 	}
+	return seen, nil
+}
 
-	// Slots that had zero events still need a callback so the caller can
-	// emit a fully-censored interval for them.
+// emitUnseenSlots fires fn with an empty event slice for every slot
+// that had zero access events, so BuildIntervals can emit a
+// fully-censored interval for them.
+func emitUnseenSlots(
+	ctx context.Context,
+	order []string,
+	seen map[string]bool,
+	meta map[string]SlotWithMeta,
+	fn func(SlotWithMeta, []model.AccessEvent) error,
+) error {
 	for _, id := range order {
 		if seen[id] {
 			continue

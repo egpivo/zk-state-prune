@@ -242,12 +242,22 @@ func summarize(built IntervalBuildResult, window model.ObservationWindow) *EDARe
 	if report.SlotCount > 0 {
 		report.LeftTruncatedRate = float64(built.LeftTruncatedSlots) / float64(report.SlotCount)
 	}
+	report.ByContractType = buildContractSummaries(byCat)
+	report.BySlotType = buildSlotTypeSummaries(bySlot)
+	return report
+}
+
+// buildContractSummaries turns the per-category raw aggregates into
+// the public ContractTypeSummary map, computing the right-censored
+// rate per category in one place.
+func buildContractSummaries(byCat map[model.ContractCategory]*ctAgg) map[model.ContractCategory]ContractTypeSummary {
+	out := make(map[model.ContractCategory]ContractTypeSummary, len(byCat))
 	for cat, agg := range byCat {
 		cr := 0.0
 		if agg.intervals > 0 {
 			cr = float64(agg.censored) / float64(agg.intervals)
 		}
-		report.ByContractType[cat] = ContractTypeSummary{
+		out[cat] = ContractTypeSummary{
 			Slots:             agg.slots,
 			Intervals:         agg.intervals,
 			AccessFrequency:   summarizeDistribution(agg.freq),
@@ -255,19 +265,27 @@ func summarize(built IntervalBuildResult, window model.ObservationWindow) *EDARe
 			RightCensoredRate: cr,
 		}
 	}
+	return out
+}
+
+// buildSlotTypeSummaries mirrors buildContractSummaries for the
+// SlotType axis. SlotTypeSummary omits AccessFrequency because we
+// don't currently track per-slot-type frequency in the aggregate.
+func buildSlotTypeSummaries(bySlot map[model.SlotType]*stAgg) map[model.SlotType]SlotTypeSummary {
+	out := make(map[model.SlotType]SlotTypeSummary, len(bySlot))
 	for st, agg := range bySlot {
 		cr := 0.0
 		if agg.intervals > 0 {
 			cr = float64(agg.censored) / float64(agg.intervals)
 		}
-		report.BySlotType[st] = SlotTypeSummary{
+		out[st] = SlotTypeSummary{
 			Slots:             agg.slots,
 			Intervals:         agg.intervals,
 			InterAccessTime:   summarizeDistribution(agg.iat),
 			RightCensoredRate: cr,
 		}
 	}
-	return report
+	return out
 }
 
 type ctAgg struct {

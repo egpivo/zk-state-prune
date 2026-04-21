@@ -5,6 +5,8 @@ import (
 	"math/rand/v2"
 	"path/filepath"
 	"testing"
+
+	"github.com/egpivo/zk-state-prune/internal/model"
 )
 
 func TestConditionalConformal_OutOfSampleCoverage(t *testing.T) {
@@ -26,52 +28,10 @@ func TestConditionalConformal_OutOfSampleCoverage(t *testing.T) {
 
 	// On a fresh test set drawn from the same distribution, the true
 	// conditional label should fall inside [pred - ε, pred + ε] with
-	// rate at least CoverageLevel − slack. Sampling u uniformly per
-	// test row (different RNG seed than CalibrateAt's salt so we're
-	// not recovering cal-half points).
+	// rate at least CoverageLevel − slack. Different RNG seed than
+	// CalibrateAt's salt so we're not recovering cal-half points.
 	r := rand.New(rand.NewPCG(29, 31))
-	tau := calib.Tau
-	evaluated, covered := 0, 0
-	for _, it := range test {
-		if it.Duration == 0 {
-			continue
-		}
-		u := uint64(r.Float64() * float64(it.Duration))
-		reach := u + uint64(tau+0.5)
-		var label float64
-		switch {
-		case reach <= it.Duration:
-			label = 0
-		case it.IsObserved:
-			label = 1
-		default:
-			continue
-		}
-		sU := calib.Base.SurvivalForInterval(it, float64(u))
-		if sU <= 0 {
-			continue
-		}
-		sUTau := calib.Base.SurvivalForInterval(it, float64(u)+tau)
-		pred := 1 - sUTau/sU
-		if pred < 0 {
-			pred = 0
-		}
-		if pred > 1 {
-			pred = 1
-		}
-		lower := pred - calib.ConditionalEpsilon
-		upper := pred + calib.ConditionalEpsilon
-		if lower < 0 {
-			lower = 0
-		}
-		if upper > 1 {
-			upper = 1
-		}
-		evaluated++
-		if label >= lower && label <= upper {
-			covered++
-		}
-	}
+	evaluated, covered := measureConditionalCoverage(calib, test, r)
 	if evaluated == 0 {
 		t.Fatal("no evaluable test rows for conditional coverage")
 	}
@@ -82,6 +42,83 @@ func TestConditionalConformal_OutOfSampleCoverage(t *testing.T) {
 	if rate < 0.7 {
 		t.Errorf("conditional coverage = %v (%d/%d), want ≥ 0.7", rate, covered, evaluated)
 	}
+}
+
+// measureConditionalCoverage walks test rows, samples a random idle
+// u ∈ [0, Duration) per row, and checks whether the observed label
+// at horizon u+τ falls inside [pred − ε, pred + ε]. Returns the
+// (evaluated, covered) pair for the caller to translate into a rate.
+func measureConditionalCoverage(
+	calib *CalibratedModel,
+	test []model.InterAccessInterval,
+	r *rand.Rand,
+) (evaluated, covered int) {
+	tau := calib.Tau
+	for _, it := range test {
+		if it.Duration == 0 {
+			continue
+		}
+		u := uint64(r.Float64() * float64(it.Duration))
+		label, ok := conditionalLabel(it, u, tau)
+		if !ok {
+			continue
+		}
+		pred, ok := conditionalPred(calib, it, u, tau)
+		if !ok {
+			continue
+		}
+		lower, upper := clampUnit(pred-calib.ConditionalEpsilon, pred+calib.ConditionalEpsilon)
+		evaluated++
+		if label >= lower && label <= upper {
+			covered++
+		}
+	}
+	return evaluated, covered
+}
+
+// conditionalLabel returns the binary coverage label at idle u:
+// 0 if (u + τ) still falls inside the observed duration, 1 if the
+// interval terminated with an observed event, or !ok for the
+// right-censored "we can't tell" case we skip for coverage.
+func conditionalLabel(it model.InterAccessInterval, u uint64, tau float64) (float64, bool) {
+	reach := u + uint64(tau+0.5)
+	switch {
+	case reach <= it.Duration:
+		return 0, true
+	case it.IsObserved:
+		return 1, true
+	default:
+		return 0, false
+	}
+}
+
+// conditionalPred returns the raw Cox conditional access probability
+// at idle u with horizon τ, or !ok if the conditional is undefined
+// (S(u) ≤ 0 means the interval has already "died" at u).
+func conditionalPred(calib *CalibratedModel, it model.InterAccessInterval, u uint64, tau float64) (float64, bool) {
+	sU := calib.Base.SurvivalForInterval(it, float64(u))
+	if sU <= 0 {
+		return 0, false
+	}
+	sUTau := calib.Base.SurvivalForInterval(it, float64(u)+tau)
+	pred := 1 - sUTau/sU
+	if pred < 0 {
+		pred = 0
+	}
+	if pred > 1 {
+		pred = 1
+	}
+	return pred, true
+}
+
+func clampUnit(lo, hi float64) (float64, float64) {
+	if lo < 0 {
+		lo = 0
+	}
+	if hi > 1 {
+		hi = 1
+	}
+	return lo, hi
 }
 
 func TestPredictUpperConditional_BoundedAndAboveRaw(t *testing.T) {

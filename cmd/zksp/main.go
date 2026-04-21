@@ -651,72 +651,18 @@ func newReportCmd() *cobra.Command {
 				return err
 			}
 			fitter := analysis.NewStatmodelFitter()
-			overall, err := fitter.FitKaplanMeier(built.Intervals)
+			curves, err := buildReportKMCurves(fitter, built.Intervals)
 			if err != nil {
-				return fmt.Errorf("fit km: %w", err)
-			}
-			overall.Label = "all"
-			byCat, err := analysis.FitKaplanMeierStratified(fitter, built.Intervals, analysis.StratumByContractType)
-			if err != nil {
-				return fmt.Errorf("fit km stratified: %w", err)
-			}
-			curves := []*analysis.KMResult{overall}
-			catLabels := make([]string, 0, len(byCat))
-			for k := range byCat {
-				catLabels = append(catLabels, k)
-			}
-			sort.Strings(catLabels)
-			for _, l := range catLabels {
-				curves = append(curves, byCat[l])
+				return err
 			}
 
 			// 3. Baseline + statistical + statistical-robust, all scored on
 			// shared CostParams so TotalCost is directly comparable.
-			// If --model is set, both statistical variants reuse the
-			// same persisted model (the robust/point difference is a
-			// policy-layer toggle on top of the same CalibratedModel).
-			// Without --model we refit on the fly, once per variant.
 			costs := costsFromFlags(cmd, ramUnit, missPen)
-			policies := []pruning.Policy{pruning.NoPrune{}, pruning.Fixed30d, pruning.Fixed90d}
-			buildStat := func(robust bool) (*pruning.StatisticalPolicy, error) {
-				if modelPath != "" {
-					loaded, err := analysis.LoadModelFile(modelPath)
-					if err != nil {
-						return nil, fmt.Errorf("load model: %w", err)
-					}
-					return app.StatisticalPolicyFromCalibrated(loaded, costs, robust)
-				}
-				return app.BuildStatisticalPolicy(built.Intervals, 0.3, 1, 0, costs, robust)
+			policies, err := buildReportPolicies(built.Intervals, costs, modelPath)
+			if err != nil {
+				return err
 			}
-			// When the user explicitly passes --model, a load failure
-			// should be hard — otherwise the report silently drops
-			// the statistical comparison and the remaining sections
-			// look deceptively complete. When no --model was passed
-			// (built-from-scratch path) a non-fatal warning is fine;
-			// the on-the-fly fit can fail on small or degenerate
-			// datasets and we don't want a single bad split to kill
-			// the whole end-to-end report.
-			statErr, statRErr := "", ""
-			if stat, err := buildStat(false); err != nil {
-				if modelPath != "" {
-					return fmt.Errorf("statistical policy from --model: %w", err)
-				}
-				slog.Warn("statistical policy unavailable for report", "err", err)
-				statErr = err.Error()
-			} else {
-				policies = append(policies, stat)
-			}
-			if statR, err := buildStat(true); err != nil {
-				if modelPath != "" {
-					return fmt.Errorf("statistical-robust policy from --model: %w", err)
-				}
-				slog.Warn("statistical-robust policy unavailable for report", "err", err)
-				statRErr = err.Error()
-			} else {
-				policies = append(policies, statR)
-			}
-			_ = statErr
-			_ = statRErr
 			results, err := pruning.RunAll(policies, built.Intervals, costs)
 			if err != nil {
 				return fmt.Errorf("run all policies: %w", err)
@@ -737,25 +683,7 @@ func newReportCmd() *cobra.Command {
 					Cox:      coxReport,
 				})
 			}
-
-			fmt.Fprintln(out, "=== EDA ===")
-			if err := render.EDA(out, rep); err != nil {
-				return err
-			}
-			fmt.Fprintln(out, "\n=== Kaplan–Meier ===")
-			if err := render.KM(out, curves); err != nil {
-				return err
-			}
-			fmt.Fprintln(out, "\n=== Tiering policies ===")
-			if err := render.SimResults(out, results); err != nil {
-				return err
-			}
-			fmt.Fprintln(out, "\n=== Cox PH (70/30 split) ===")
-			if coxErr != nil {
-				fmt.Fprintf(out, "cox section skipped: %v\n", coxErr)
-			} else {
-				render.CoxFit(out, coxReport)
-			}
+			return renderReportText(out, rep, curves, results, coxReport, coxErr)
 			return nil
 		},
 	}
@@ -767,4 +695,106 @@ func newReportCmd() *cobra.Command {
 	return cmd
 }
 
-// (all text renderers now live in internal/app/render.)
+// buildReportKMCurves fits the overall Kaplan–Meier curve plus one
+// per contract type and returns them in a stable (overall first,
+// then strata alphabetically) order for the KM section of `report`.
+func buildReportKMCurves(
+	fitter analysis.StatmodelFitter,
+	intervals []model.InterAccessInterval,
+) ([]*analysis.KMResult, error) {
+	overall, err := fitter.FitKaplanMeier(intervals)
+	if err != nil {
+		return nil, fmt.Errorf("fit km: %w", err)
+	}
+	overall.Label = "all"
+	byCat, err := analysis.FitKaplanMeierStratified(fitter, intervals, analysis.StratumByContractType)
+	if err != nil {
+		return nil, fmt.Errorf("fit km stratified: %w", err)
+	}
+	curves := []*analysis.KMResult{overall}
+	labels := make([]string, 0, len(byCat))
+	for k := range byCat {
+		labels = append(labels, k)
+	}
+	sort.Strings(labels)
+	for _, l := range labels {
+		curves = append(curves, byCat[l])
+	}
+	return curves, nil
+}
+
+// buildReportPolicies assembles the policy slate `report` scores on
+// common CostParams: NoPrune + FixedIdle baselines plus the two
+// statistical variants (point + robust). When modelPath is set both
+// variants reuse the same persisted model and a load failure is
+// fatal; otherwise we refit on the fly and treat per-variant fit
+// failures as a warning so the report still renders the baselines
+// and the other statistical variant.
+func buildReportPolicies(
+	intervals []model.InterAccessInterval,
+	costs pruning.CostParams,
+	modelPath string,
+) ([]pruning.Policy, error) {
+	policies := []pruning.Policy{pruning.NoPrune{}, pruning.Fixed30d, pruning.Fixed90d}
+	build := func(robust bool) (*pruning.StatisticalPolicy, error) {
+		if modelPath != "" {
+			loaded, err := analysis.LoadModelFile(modelPath)
+			if err != nil {
+				return nil, fmt.Errorf("load model: %w", err)
+			}
+			return app.StatisticalPolicyFromCalibrated(loaded, costs, robust)
+		}
+		return app.BuildStatisticalPolicy(intervals, 0.3, 1, 0, costs, robust)
+	}
+	if p, err := build(false); err != nil {
+		if modelPath != "" {
+			return nil, fmt.Errorf("statistical policy from --model: %w", err)
+		}
+		slog.Warn("statistical policy unavailable for report", "err", err)
+	} else {
+		policies = append(policies, p)
+	}
+	if p, err := build(true); err != nil {
+		if modelPath != "" {
+			return nil, fmt.Errorf("statistical-robust policy from --model: %w", err)
+		}
+		slog.Warn("statistical-robust policy unavailable for report", "err", err)
+	} else {
+		policies = append(policies, p)
+	}
+	return policies, nil
+}
+
+// renderReportText prints the four section blocks of the text-mode
+// `report` output in order: EDA → KM → tiering → Cox. The Cox
+// section is replaced with a one-line "skipped" message when the
+// on-the-fly fit failed upstream, so the rest of the report still
+// lands even on degenerate inputs.
+func renderReportText(
+	out io.Writer,
+	eda *analysis.EDAReport,
+	curves []*analysis.KMResult,
+	results []*pruning.SimResult,
+	coxReport *app.CoxFitReport,
+	coxErr error,
+) error {
+	fmt.Fprintln(out, "=== EDA ===")
+	if err := render.EDA(out, eda); err != nil {
+		return err
+	}
+	fmt.Fprintln(out, "\n=== Kaplan–Meier ===")
+	if err := render.KM(out, curves); err != nil {
+		return err
+	}
+	fmt.Fprintln(out, "\n=== Tiering policies ===")
+	if err := render.SimResults(out, results); err != nil {
+		return err
+	}
+	fmt.Fprintln(out, "\n=== Cox PH (70/30 split) ===")
+	if coxErr != nil {
+		fmt.Fprintf(out, "cox section skipped: %v\n", coxErr)
+		return nil
+	}
+	render.CoxFit(out, coxReport)
+	return nil
+}

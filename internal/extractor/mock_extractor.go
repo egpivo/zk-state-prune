@@ -144,171 +144,246 @@ func (m *MockExtractor) Extract(ctx context.Context, db *storage.DB) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		addr := fmt.Sprintf("0x%040x", i+1)
-		category := catSampler.sample(r)
-		// Mixture deploy-block sampler: with probability PreWindowSlotFraction
-		// the contract is born before Window.Start (→ left-truncated from the
-		// analyst's point of view); otherwise it's born inside the window so
-		// we see its full history. Drawing from this mixture up-front lets
-		// us hit the plan's target pre-window fraction deterministically
-		// instead of having it drift with unrelated parameter tweaks.
-		var deployBlock uint64
-		if m.cfg.Window.Span() > 0 && r.Float64() < m.cfg.PreWindowSlotFraction {
-			deployBlock = uint64(r.Float64() * float64(m.cfg.Window.Start))
-		} else {
-			lo := m.cfg.Window.Start
-			hi := m.cfg.TotalBlocks
-			if hi <= lo {
-				deployBlock = lo
-			} else {
-				deployBlock = lo + uint64(r.Float64()*float64(hi-lo))
-			}
-		}
-		isPeriodic := r.Float64() < m.cfg.PeriodicContractsRatio
-		m.last.Contracts++
-		if deployBlock < m.cfg.Window.Start {
-			m.last.PreWindowContracts++
-		}
-		if isPeriodic {
-			m.last.PeriodicContracts++
-		}
-
-		nSlots := samplePareto(r, m.cfg.SlotsPerContractXmin, m.cfg.SlotsPerContractAlpha)
-		numSlots := int(math.Min(math.Round(nSlots), float64(m.cfg.SlotsPerContractMax)))
-		if numSlots < 1 {
-			numSlots = 1
-		}
-
-		slots := make([]model.StateSlot, 0, numSlots)
-		// First pass: create slots, generate per-slot event positions.
-		perSlotEvents := make([][]uint64, numSlots)
-		totalEvents := uint64(0)
-		for j := 0; j < numSlots; j++ {
-			slotID := fmt.Sprintf("%s:%06d", addr, j)
-			slotType := sampleSlotType(r, category)
-
-			rate := samplePareto(r, m.cfg.AccessRateXmin, m.cfg.AccessRateAlpha)
-			horizon := float64(m.cfg.TotalBlocks - deployBlock)
-			expected := rate * horizon
-			n := samplePoisson(r, expected)
-			if n > m.cfg.MaxEventsPerSlot {
-				n = m.cfg.MaxEventsPerSlot
-			}
-
-			blocks := make([]uint64, 0, n)
-			for k := 0; k < n; k++ {
-				var b uint64
-				if isPeriodic {
-					b = samplePeriodicBlock(r, deployBlock, m.cfg.TotalBlocks, m.cfg.PeriodBlocks)
-				} else {
-					span := m.cfg.TotalBlocks - deployBlock
-					b = deployBlock + uint64(r.Float64()*float64(span))
-				}
-				blocks = append(blocks, b)
-			}
-			perSlotEvents[j] = blocks
-			totalEvents += uint64(n)
-
-			// Slot creation block is the *first* event the slot ever
-			// receives, not the contract's deploy block — a storage
-			// slot only exists once it has been written to. Modelling
-			// it this way makes ContractAge and SlotAge naturally
-			// distinct (ContractAge ≥ SlotAge), which is what the Cox
-			// fit needs to keep both predictors non-collinear.
-			createdAt := deployBlock
-			lastAccess := deployBlock
-			if len(blocks) > 0 {
-				createdAt = minU64(blocks)
-				lastAccess = maxU64(blocks)
-			}
-			slots = append(slots, model.StateSlot{
-				SlotID:       slotID,
-				ContractAddr: addr,
-				SlotIndex:    uint64(j),
-				SlotType:     slotType,
-				CreatedAt:    createdAt,
-				LastAccess:   lastAccess,
-				AccessCount:  uint64(len(blocks)),
-				IsActive:     true,
-			})
-			m.last.Slots++
-			if deployBlock < m.cfg.Window.Start {
-				m.last.PreWindowSlots++
-			}
-		}
-
-		// Second pass: inject co-accesses. With probability rho, every event
-		// pulls in a buddy event on a randomly-chosen sibling slot at the
-		// same block. This produces the intra-contract clustering that the
-		// spatial analysis later looks for.
-		if numSlots > 1 && m.cfg.IntraContractCorrelation > 0 {
-			for j := 0; j < numSlots; j++ {
-				orig := perSlotEvents[j]
-				for _, b := range orig {
-					if r.Float64() >= m.cfg.IntraContractCorrelation {
-						continue
-					}
-					buddy := r.IntN(numSlots)
-					if buddy == j {
-						buddy = (buddy + 1) % numSlots
-					}
-					perSlotEvents[buddy] = append(perSlotEvents[buddy], b)
-					slots[buddy].AccessCount++
-					if b > slots[buddy].LastAccess {
-						slots[buddy].LastAccess = b
-					}
-				}
-			}
-		}
-
-		// Persist contract + slots, then stream events in batches.
-		if err := db.UpsertContract(ctx, model.ContractMeta{
-			Address:      addr,
-			ContractType: category,
-			DeployBlock:  deployBlock,
-			TotalSlots:   uint64(numSlots),
-			ActiveSlots:  uint64(numSlots),
-		}); err != nil {
+		if err := m.generateContract(ctx, db, i, r, catSampler, &eventBuf, eventBatch, flush); err != nil {
 			return err
 		}
-		for _, s := range slots {
-			if err := db.UpsertSlot(ctx, s); err != nil {
-				return err
-			}
-		}
-
-		for j := 0; j < numSlots; j++ {
-			blocks := perSlotEvents[j]
-			sort.Slice(blocks, func(a, b int) bool { return blocks[a] < blocks[b] })
-			for idx, b := range blocks {
-				at := model.AccessRead
-				if idx == 0 {
-					at = model.AccessWrite // first touch is the SSTORE
-				} else if r.Float64() < 0.2 {
-					at = model.AccessWrite
-				}
-				eventBuf = append(eventBuf, model.AccessEvent{
-					SlotID:      slots[j].SlotID,
-					BlockNumber: b,
-					AccessType:  at,
-					TxHash:      fmt.Sprintf("0x%064x", uint64(i)*1_000_000+uint64(j)*1000+uint64(idx)),
-				})
-				m.last.Events++
-				if m.cfg.Window.Contains(b) {
-					m.last.EventsInWindow++
-				}
-				if len(eventBuf) >= eventBatch {
-					if err := flush(); err != nil {
-						return err
-					}
-				}
-			}
-		}
-		_ = totalEvents
 	}
 	if len(eventBuf) > 0 {
 		if err := flush(); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// generateContract samples the full synthetic trace of contract i —
+// deploy block, category, slots, events, co-access correlation — and
+// persists it to db in FK-safe order (contract → slots → events).
+// eventBuf is flushed mid-contract whenever it reaches eventBatch so
+// peak memory is bounded independent of contract size.
+func (m *MockExtractor) generateContract(
+	ctx context.Context,
+	db *storage.DB,
+	i int,
+	r *rand.Rand,
+	catSampler *categorySampler,
+	eventBuf *[]model.AccessEvent,
+	eventBatch int,
+	flush func() error,
+) error {
+	addr := fmt.Sprintf("0x%040x", i+1)
+	category := catSampler.sample(r)
+	deployBlock := m.sampleDeployBlock(r)
+	isPeriodic := r.Float64() < m.cfg.PeriodicContractsRatio
+	m.last.Contracts++
+	if deployBlock < m.cfg.Window.Start {
+		m.last.PreWindowContracts++
+	}
+	if isPeriodic {
+		m.last.PeriodicContracts++
+	}
+	numSlots := m.sampleNumSlots(r)
+
+	slots, perSlotEvents := m.generateContractSlots(r, addr, numSlots, deployBlock, category, isPeriodic)
+	m.injectCoAccess(r, perSlotEvents, slots)
+
+	if err := m.persistContractRows(ctx, db, addr, category, deployBlock, slots); err != nil {
+		return err
+	}
+	return m.streamContractEvents(ctx, i, r, slots, perSlotEvents, eventBuf, eventBatch, flush)
+}
+
+// sampleDeployBlock draws a contract's birth block from a mixture:
+// with probability PreWindowSlotFraction the contract is born before
+// Window.Start (→ left-truncated from the analyst's POV); otherwise
+// it's born inside the window so we see its full history. Drawing
+// from this mixture up-front lets us hit the plan's target
+// pre-window fraction deterministically instead of having it drift
+// with unrelated parameter tweaks.
+func (m *MockExtractor) sampleDeployBlock(r *rand.Rand) uint64 {
+	if m.cfg.Window.Span() > 0 && r.Float64() < m.cfg.PreWindowSlotFraction {
+		return uint64(r.Float64() * float64(m.cfg.Window.Start))
+	}
+	lo := m.cfg.Window.Start
+	hi := m.cfg.TotalBlocks
+	if hi <= lo {
+		return lo
+	}
+	return lo + uint64(r.Float64()*float64(hi-lo))
+}
+
+func (m *MockExtractor) sampleNumSlots(r *rand.Rand) int {
+	nSlots := samplePareto(r, m.cfg.SlotsPerContractXmin, m.cfg.SlotsPerContractAlpha)
+	numSlots := int(math.Min(math.Round(nSlots), float64(m.cfg.SlotsPerContractMax)))
+	if numSlots < 1 {
+		numSlots = 1
+	}
+	return numSlots
+}
+
+// generateContractSlots builds both the slot metadata and the raw
+// per-slot event position lists (pre-sort, pre-co-access). Returns
+// parallel slices: slots[j] and perSlotEvents[j] describe the same
+// slot. SlotID = "<contract>:<index-6d>" stays stable across reseeded
+// runs so golden-file tests can pin it.
+func (m *MockExtractor) generateContractSlots(
+	r *rand.Rand,
+	addr string,
+	numSlots int,
+	deployBlock uint64,
+	category model.ContractCategory,
+	isPeriodic bool,
+) ([]model.StateSlot, [][]uint64) {
+	slots := make([]model.StateSlot, 0, numSlots)
+	perSlotEvents := make([][]uint64, numSlots)
+	for j := 0; j < numSlots; j++ {
+		slotID := fmt.Sprintf("%s:%06d", addr, j)
+		slotType := sampleSlotType(r, category)
+		blocks := m.sampleSlotEventBlocks(r, deployBlock, isPeriodic)
+		perSlotEvents[j] = blocks
+
+		// Slot creation block is the *first* event the slot ever
+		// receives, not the contract's deploy block — a storage
+		// slot only exists once it has been written to. Modelling
+		// it this way makes ContractAge and SlotAge naturally
+		// distinct (ContractAge ≥ SlotAge), which is what the Cox
+		// fit needs to keep both predictors non-collinear.
+		createdAt := deployBlock
+		lastAccess := deployBlock
+		if len(blocks) > 0 {
+			createdAt = minU64(blocks)
+			lastAccess = maxU64(blocks)
+		}
+		slots = append(slots, model.StateSlot{
+			SlotID:       slotID,
+			ContractAddr: addr,
+			SlotIndex:    uint64(j),
+			SlotType:     slotType,
+			CreatedAt:    createdAt,
+			LastAccess:   lastAccess,
+			AccessCount:  uint64(len(blocks)),
+			IsActive:     true,
+		})
+		m.last.Slots++
+		if deployBlock < m.cfg.Window.Start {
+			m.last.PreWindowSlots++
+		}
+	}
+	return slots, perSlotEvents
+}
+
+func (m *MockExtractor) sampleSlotEventBlocks(r *rand.Rand, deployBlock uint64, isPeriodic bool) []uint64 {
+	rate := samplePareto(r, m.cfg.AccessRateXmin, m.cfg.AccessRateAlpha)
+	horizon := float64(m.cfg.TotalBlocks - deployBlock)
+	n := samplePoisson(r, rate*horizon)
+	if n > m.cfg.MaxEventsPerSlot {
+		n = m.cfg.MaxEventsPerSlot
+	}
+	blocks := make([]uint64, 0, n)
+	for k := 0; k < n; k++ {
+		var b uint64
+		if isPeriodic {
+			b = samplePeriodicBlock(r, deployBlock, m.cfg.TotalBlocks, m.cfg.PeriodBlocks)
+		} else {
+			span := m.cfg.TotalBlocks - deployBlock
+			b = deployBlock + uint64(r.Float64()*float64(span))
+		}
+		blocks = append(blocks, b)
+	}
+	return blocks
+}
+
+// injectCoAccess is the second pass: with probability
+// IntraContractCorrelation, each event pulls in a buddy event on a
+// randomly-chosen sibling slot at the same block. This produces the
+// intra-contract clustering that spatial.RunSpatial later looks for.
+func (m *MockExtractor) injectCoAccess(r *rand.Rand, perSlotEvents [][]uint64, slots []model.StateSlot) {
+	numSlots := len(slots)
+	if numSlots <= 1 || m.cfg.IntraContractCorrelation <= 0 {
+		return
+	}
+	for j := 0; j < numSlots; j++ {
+		orig := perSlotEvents[j]
+		for _, b := range orig {
+			if r.Float64() >= m.cfg.IntraContractCorrelation {
+				continue
+			}
+			buddy := r.IntN(numSlots)
+			if buddy == j {
+				buddy = (buddy + 1) % numSlots
+			}
+			perSlotEvents[buddy] = append(perSlotEvents[buddy], b)
+			slots[buddy].AccessCount++
+			if b > slots[buddy].LastAccess {
+				slots[buddy].LastAccess = b
+			}
+		}
+	}
+}
+
+func (m *MockExtractor) persistContractRows(
+	ctx context.Context,
+	db *storage.DB,
+	addr string,
+	category model.ContractCategory,
+	deployBlock uint64,
+	slots []model.StateSlot,
+) error {
+	if err := db.UpsertContract(ctx, model.ContractMeta{
+		Address:      addr,
+		ContractType: category,
+		DeployBlock:  deployBlock,
+		TotalSlots:   uint64(len(slots)),
+		ActiveSlots:  uint64(len(slots)),
+	}); err != nil {
+		return err
+	}
+	for _, s := range slots {
+		if err := db.UpsertSlot(ctx, s); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// streamContractEvents sorts each slot's event blocks, assigns
+// read/write labels (first touch is always a SSTORE; subsequent are
+// 80/20 read/write), and buffers the resulting AccessEvent rows into
+// eventBuf, flushing when the batch cap is hit.
+func (m *MockExtractor) streamContractEvents(
+	ctx context.Context,
+	contractIdx int,
+	r *rand.Rand,
+	slots []model.StateSlot,
+	perSlotEvents [][]uint64,
+	eventBuf *[]model.AccessEvent,
+	eventBatch int,
+	flush func() error,
+) error {
+	_ = ctx // kept for future cancellation points inside the inner loop
+	for j := 0; j < len(slots); j++ {
+		blocks := perSlotEvents[j]
+		sort.Slice(blocks, func(a, b int) bool { return blocks[a] < blocks[b] })
+		for idx, b := range blocks {
+			at := model.AccessRead
+			if idx == 0 || r.Float64() < 0.2 {
+				at = model.AccessWrite
+			}
+			*eventBuf = append(*eventBuf, model.AccessEvent{
+				SlotID:      slots[j].SlotID,
+				BlockNumber: b,
+				AccessType:  at,
+				TxHash:      fmt.Sprintf("0x%064x", uint64(contractIdx)*1_000_000+uint64(j)*1000+uint64(idx)),
+			})
+			m.last.Events++
+			if m.cfg.Window.Contains(b) {
+				m.last.EventsInWindow++
+			}
+			if len(*eventBuf) >= eventBatch {
+				if err := flush(); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	return nil

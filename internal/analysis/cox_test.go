@@ -45,13 +45,33 @@ func TestFitCoxPH_LearnsExpectedSign(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FitCoxPH: %v", err)
 	}
+	t.Run("shape matches predictor count", func(t *testing.T) {
+		assertCoxShape(t, res, len(ivs))
+	})
+	t.Run("AccessCount coef is positive", func(t *testing.T) {
+		assertAccessCountSignPositive(t, res)
+	})
+	t.Run("LogLike and StdErr are finite", func(t *testing.T) {
+		assertCoxFiniteStats(t, res)
+	})
+	t.Run("BaselineCumHaz monotone non-decreasing", func(t *testing.T) {
+		assertBaselineCumHazMonotone(t, res)
+	})
+}
+
+func assertCoxShape(t *testing.T, res *CoxResult, nIntervals int) {
+	t.Helper()
 	if got, want := len(res.Coef), len(DefaultCoxPredictors); got != want {
 		t.Fatalf("len(Coef)=%d want %d", got, want)
 	}
-	if res.NumObs != len(ivs) || res.NumEvents != len(ivs) {
-		t.Errorf("NumObs=%d NumEvents=%d, want %d/%d", res.NumObs, res.NumEvents, len(ivs), len(ivs))
+	if res.NumObs != nIntervals || res.NumEvents != nIntervals {
+		t.Errorf("NumObs=%d NumEvents=%d, want %d/%d", res.NumObs, res.NumEvents, nIntervals, nIntervals)
 	}
-	// AccessCount is the first predictor; its coef should be positive
+}
+
+func assertAccessCountSignPositive(t *testing.T, res *CoxResult) {
+	t.Helper()
+	// AccessCount is a predictor; its coef should be positive
 	// (higher prior accesses → higher hazard → shorter gap).
 	idx := -1
 	for i, p := range res.Predictors {
@@ -65,7 +85,10 @@ func TestFitCoxPH_LearnsExpectedSign(t *testing.T) {
 	if res.Coef[idx] <= 0 {
 		t.Errorf("AccessCount coef = %v, want > 0", res.Coef[idx])
 	}
-	// Sanity: log-likelihood and SE all finite.
+}
+
+func assertCoxFiniteStats(t *testing.T, res *CoxResult) {
+	t.Helper()
 	if math.IsNaN(res.LogLike) || math.IsInf(res.LogLike, 0) {
 		t.Errorf("LogLike not finite: %v", res.LogLike)
 	}
@@ -74,7 +97,10 @@ func TestFitCoxPH_LearnsExpectedSign(t *testing.T) {
 			t.Errorf("StdErr[%d]=%v, want positive finite", i, se)
 		}
 	}
-	// BaselineCumHaz should be non-empty and monotone non-decreasing.
+}
+
+func assertBaselineCumHazMonotone(t *testing.T, res *CoxResult) {
+	t.Helper()
 	if len(res.BaselineCumHaz) == 0 {
 		t.Fatalf("BaselineCumHaz empty")
 	}
