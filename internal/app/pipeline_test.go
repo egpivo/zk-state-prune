@@ -7,9 +7,9 @@ import (
 	"testing"
 
 	"github.com/egpivo/zk-state-prune/internal/analysis"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 	"github.com/egpivo/zk-state-prune/internal/extractor"
-	"github.com/egpivo/zk-state-prune/internal/model"
-	"github.com/egpivo/zk-state-prune/internal/pruning"
+	"github.com/egpivo/zk-state-prune/internal/sim"
 	"github.com/egpivo/zk-state-prune/internal/storage"
 )
 
@@ -49,16 +49,16 @@ func TestCoxStrataColumn(t *testing.T) {
 }
 
 func TestMedianDuration(t *testing.T) {
-	mk := func(durs ...uint64) []model.InterAccessInterval {
-		out := make([]model.InterAccessInterval, len(durs))
+	mk := func(durs ...uint64) []domain.InterAccessInterval {
+		out := make([]domain.InterAccessInterval, len(durs))
 		for i, d := range durs {
-			out[i] = model.InterAccessInterval{Duration: d}
+			out[i] = domain.InterAccessInterval{Duration: d}
 		}
 		return out
 	}
 	cases := []struct {
 		name string
-		in   []model.InterAccessInterval
+		in   []domain.InterAccessInterval
 		want float64
 	}{
 		// Empty + all-zero + single-element defend the "never return 0"
@@ -82,7 +82,7 @@ func TestMedianDuration(t *testing.T) {
 }
 
 func TestStatisticalPolicyFromCalibrated_NilModel(t *testing.T) {
-	costs := pruning.CostParams{RAMUnitCost: 1, MissPenalty: 10}
+	costs := sim.CostParams{RAMUnitCost: 1, MissPenalty: 10}
 	if _, err := StatisticalPolicyFromCalibrated(nil, costs, false); err == nil {
 		t.Error("nil model: want error")
 	}
@@ -114,14 +114,14 @@ func smallMockCfg() extractor.MockConfig {
 	c.SlotsPerContractXmin = 5
 	c.SlotsPerContractMax = 40
 	c.TotalBlocks = 20_000
-	c.Window = model.ObservationWindow{Start: 4_000, End: 20_000}
+	c.Window = domain.ObservationWindow{Start: 4_000, End: 20_000}
 	c.AccessRateXmin = 1e-4
 	c.MaxEventsPerSlot = 200
 	c.PeriodBlocks = 2_000
 	return c
 }
 
-func setupMockIntervals(t *testing.T) []model.InterAccessInterval {
+func setupMockIntervals(t *testing.T) []domain.InterAccessInterval {
 	t.Helper()
 	ctx := context.Background()
 	db, err := storage.Open(ctx, filepath.Join(t.TempDir(), "app.db"))
@@ -146,7 +146,7 @@ func setupMockIntervals(t *testing.T) []model.InterAccessInterval {
 
 func TestBuildStatisticalPolicy_PointAndRobust(t *testing.T) {
 	intervals := setupMockIntervals(t)
-	costs := pruning.CostParams{RAMUnitCost: 1, MissPenalty: 1_000}
+	costs := sim.CostParams{RAMUnitCost: 1, MissPenalty: 1_000}
 
 	// Point variant.
 	p, err := BuildStatisticalPolicy(intervals, 0.3, 1, 0, costs, false)
@@ -179,7 +179,7 @@ func TestBuildStatisticalPolicy_PointAndRobust(t *testing.T) {
 
 func TestBuildStatisticalPolicy_ExplicitTauOverridesMedian(t *testing.T) {
 	intervals := setupMockIntervals(t)
-	costs := pruning.CostParams{RAMUnitCost: 1, MissPenalty: 1_000}
+	costs := sim.CostParams{RAMUnitCost: 1, MissPenalty: 1_000}
 	const explicit uint64 = 12345
 
 	p, err := BuildStatisticalPolicy(intervals, 0.3, 1, explicit, costs, false)
@@ -247,7 +247,7 @@ func TestStatisticalPolicy_ClosuresExerciseOnHotBlocks(t *testing.T) {
 	// a freshly fit CalibratedModel and invoke HotBlocks on a few
 	// intervals so the rawCondP / robust branches are hit.
 	intervals := setupMockIntervals(t)
-	costs := pruning.CostParams{RAMUnitCost: 1, MissPenalty: 1_000}
+	costs := sim.CostParams{RAMUnitCost: 1, MissPenalty: 1_000}
 
 	for _, robust := range []bool{false, true} {
 		p, err := BuildStatisticalPolicy(intervals, 0.3, 1, 0, costs, robust)

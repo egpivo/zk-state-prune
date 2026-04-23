@@ -1,5 +1,5 @@
-// Package model contains core domain types shared across zksp.
-package model
+// Package domain contains core domain types shared across zksp.
+package domain
 
 import "fmt"
 

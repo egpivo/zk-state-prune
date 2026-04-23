@@ -68,7 +68,7 @@ func TestLoad_CheckedInDefaultYAML(t *testing.T) {
 	// non-default tweak check: the file should be detectable as a
 	// "real load" by having a non-zero cost.
 	if c.Pruning.Cost.RAMUnitCost <= 0 || c.Pruning.Cost.MissPenalty <= 0 {
-		t.Errorf("configs/default.yaml did not populate pruning.cost: got %+v", c.Pruning.Cost)
+		t.Errorf("configs/default.yaml did not populate sim.cost: got %+v", c.Pruning.Cost)
 	}
 }
 

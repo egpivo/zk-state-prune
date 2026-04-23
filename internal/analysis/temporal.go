@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/egpivo/zk-state-prune/internal/model"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 	"github.com/egpivo/zk-state-prune/internal/storage"
 )
 
@@ -16,7 +16,7 @@ import (
 // need. Phase 2 ships a basic autocorrelation-peak detector — good
 // enough to flag the synthetic periodic contracts as a sanity check.
 type TemporalReport struct {
-	Window model.ObservationWindow
+	Window domain.ObservationWindow
 
 	// Number of contracts that had enough in-window events
 	// (>= temporalMinEvents) for a periodicity call.
@@ -67,14 +67,14 @@ const temporalSignificance = 0.3
 //  3. Reports the lag with the largest correlation. If that value is
 //     above temporalSignificance the contract is flagged periodic and
 //     its dominant period (in blocks) is lag × bin_width.
-func RunTemporal(ctx context.Context, db *storage.DB, window model.ObservationWindow) (*TemporalReport, error) {
+func RunTemporal(ctx context.Context, db *storage.DB, window domain.ObservationWindow) (*TemporalReport, error) {
 	if window.End <= window.Start {
 		return nil, fmt.Errorf("RunTemporal: invalid window [%d, %d)", window.Start, window.End)
 	}
 
 	// Collect per-contract event blocks (in-window, deduped).
 	byContract := make(map[string][]uint64)
-	err := db.IterateSlotEvents(ctx, func(sm storage.SlotWithMeta, events []model.AccessEvent) error {
+	err := db.IterateSlotEvents(ctx, func(sm storage.SlotWithMeta, events []domain.AccessEvent) error {
 		addr := sm.Slot.ContractAddr
 		for _, e := range events {
 			if !window.Contains(e.BlockNumber) {

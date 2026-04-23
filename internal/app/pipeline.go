@@ -16,8 +16,8 @@ import (
 	"sort"
 
 	"github.com/egpivo/zk-state-prune/internal/analysis"
-	"github.com/egpivo/zk-state-prune/internal/model"
-	"github.com/egpivo/zk-state-prune/internal/pruning"
+	"github.com/egpivo/zk-state-prune/internal/domain"
+	"github.com/egpivo/zk-state-prune/internal/sim"
 )
 
 // CoxFitReport is the display-layer bundle produced by BuildCoxFitReport.
@@ -38,7 +38,7 @@ type CoxFitReport struct {
 // ("none" / "contract-type" / "slot-type") into a dstream adapter
 // column name consumed by FitCoxPHStratified. The empty string means
 // unstratified. Unknown values return an error so the CLI can surface
-// a helpful message rather than silently fitting an unstratified model.
+// a helpful message rather than silently fitting an unstratified domain.
 func CoxStrataColumn(stratify string) (string, error) {
 	switch stratify {
 	case "", "none":
@@ -57,7 +57,7 @@ func CoxStrataColumn(stratify string) (string, error) {
 // set. An empty slice maps to 1 so downstream math doesn't divide by
 // zero; a zero median (e.g. all durations in a degenerate fixture)
 // also clamps to 1 for the same reason.
-func MedianDuration(ivs []model.InterAccessInterval) float64 {
+func MedianDuration(ivs []domain.InterAccessInterval) float64 {
 	if len(ivs) == 0 {
 		return 1
 	}
@@ -79,13 +79,13 @@ func MedianDuration(ivs []model.InterAccessInterval) float64 {
 // diagram uses the exact same bin-wise KM logic as the raw Cox curve.
 func CalibrationCurveFromCalibrated(
 	calib *analysis.CalibratedModel,
-	holdout []model.InterAccessInterval,
+	holdout []domain.InterAccessInterval,
 	nBins int,
 ) (*analysis.CalibrationCurve, error) {
 	if calib == nil || calib.Base == nil {
 		return nil, fmt.Errorf("CalibrationCurveFromCalibrated: nil calibrated model")
 	}
-	predict := func(it model.InterAccessInterval) float64 {
+	predict := func(it domain.InterAccessInterval) float64 {
 		return calib.PredictAccessProbForInterval(it)
 	}
 	return analysis.CalibrationCurveFromPredict(predict, holdout, calib.Tau, nBins)
@@ -103,7 +103,7 @@ func CalibrationCurveFromCalibrated(
 // through CoxStrataColumn.
 func BuildCoxFitReport(
 	fitter analysis.StatmodelFitter,
-	intervals []model.InterAccessInterval,
+	intervals []domain.InterAccessInterval,
 	holdoutFrac float64,
 	splitSeed uint64,
 	tauFlag uint64,
@@ -166,13 +166,13 @@ func BuildCoxFitReport(
 // Labels are "statistical" and "statistical-robust" respectively so
 // the comparison table in SimResults keeps them distinct.
 func BuildStatisticalPolicy(
-	intervals []model.InterAccessInterval,
+	intervals []domain.InterAccessInterval,
 	holdoutFrac float64,
 	splitSeed uint64,
 	tauFlag uint64,
-	costs pruning.CostParams,
+	costs sim.CostParams,
 	robust bool,
-) (*pruning.StatisticalPolicy, error) {
+) (*sim.StatisticalPolicy, error) {
 	train, holdout, err := analysis.TrainHoldoutSplitBySlot(intervals, holdoutFrac, splitSeed)
 	if err != nil {
 		return nil, fmt.Errorf("split: %w", err)
@@ -221,14 +221,14 @@ func BuildStatisticalPolicy(
 // 10+ unambiguous rows).
 func StatisticalPolicyFromCalibrated(
 	calib *analysis.CalibratedModel,
-	costs pruning.CostParams,
+	costs sim.CostParams,
 	robust bool,
-) (*pruning.StatisticalPolicy, error) {
+) (*sim.StatisticalPolicy, error) {
 	if calib == nil || calib.Base == nil {
 		return nil, fmt.Errorf("StatisticalPolicyFromCalibrated: nil model")
 	}
 	cox := calib.Base
-	rawCondP := func(it model.InterAccessInterval, idle float64) float64 {
+	rawCondP := func(it domain.InterAccessInterval, idle float64) float64 {
 		sU := cox.SurvivalForInterval(it, idle)
 		if sU <= 0 {
 			return 1
@@ -245,15 +245,15 @@ func StatisticalPolicyFromCalibrated(
 	}
 
 	name := "statistical"
-	var predict pruning.CondAccessProbFunc = rawCondP
+	var predict sim.CondAccessProbFunc = rawCondP
 	if robust {
 		name = "statistical-robust"
-		predict = func(it model.InterAccessInterval, idle float64) float64 {
+		predict = func(it domain.InterAccessInterval, idle float64) float64 {
 			if idle == 0 {
 				return calib.PredictUpperAccessProbForInterval(it)
 			}
 			return calib.PredictUpperConditionalAccessProb(it, idle)
 		}
 	}
-	return pruning.NewStatisticalPolicy(name, predict, calib.Tau, costs)
+	return sim.NewStatisticalPolicy(name, predict, calib.Tau, costs)
 }

@@ -7,7 +7,7 @@ import (
 	"math/rand/v2"
 	"sort"
 
-	"github.com/egpivo/zk-state-prune/internal/model"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 	"github.com/egpivo/zk-state-prune/internal/storage"
 )
 
@@ -43,14 +43,14 @@ type MockConfig struct {
 	// sees events inside Window, which is where censoring and truncation
 	// come from. Keeping it on MockConfig lets the generator hit a target
 	// pre-window slot fraction deterministically.
-	Window model.ObservationWindow
+	Window domain.ObservationWindow
 	// PreWindowSlotFraction controls the share of contracts whose deploy
 	// block lands before Window.Start. A value of 0.3 reproduces the plan's
 	// "30% slots pre-exist the observation window" assumption; those slots
 	// will be flagged as left-truncated by the interval builder.
 	PreWindowSlotFraction float64
 
-	ContractTypeDistribution map[model.ContractCategory]float64
+	ContractTypeDistribution map[domain.ContractCategory]float64
 }
 
 // Diagnostics is a small report produced by the mock extractor describing how
@@ -83,15 +83,15 @@ func DefaultMockConfig() MockConfig {
 		PeriodicContractsRatio:   0.1,
 		PeriodBlocks:             50_000,
 		TotalBlocks:              1_000_000,
-		Window:                   model.ObservationWindow{Start: 200_000, End: 1_000_000},
+		Window:                   domain.ObservationWindow{Start: 200_000, End: 1_000_000},
 		PreWindowSlotFraction:    0.3,
-		ContractTypeDistribution: map[model.ContractCategory]float64{
-			model.ContractERC20:      0.40,
-			model.ContractDEX:        0.15,
-			model.ContractNFT:        0.20,
-			model.ContractBridge:     0.05,
-			model.ContractGovernance: 0.05,
-			model.ContractOther:      0.15,
+		ContractTypeDistribution: map[domain.ContractCategory]float64{
+			domain.ContractERC20:      0.40,
+			domain.ContractDEX:        0.15,
+			domain.ContractNFT:        0.20,
+			domain.ContractBridge:     0.05,
+			domain.ContractGovernance: 0.05,
+			domain.ContractOther:      0.15,
 		},
 	}
 }
@@ -128,7 +128,7 @@ func (m *MockExtractor) Extract(ctx context.Context, db *storage.DB) error {
 	m.last = Diagnostics{}
 
 	const eventBatch = 10_000
-	eventBuf := make([]model.AccessEvent, 0, eventBatch)
+	eventBuf := make([]domain.AccessEvent, 0, eventBatch)
 	flush := func() error {
 		// Mock always generates fresh synthetic rows on a Reset()'d
 		// DB, so the inserted-row count equals len(eventBuf); the
@@ -167,7 +167,7 @@ func (m *MockExtractor) generateContract(
 	i int,
 	r *rand.Rand,
 	catSampler *categorySampler,
-	eventBuf *[]model.AccessEvent,
+	eventBuf *[]domain.AccessEvent,
 	eventBatch int,
 	flush func() error,
 ) error {
@@ -231,10 +231,10 @@ func (m *MockExtractor) generateContractSlots(
 	addr string,
 	numSlots int,
 	deployBlock uint64,
-	category model.ContractCategory,
+	category domain.ContractCategory,
 	isPeriodic bool,
-) ([]model.StateSlot, [][]uint64) {
-	slots := make([]model.StateSlot, 0, numSlots)
+) ([]domain.StateSlot, [][]uint64) {
+	slots := make([]domain.StateSlot, 0, numSlots)
 	perSlotEvents := make([][]uint64, numSlots)
 	for j := 0; j < numSlots; j++ {
 		slotID := fmt.Sprintf("%s:%06d", addr, j)
@@ -254,7 +254,7 @@ func (m *MockExtractor) generateContractSlots(
 			createdAt = minU64(blocks)
 			lastAccess = maxU64(blocks)
 		}
-		slots = append(slots, model.StateSlot{
+		slots = append(slots, domain.StateSlot{
 			SlotID:       slotID,
 			ContractAddr: addr,
 			SlotIndex:    uint64(j),
@@ -297,7 +297,7 @@ func (m *MockExtractor) sampleSlotEventBlocks(r *rand.Rand, deployBlock uint64, 
 // IntraContractCorrelation, each event pulls in a buddy event on a
 // randomly-chosen sibling slot at the same block. This produces the
 // intra-contract clustering that spatial.RunSpatial later looks for.
-func (m *MockExtractor) injectCoAccess(r *rand.Rand, perSlotEvents [][]uint64, slots []model.StateSlot) {
+func (m *MockExtractor) injectCoAccess(r *rand.Rand, perSlotEvents [][]uint64, slots []domain.StateSlot) {
 	numSlots := len(slots)
 	if numSlots <= 1 || m.cfg.IntraContractCorrelation <= 0 {
 		return
@@ -325,11 +325,11 @@ func (m *MockExtractor) persistContractRows(
 	ctx context.Context,
 	db *storage.DB,
 	addr string,
-	category model.ContractCategory,
+	category domain.ContractCategory,
 	deployBlock uint64,
-	slots []model.StateSlot,
+	slots []domain.StateSlot,
 ) error {
-	if err := db.UpsertContract(ctx, model.ContractMeta{
+	if err := db.UpsertContract(ctx, domain.ContractMeta{
 		Address:      addr,
 		ContractType: category,
 		DeployBlock:  deployBlock,
@@ -354,9 +354,9 @@ func (m *MockExtractor) streamContractEvents(
 	ctx context.Context,
 	contractIdx int,
 	r *rand.Rand,
-	slots []model.StateSlot,
+	slots []domain.StateSlot,
 	perSlotEvents [][]uint64,
-	eventBuf *[]model.AccessEvent,
+	eventBuf *[]domain.AccessEvent,
 	eventBatch int,
 	flush func() error,
 ) error {
@@ -365,11 +365,11 @@ func (m *MockExtractor) streamContractEvents(
 		blocks := perSlotEvents[j]
 		sort.Slice(blocks, func(a, b int) bool { return blocks[a] < blocks[b] })
 		for idx, b := range blocks {
-			at := model.AccessRead
+			at := domain.AccessRead
 			if idx == 0 || r.Float64() < 0.2 {
-				at = model.AccessWrite
+				at = domain.AccessWrite
 			}
-			*eventBuf = append(*eventBuf, model.AccessEvent{
+			*eventBuf = append(*eventBuf, domain.AccessEvent{
 				SlotID:      slots[j].SlotID,
 				BlockNumber: b,
 				AccessType:  at,
@@ -472,25 +472,25 @@ func samplePeriodicBlock(r *rand.Rand, start, total, periodBlocks uint64) uint64
 // sampleSlotType emits a slot-type chosen from a category-specific mix.
 // Hard-coded weights keep the table inspectable; tweak as the model demands
 // more nuance.
-func sampleSlotType(r *rand.Rand, c model.ContractCategory) model.SlotType {
+func sampleSlotType(r *rand.Rand, c domain.ContractCategory) domain.SlotType {
 	type w struct {
-		t model.SlotType
+		t domain.SlotType
 		p float64
 	}
 	var dist []w
 	switch c {
-	case model.ContractERC20:
-		dist = []w{{model.SlotTypeBalance, 0.7}, {model.SlotTypeMapping, 0.2}, {model.SlotTypeFixed, 0.1}}
-	case model.ContractDEX:
-		dist = []w{{model.SlotTypeMapping, 0.5}, {model.SlotTypeArray, 0.2}, {model.SlotTypeBalance, 0.2}, {model.SlotTypeFixed, 0.1}}
-	case model.ContractNFT:
-		dist = []w{{model.SlotTypeMapping, 0.7}, {model.SlotTypeArray, 0.2}, {model.SlotTypeFixed, 0.1}}
-	case model.ContractBridge:
-		dist = []w{{model.SlotTypeMapping, 0.5}, {model.SlotTypeBalance, 0.3}, {model.SlotTypeFixed, 0.2}}
-	case model.ContractGovernance:
-		dist = []w{{model.SlotTypeMapping, 0.4}, {model.SlotTypeArray, 0.3}, {model.SlotTypeFixed, 0.3}}
+	case domain.ContractERC20:
+		dist = []w{{domain.SlotTypeBalance, 0.7}, {domain.SlotTypeMapping, 0.2}, {domain.SlotTypeFixed, 0.1}}
+	case domain.ContractDEX:
+		dist = []w{{domain.SlotTypeMapping, 0.5}, {domain.SlotTypeArray, 0.2}, {domain.SlotTypeBalance, 0.2}, {domain.SlotTypeFixed, 0.1}}
+	case domain.ContractNFT:
+		dist = []w{{domain.SlotTypeMapping, 0.7}, {domain.SlotTypeArray, 0.2}, {domain.SlotTypeFixed, 0.1}}
+	case domain.ContractBridge:
+		dist = []w{{domain.SlotTypeMapping, 0.5}, {domain.SlotTypeBalance, 0.3}, {domain.SlotTypeFixed, 0.2}}
+	case domain.ContractGovernance:
+		dist = []w{{domain.SlotTypeMapping, 0.4}, {domain.SlotTypeArray, 0.3}, {domain.SlotTypeFixed, 0.3}}
 	default:
-		dist = []w{{model.SlotTypeMapping, 0.4}, {model.SlotTypeArray, 0.2}, {model.SlotTypeFixed, 0.2}, {model.SlotTypeBalance, 0.2}}
+		dist = []w{{domain.SlotTypeMapping, 0.4}, {domain.SlotTypeArray, 0.2}, {domain.SlotTypeFixed, 0.2}, {domain.SlotTypeBalance, 0.2}}
 	}
 	u := r.Float64()
 	cum := 0.0
@@ -505,18 +505,18 @@ func sampleSlotType(r *rand.Rand, c model.ContractCategory) model.SlotType {
 
 // categorySampler turns a weight map into an alias-free CDF lookup.
 type categorySampler struct {
-	cats []model.ContractCategory
+	cats []domain.ContractCategory
 	cdf  []float64
 }
 
-func newCategorySampler(weights map[model.ContractCategory]float64) *categorySampler {
+func newCategorySampler(weights map[domain.ContractCategory]float64) *categorySampler {
 	cs := &categorySampler{}
 	sum := 0.0
 	for _, w := range weights {
 		sum += w
 	}
 	// Stable iteration order so the same seed gives the same sequence.
-	keys := make([]model.ContractCategory, 0, len(weights))
+	keys := make([]domain.ContractCategory, 0, len(weights))
 	for k := range weights {
 		keys = append(keys, k)
 	}
@@ -530,7 +530,7 @@ func newCategorySampler(weights map[model.ContractCategory]float64) *categorySam
 	return cs
 }
 
-func (c *categorySampler) sample(r *rand.Rand) model.ContractCategory {
+func (c *categorySampler) sample(r *rand.Rand) domain.ContractCategory {
 	u := r.Float64()
 	for i, p := range c.cdf {
 		if u < p {

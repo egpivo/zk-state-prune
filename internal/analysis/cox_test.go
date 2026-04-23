@@ -7,23 +7,23 @@ import (
 	"math/rand/v2"
 	"testing"
 
+	"github.com/egpivo/zk-state-prune/internal/domain"
 	"github.com/egpivo/zk-state-prune/internal/extractor"
-	"github.com/egpivo/zk-state-prune/internal/model"
 )
 
 // syntheticCoxIntervals fabricates intervals where Duration is monotone in
 // AccessCount: higher AccessCount → shorter gap. Cox should learn a
 // positive coefficient on AccessCount (higher hazard → shorter survival).
 // All intervals are observed (no censoring) so the test is unambiguous.
-func syntheticCoxIntervals(n int) []model.InterAccessInterval {
+func syntheticCoxIntervals(n int) []domain.InterAccessInterval {
 	r := rand.New(rand.NewPCG(7, 11))
-	out := make([]model.InterAccessInterval, 0, n)
+	out := make([]domain.InterAccessInterval, 0, n)
 	for i := 0; i < n; i++ {
 		ac := uint64(r.IntN(20))
 		// Inverse relationship + jitter, clamped to >=1.
 		base := 100.0 / float64(ac+1)
 		dur := uint64(math.Max(1, base+r.NormFloat64()*2))
-		out = append(out, model.InterAccessInterval{
+		out = append(out, domain.InterAccessInterval{
 			SlotID:      fmt.Sprintf("s%d", i),
 			Duration:    dur,
 			IsObserved:  true,
@@ -32,8 +32,8 @@ func syntheticCoxIntervals(n int) []model.InterAccessInterval {
 			// same collinearity pitfall the Phase-1 mock has.
 			ContractAge:  uint64(i * 10),
 			SlotAge:      uint64(i*7 + r.IntN(5)),
-			ContractType: model.ContractERC20,
-			SlotType:     model.SlotTypeBalance,
+			ContractType: domain.ContractERC20,
+			SlotType:     domain.SlotTypeBalance,
 		})
 	}
 	return out
@@ -162,7 +162,7 @@ func TestFitCoxPH_OnMockEndToEnd(t *testing.T) {
 	cfg.SlotsPerContractXmin = 5
 	cfg.SlotsPerContractMax = 30
 	cfg.TotalBlocks = 20_000
-	cfg.Window = model.ObservationWindow{Start: 4_000, End: 20_000}
+	cfg.Window = domain.ObservationWindow{Start: 4_000, End: 20_000}
 	cfg.AccessRateXmin = 1e-4
 	cfg.MaxEventsPerSlot = 200
 	cfg.PeriodBlocks = 2_000

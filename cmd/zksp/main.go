@@ -15,6 +15,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"sort"
@@ -24,11 +25,11 @@ import (
 
 	"github.com/egpivo/zk-state-prune/internal/analysis"
 	"github.com/egpivo/zk-state-prune/internal/app"
-	"github.com/egpivo/zk-state-prune/internal/app/render"
 	"github.com/egpivo/zk-state-prune/internal/config"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 	"github.com/egpivo/zk-state-prune/internal/extractor"
-	"github.com/egpivo/zk-state-prune/internal/model"
-	"github.com/egpivo/zk-state-prune/internal/pruning"
+	"github.com/egpivo/zk-state-prune/internal/render"
+	"github.com/egpivo/zk-state-prune/internal/sim"
 	"github.com/egpivo/zk-state-prune/internal/storage"
 )
 
@@ -62,6 +63,11 @@ func emitJSON(w io.Writer, v any) error {
 }
 
 var version = "0.1.0-dev"
+
+// rpcHTTPClientOverride is a test hook that replaces the HTTP client used by
+// the RPC extractor. The sandbox this repo runs under disallows binding
+// httptest servers, so cmd tests inject a custom RoundTripper instead.
+var rpcHTTPClientOverride func() *http.Client
 
 const (
 	defaultDBPath      = "zksp.db"
@@ -140,7 +146,7 @@ func openDB(ctx context.Context, path string) (*storage.DB, error) {
 // loadIntervals is the common (open → BuildIntervals) preamble for fit /
 // simulate / report. It returns the closed-over DB so the caller can use
 // it for follow-up queries; callers must defer Close themselves.
-func loadIntervals(ctx context.Context, db *storage.DB, w model.ObservationWindow) (analysis.IntervalBuildResult, error) {
+func loadIntervals(ctx context.Context, db *storage.DB, w domain.ObservationWindow) (analysis.IntervalBuildResult, error) {
 	built, err := analysis.BuildIntervals(ctx, db, w)
 	if err != nil {
 		return analysis.IntervalBuildResult{}, fmt.Errorf("build intervals: %w", err)
@@ -174,15 +180,15 @@ func addCostFlags(cmd *cobra.Command, ramUnit, missPen *float64) {
 // If the user did not pass a cost flag explicitly, fall back to
 // globalCfg (which PersistentPreRunE has now populated from YAML).
 // This is how we honour "YAML overrides hardcoded defaults; CLI flags
-// override YAML" with cobra's flag-default-at-construction-time model.
-func costsFromFlags(cmd *cobra.Command, ramUnit, missPen float64) pruning.CostParams {
+// override YAML" with cobra's flag-default-at-construction-time domain.
+func costsFromFlags(cmd *cobra.Command, ramUnit, missPen float64) sim.CostParams {
 	if !cmd.Flags().Changed("ram-unit-cost") {
 		ramUnit = globalCfg.Pruning.Cost.RAMUnitCost
 	}
 	if !cmd.Flags().Changed("miss-penalty") {
 		missPen = globalCfg.Pruning.Cost.MissPenalty
 	}
-	return pruning.CostParams{RAMUnitCost: ramUnit, MissPenalty: missPen}
+	return sim.CostParams{RAMUnitCost: ramUnit, MissPenalty: missPen}
 }
 
 // ---------------------------------------------------------------- extract
@@ -277,7 +283,7 @@ func runMockExtract(ctx context.Context, output string, seed uint64, numContract
 	if totalBlocks > 0 {
 		cfg.TotalBlocks = totalBlocks
 		if cfg.Window.End > totalBlocks || cfg.Window.End == 0 {
-			cfg.Window = model.ObservationWindow{Start: totalBlocks / 5, End: totalBlocks}
+			cfg.Window = domain.ObservationWindow{Start: totalBlocks / 5, End: totalBlocks}
 		}
 	}
 	slog.Info("extract begin",
@@ -334,6 +340,9 @@ func runRPCExtract(ctx context.Context, output, endpoint string, start, end uint
 	cfg.Endpoint = endpoint
 	cfg.Start = start
 	cfg.End = end
+	if rpcHTTPClientOverride != nil {
+		cfg.HTTPClient = rpcHTTPClientOverride()
+	}
 	slog.Info("extract begin",
 		"source", "rpc",
 		"endpoint", cfg.Endpoint,
@@ -375,7 +384,7 @@ func newEDACmd() *cobra.Command {
 				return err
 			}
 			defer db.Close()
-			rep, err := analysis.RunEDAFull(ctx, db, model.ObservationWindow{Start: startBlock, End: endBlock})
+			rep, err := analysis.RunEDAFull(ctx, db, domain.ObservationWindow{Start: startBlock, End: endBlock})
 			if err != nil {
 				return fmt.Errorf("eda: %w", err)
 			}
@@ -409,7 +418,7 @@ func newFitCmd() *cobra.Command {
 				return err
 			}
 			defer db.Close()
-			window := model.ObservationWindow{Start: startBlock, End: endBlock}
+			window := domain.ObservationWindow{Start: startBlock, End: endBlock}
 			built, err := loadIntervals(ctx, db, window)
 			if err != nil {
 				return err
@@ -444,7 +453,7 @@ func newFitCmd() *cobra.Command {
 	return cmd
 }
 
-func runKMFit(out io.Writer, fitter analysis.SurvivalFitter, intervals []model.InterAccessInterval, stratify string, format outputFormat) error {
+func runKMFit(out io.Writer, fitter analysis.SurvivalFitter, intervals []domain.InterAccessInterval, stratify string, format outputFormat) error {
 	var curves []*analysis.KMResult
 	if stratify == "none" || stratify == "" {
 		res, err := fitter.FitKaplanMeier(intervals)
@@ -454,7 +463,7 @@ func runKMFit(out io.Writer, fitter analysis.SurvivalFitter, intervals []model.I
 		res.Label = "all"
 		curves = []*analysis.KMResult{res}
 	} else {
-		var key func(model.InterAccessInterval) string
+		var key func(domain.InterAccessInterval) string
 		switch stratify {
 		case "contract-type", "contract":
 			key = analysis.StratumByContractType
@@ -492,7 +501,7 @@ func runKMFit(out io.Writer, fitter analysis.SurvivalFitter, intervals []model.I
 func runCoxFit(
 	out io.Writer,
 	fitter analysis.StatmodelFitter,
-	intervals []model.InterAccessInterval,
+	intervals []domain.InterAccessInterval,
 	holdoutFrac float64,
 	splitSeed uint64,
 	tauFlag uint64,
@@ -540,16 +549,16 @@ func newSimulateCmd() *cobra.Command {
 				return err
 			}
 			defer db.Close()
-			built, err := loadIntervals(ctx, db, model.ObservationWindow{Start: startBlock, End: endBlock})
+			built, err := loadIntervals(ctx, db, domain.ObservationWindow{Start: startBlock, End: endBlock})
 			if err != nil {
 				return err
 			}
 			costs := costsFromFlags(cmd, ramUnit, missPen)
 
-			var deps pruning.PolicyDeps
+			var deps sim.PolicyDeps
 			if policyName == "statistical" || policyName == "statistical-robust" {
 				useRobust := robust || policyName == "statistical-robust"
-				var p *pruning.StatisticalPolicy
+				var p *sim.StatisticalPolicy
 				if modelPath != "" {
 					// Load a previously persisted model and wrap it
 					// in a statistical policy — skipping the full fit
@@ -580,19 +589,19 @@ func newSimulateCmd() *cobra.Command {
 			} else if modelPath != "" {
 				return fmt.Errorf("--model is only meaningful with --policy statistical[-robust]")
 			}
-			policy, err := pruning.PolicyByName(policyName, deps)
+			policy, err := sim.PolicyByName(policyName, deps)
 			if err != nil {
 				return err
 			}
 
-			res, err := pruning.Run(policy, built.Intervals, costs)
+			res, err := sim.Run(policy, built.Intervals, costs)
 			if err != nil {
 				return fmt.Errorf("simulate: %w", err)
 			}
 			if outputFormat(format).isJSON() {
-				return emitJSON(cmd.OutOrStdout(), []*pruning.SimResult{res})
+				return emitJSON(cmd.OutOrStdout(), []*sim.Result{res})
 			}
-			return render.SimResults(cmd.OutOrStdout(), []*pruning.SimResult{res})
+			return render.SimResults(cmd.OutOrStdout(), []*sim.Result{res})
 		},
 	}
 	cmd.Flags().StringVar(&dbPath, "db", defaultDBPath, "SQLite DB path")
@@ -617,7 +626,7 @@ func newSimulateCmd() *cobra.Command {
 type fullReport struct {
 	EDA      *analysis.EDAReport  `json:"eda"`
 	KMCurves []*analysis.KMResult `json:"km_curves"`
-	Tiering  []*pruning.SimResult `json:"tiering"`
+	Tiering  []*sim.Result        `json:"tiering"`
 	Cox      *app.CoxFitReport    `json:"cox,omitempty"`
 }
 
@@ -635,7 +644,7 @@ func newReportCmd() *cobra.Command {
 				return err
 			}
 			defer db.Close()
-			window := model.ObservationWindow{Start: startBlock, End: endBlock}
+			window := domain.ObservationWindow{Start: startBlock, End: endBlock}
 			out := cmd.OutOrStdout()
 			fmtMode := outputFormat(format)
 
@@ -663,7 +672,7 @@ func newReportCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			results, err := pruning.RunAll(policies, built.Intervals, costs)
+			results, err := sim.RunAll(policies, built.Intervals, costs)
 			if err != nil {
 				return fmt.Errorf("run all policies: %w", err)
 			}
@@ -699,7 +708,7 @@ func newReportCmd() *cobra.Command {
 // then strata alphabetically) order for the KM section of `report`.
 func buildReportKMCurves(
 	fitter analysis.StatmodelFitter,
-	intervals []model.InterAccessInterval,
+	intervals []domain.InterAccessInterval,
 ) ([]*analysis.KMResult, error) {
 	overall, err := fitter.FitKaplanMeier(intervals)
 	if err != nil {
@@ -730,12 +739,12 @@ func buildReportKMCurves(
 // failures as a warning so the report still renders the baselines
 // and the other statistical variant.
 func buildReportPolicies(
-	intervals []model.InterAccessInterval,
-	costs pruning.CostParams,
+	intervals []domain.InterAccessInterval,
+	costs sim.CostParams,
 	modelPath string,
-) ([]pruning.Policy, error) {
-	policies := []pruning.Policy{pruning.NoPrune{}, pruning.Fixed30d, pruning.Fixed90d}
-	build := func(robust bool) (*pruning.StatisticalPolicy, error) {
+) ([]sim.Policy, error) {
+	policies := []sim.Policy{sim.NoPrune{}, sim.Fixed30d, sim.Fixed90d}
+	build := func(robust bool) (*sim.StatisticalPolicy, error) {
 		if modelPath != "" {
 			loaded, err := analysis.LoadModelFile(modelPath)
 			if err != nil {
@@ -773,7 +782,7 @@ func renderReportText(
 	out io.Writer,
 	eda *analysis.EDAReport,
 	curves []*analysis.KMResult,
-	results []*pruning.SimResult,
+	results []*sim.Result,
 	coxReport *app.CoxFitReport,
 	coxErr error,
 ) error {

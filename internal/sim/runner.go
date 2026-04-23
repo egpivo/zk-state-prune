@@ -1,16 +1,22 @@
-package pruning
+package sim
 
 import (
 	"fmt"
 
-	"github.com/egpivo/zk-state-prune/internal/model"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 )
 
+// Runner simulates tiering policies over survival intervals and scores them
+// under a CostParams budget.
+type Runner struct {
+	Costs CostParams
+}
+
 // Run simulates a tiering policy over a precomputed slice of survival
-// intervals and scores it under a CostParams budget. The simulator is a
-// pure function over intervals: no random state, no wall clock, and no
-// dependency on raw access events, which makes it trivially deterministic
-// and cheap to run across many policies back-to-back.
+// intervals and scores it under r.Costs. The runner is a pure function over
+// intervals: no random state, no wall clock, and no dependency on raw access
+// events, which makes it trivially deterministic and cheap to run across
+// many policies back-to-back.
 //
 // Semantics per interval (gap time from previous access to next event or
 // window end):
@@ -27,12 +33,12 @@ import (
 // TotalCost = SlotBlocksHot × RAMUnitCost + Reactivations × MissPenalty,
 // which is the surrogate score the statistical policy minimizes
 // slot-by-slot.
-func Run(policy Policy, intervals []model.InterAccessInterval, costs CostParams) (*SimResult, error) {
+func (r Runner) Run(policy Policy, intervals []domain.InterAccessInterval) (*Result, error) {
 	if policy == nil {
-		return nil, fmt.Errorf("pruning.Run: nil policy")
+		return nil, fmt.Errorf("sim.Runner.Run: nil policy")
 	}
 
-	res := &SimResult{Policy: policy.Name()}
+	res := &Result{Policy: policy.Name()}
 	slotFinalPruned := make(map[string]bool)
 
 	for _, it := range intervals {
@@ -86,8 +92,8 @@ func Run(policy Policy, intervals []model.InterAccessInterval, costs CostParams)
 		res.HotHitCoverage = 1
 	}
 
-	res.RAMCost = float64(res.SlotBlocksHot) * costs.RAMUnitCost
-	res.MissPenaltyAgg = float64(res.Reactivations) * costs.MissPenalty
+	res.RAMCost = float64(res.SlotBlocksHot) * r.Costs.RAMUnitCost
+	res.MissPenaltyAgg = float64(res.Reactivations) * r.Costs.MissPenalty
 	res.TotalCost = res.RAMCost + res.MissPenaltyAgg
 	return res, nil
 }
@@ -95,14 +101,24 @@ func Run(policy Policy, intervals []model.InterAccessInterval, costs CostParams)
 // RunAll runs every policy against the same intervals and returns the
 // results in the order the policies were passed. Convenience wrapper for
 // the comparison report.
-func RunAll(policies []Policy, intervals []model.InterAccessInterval, costs CostParams) ([]*SimResult, error) {
-	out := make([]*SimResult, 0, len(policies))
+func (r Runner) RunAll(policies []Policy, intervals []domain.InterAccessInterval) ([]*Result, error) {
+	out := make([]*Result, 0, len(policies))
 	for _, p := range policies {
-		r, err := Run(p, intervals, costs)
+		res, err := r.Run(p, intervals)
 		if err != nil {
 			return nil, fmt.Errorf("policy %q: %w", p.Name(), err)
 		}
-		out = append(out, r)
+		out = append(out, res)
 	}
 	return out, nil
+}
+
+// Run is a convenience wrapper around Runner{Costs: costs}.Run.
+func Run(policy Policy, intervals []domain.InterAccessInterval, costs CostParams) (*Result, error) {
+	return Runner{Costs: costs}.Run(policy, intervals)
+}
+
+// RunAll is a convenience wrapper around Runner{Costs: costs}.RunAll.
+func RunAll(policies []Policy, intervals []domain.InterAccessInterval, costs CostParams) ([]*Result, error) {
+	return Runner{Costs: costs}.RunAll(policies, intervals)
 }

@@ -1,17 +1,17 @@
-package pruning
+package sim
 
 import (
 	"math"
 	"testing"
 
-	"github.com/egpivo/zk-state-prune/internal/model"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 )
 
 // constPredict returns a fixed probability regardless of the interval
 // and idle duration. Lets the unit tests pin the policy output
 // deterministically when the T*-search isn't the thing under test.
 func constPredict(p float64) CondAccessProbFunc {
-	return func(_ model.InterAccessInterval, _ float64) float64 { return p }
+	return func(_ domain.InterAccessInterval, _ float64) float64 { return p }
 }
 
 func TestStatisticalPolicy_PStarComputation(t *testing.T) {
@@ -40,7 +40,7 @@ func TestStatisticalPolicy_DemotesWhenProbBelowPStarFromIdleZero(t *testing.T) {
 	// Constant p = 0.2 everywhere < p* = 0.5 → policy demotes at u=0
 	// and the slot is fully cold for its entire interval.
 	p, _ := NewStatisticalPolicy("s", constPredict(0.2), 10, CostParams{RAMUnitCost: 5, MissPenalty: 100})
-	got := p.HotBlocks(model.InterAccessInterval{Duration: 100})
+	got := p.HotBlocks(domain.InterAccessInterval{Duration: 100})
 	if got != 0 {
 		t.Errorf("HotBlocks=%d want 0 (demoted at u=0)", got)
 	}
@@ -49,7 +49,7 @@ func TestStatisticalPolicy_DemotesWhenProbBelowPStarFromIdleZero(t *testing.T) {
 func TestStatisticalPolicy_KeepsHotWhenProbAbovePStarEverywhere(t *testing.T) {
 	// Constant p = 0.9 > p* = 0.5 at every idle duration → never demotes.
 	p, _ := NewStatisticalPolicy("s", constPredict(0.9), 10, CostParams{RAMUnitCost: 5, MissPenalty: 100})
-	got := p.HotBlocks(model.InterAccessInterval{Duration: 100})
+	got := p.HotBlocks(domain.InterAccessInterval{Duration: 100})
 	if got != 100 {
 		t.Errorf("HotBlocks=%d want 100 (kept hot)", got)
 	}
@@ -61,14 +61,14 @@ func TestStatisticalPolicy_MidIntervalTransition(t *testing.T) {
 	// interval. With N=20 samples over Duration=100, the sampling grid
 	// has 5-block spacing; asking the predict function to flip at
 	// u=50 lets us check the crossover lands within that step.
-	predict := func(_ model.InterAccessInterval, idle float64) float64 {
+	predict := func(_ domain.InterAccessInterval, idle float64) float64 {
 		if idle < 50 {
 			return 0.9
 		}
 		return 0.05
 	}
 	p, _ := NewStatisticalPolicy("s", predict, 10, CostParams{RAMUnitCost: 5, MissPenalty: 100}) // p* = 0.5
-	got := p.HotBlocks(model.InterAccessInterval{Duration: 100})
+	got := p.HotBlocks(domain.InterAccessInterval{Duration: 100})
 	// Search grid is 0, 5, 10, …, 100 at 5-block spacing. The first u
 	// with p < p* is 50. Allow ±5 slack for the grid.
 	if got < 45 || got > 55 {
@@ -80,15 +80,15 @@ func TestStatisticalPolicy_PerSlotBranching(t *testing.T) {
 	// Predict: high for slot "hot", low for slot "cold". Verify the
 	// policy reads the interval and branches accordingly. Idle is
 	// ignored so both slots produce the same decision at every u.
-	predict := func(it model.InterAccessInterval, _ float64) float64 {
+	predict := func(it domain.InterAccessInterval, _ float64) float64 {
 		if it.SlotID == "hot" {
 			return 0.9
 		}
 		return 0.01
 	}
 	p, _ := NewStatisticalPolicy("s", predict, 10, CostParams{RAMUnitCost: 5, MissPenalty: 100}) // p* = 0.5
-	hot := p.HotBlocks(model.InterAccessInterval{SlotID: "hot", Duration: 100})
-	cold := p.HotBlocks(model.InterAccessInterval{SlotID: "cold", Duration: 100})
+	hot := p.HotBlocks(domain.InterAccessInterval{SlotID: "hot", Duration: 100})
+	cold := p.HotBlocks(domain.InterAccessInterval{SlotID: "cold", Duration: 100})
 	if hot != 100 || cold != 0 {
 		t.Errorf("hot=%d cold=%d, want 100,0", hot, cold)
 	}
@@ -122,7 +122,7 @@ func TestStatisticalPolicy_RunsThroughSimulator(t *testing.T) {
 	// end of the interval landed on the cold slot). The second
 	// interval (censored trailing tail) demotes immediately because
 	// its idle is counted from 0 and the same predict kicks in at 10.
-	predict := func(_ model.InterAccessInterval, idle float64) float64 {
+	predict := func(_ domain.InterAccessInterval, idle float64) float64 {
 		if idle < 10 {
 			return 0.9
 		}
@@ -130,7 +130,7 @@ func TestStatisticalPolicy_RunsThroughSimulator(t *testing.T) {
 	}
 	p, _ := NewStatisticalPolicy("s", predict, 1, CostParams{RAMUnitCost: 1, MissPenalty: 10}) // p* = 0.1
 
-	ivs := []model.InterAccessInterval{
+	ivs := []domain.InterAccessInterval{
 		{SlotID: "x", IntervalStart: 0, Duration: 20, IsObserved: true},
 		{SlotID: "x", IntervalStart: 20, Duration: 100, IsObserved: false},
 	}

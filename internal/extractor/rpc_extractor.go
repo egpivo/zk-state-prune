@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/egpivo/zk-state-prune/internal/model"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 	"github.com/egpivo/zk-state-prune/internal/storage"
 )
 
@@ -148,7 +148,7 @@ func (e *RPCExtractor) Extract(ctx context.Context, db *storage.DB) error {
 	state := &rpcRunState{
 		contracts: make(map[string]*contractState),
 		slots:     make(map[string]*slotState),
-		eventBuf:  make([]model.AccessEvent, 0, e.cfg.BatchSize),
+		eventBuf:  make([]domain.AccessEvent, 0, e.cfg.BatchSize),
 	}
 	flush := func() error { return state.flush(ctx, db, &e.last) }
 
@@ -182,7 +182,7 @@ func (e *RPCExtractor) Extract(ctx context.Context, db *storage.DB) error {
 type rpcRunState struct {
 	contracts map[string]*contractState
 	slots     map[string]*slotState
-	eventBuf  []model.AccessEvent
+	eventBuf  []domain.AccessEvent
 }
 
 // flush persists the buffered events. INSERT OR IGNORE means resume
@@ -262,10 +262,10 @@ func (e *RPCExtractor) handleTransferLog(
 		if err := e.upsertSlotIfNew(ctx, db, lg.Address, holderTopic, blockNum, state); err != nil {
 			return err
 		}
-		state.eventBuf = append(state.eventBuf, model.AccessEvent{
+		state.eventBuf = append(state.eventBuf, domain.AccessEvent{
 			SlotID:      slotID,
 			BlockNumber: blockNum,
-			AccessType:  model.AccessWrite,
+			AccessType:  domain.AccessWrite,
 			TxHash:      txHash,
 		})
 		if len(state.eventBuf) >= e.cfg.BatchSize {
@@ -290,7 +290,7 @@ func (e *RPCExtractor) upsertContractIfNew(
 	}
 	state.contracts[lg.Address] = c
 	e.last.ContractsCreated++
-	if err := db.UpsertContract(ctx, model.ContractMeta{
+	if err := db.UpsertContract(ctx, domain.ContractMeta{
 		Address:      c.address,
 		ContractType: c.category,
 		DeployBlock:  c.deployBlock,
@@ -311,12 +311,12 @@ func (e *RPCExtractor) upsertSlotIfNew(
 		slotID:       slotID,
 		contractAddr: contractAddr,
 		slotIndex:    slotIndexFor(contractAddr, holderTopic),
-		slotType:     model.SlotTypeBalance,
+		slotType:     domain.SlotTypeBalance,
 		createdAt:    blockNum,
 	}
 	state.slots[slotID] = s
 	e.last.SlotsCreated++
-	if err := db.UpsertSlot(ctx, model.StateSlot{
+	if err := db.UpsertSlot(ctx, domain.StateSlot{
 		SlotID:       s.slotID,
 		ContractAddr: s.contractAddr,
 		SlotIndex:    s.slotIndex,
@@ -338,7 +338,7 @@ func (e *RPCExtractor) upsertSlotIfNew(
 // analysis passes already recompute counters from access_events.
 type contractState struct {
 	address     string
-	category    model.ContractCategory
+	category    domain.ContractCategory
 	deployBlock uint64
 }
 
@@ -346,7 +346,7 @@ type slotState struct {
 	slotID       string
 	contractAddr string
 	slotIndex    uint64
-	slotType     model.SlotType
+	slotType     domain.SlotType
 	createdAt    uint64
 }
 
@@ -365,14 +365,14 @@ func isTransferLog(lg rpcLog) bool {
 // log. ERC-20 carries the value in `data` and has exactly 3 topics;
 // ERC-721 carries tokenId as topics[3] and has 4. Anything else lands
 // in ContractOther for manual follow-up.
-func classifyFromLog(lg rpcLog) model.ContractCategory {
+func classifyFromLog(lg rpcLog) domain.ContractCategory {
 	switch len(lg.Topics) {
 	case 3:
-		return model.ContractERC20
+		return domain.ContractERC20
 	case 4:
-		return model.ContractNFT
+		return domain.ContractNFT
 	default:
-		return model.ContractOther
+		return domain.ContractOther
 	}
 }
 

@@ -10,7 +10,7 @@ import (
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver
 
-	"github.com/egpivo/zk-state-prune/internal/model"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 )
 
 // DB is a thin wrapper around *sql.DB that exposes typed helpers.
@@ -53,7 +53,7 @@ func (d *DB) Close() error { return d.sql.Close() }
 func (d *DB) SQL() *sql.DB { return d.sql }
 
 // UpsertContract inserts a contract row or updates its mutable fields.
-func (d *DB) UpsertContract(ctx context.Context, c model.ContractMeta) error {
+func (d *DB) UpsertContract(ctx context.Context, c domain.ContractMeta) error {
 	_, err := d.sql.ExecContext(ctx,
 		`INSERT INTO contracts(address, contract_type, deploy_block, total_slots, active_slots)
 		 VALUES(?, ?, ?, ?, ?)
@@ -71,7 +71,7 @@ func (d *DB) UpsertContract(ctx context.Context, c model.ContractMeta) error {
 }
 
 // UpsertSlot inserts a slot row or refreshes its lifecycle fields.
-func (d *DB) UpsertSlot(ctx context.Context, s model.StateSlot) error {
+func (d *DB) UpsertSlot(ctx context.Context, s domain.StateSlot) error {
 	active := 0
 	if s.IsActive {
 		active = 1
@@ -100,7 +100,7 @@ func (d *DB) UpsertSlot(ctx context.Context, s model.StateSlot) error {
 // report "events persisted" instead of "events attempted".
 // Extractors should batch into reasonable chunks (~10k) to keep
 // memory bounded while still amortizing the per-statement overhead.
-func (d *DB) InsertAccessEvents(ctx context.Context, events []model.AccessEvent) (int64, error) {
+func (d *DB) InsertAccessEvents(ctx context.Context, events []domain.AccessEvent) (int64, error) {
 	if len(events) == 0 {
 		return 0, nil
 	}
@@ -179,8 +179,8 @@ func (d *DB) Reset(ctx context.Context) error {
 // contract's deploy block (so ContractAge can be distinct from SlotAge),
 // so we ship the whole bundle from a single join.
 type SlotWithMeta struct {
-	Slot        model.StateSlot
-	Category    model.ContractCategory
+	Slot        domain.StateSlot
+	Category    domain.ContractCategory
 	DeployBlock uint64
 }
 
@@ -194,7 +194,7 @@ type SlotWithMeta struct {
 // largest single slot's trace rather than the full event table.
 func (d *DB) IterateSlotEvents(
 	ctx context.Context,
-	fn func(SlotWithMeta, []model.AccessEvent) error,
+	fn func(SlotWithMeta, []domain.AccessEvent) error,
 ) error {
 	meta, order, err := d.loadSlotMeta(ctx)
 	if err != nil {
@@ -214,7 +214,7 @@ func (d *DB) IterateSlotEvents(
 func (d *DB) streamSlotEvents(
 	ctx context.Context,
 	meta map[string]SlotWithMeta,
-	fn func(SlotWithMeta, []model.AccessEvent) error,
+	fn func(SlotWithMeta, []domain.AccessEvent) error,
 ) (map[string]bool, error) {
 	rows, err := d.sql.QueryContext(ctx, `
 		SELECT slot_id, block_number, access_type, tx_hash
@@ -228,7 +228,7 @@ func (d *DB) streamSlotEvents(
 	seen := make(map[string]bool, len(meta))
 	var (
 		curID string
-		buf   []model.AccessEvent
+		buf   []domain.AccessEvent
 	)
 	flush := func() error {
 		if curID == "" {
@@ -247,12 +247,12 @@ func (d *DB) streamSlotEvents(
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		var e model.AccessEvent
+		var e domain.AccessEvent
 		var at string
 		if err := rows.Scan(&e.SlotID, &e.BlockNumber, &at, &e.TxHash); err != nil {
 			return nil, fmt.Errorf("scan event: %w", err)
 		}
-		e.AccessType = model.ParseAccessType(at)
+		e.AccessType = domain.ParseAccessType(at)
 		if e.SlotID != curID {
 			if err := flush(); err != nil {
 				return nil, err
@@ -279,7 +279,7 @@ func emitUnseenSlots(
 	order []string,
 	seen map[string]bool,
 	meta map[string]SlotWithMeta,
-	fn func(SlotWithMeta, []model.AccessEvent) error,
+	fn func(SlotWithMeta, []domain.AccessEvent) error,
 ) error {
 	for _, id := range order {
 		if seen[id] {
@@ -312,7 +312,7 @@ func (d *DB) loadSlotMeta(ctx context.Context) (map[string]SlotWithMeta, []strin
 	order := make([]string, 0)
 	for rows.Next() {
 		var (
-			s             model.StateSlot
+			s             domain.StateSlot
 			slotType, cat string
 			active        int
 			deployBlock   uint64
@@ -324,11 +324,11 @@ func (d *DB) loadSlotMeta(ctx context.Context) (map[string]SlotWithMeta, []strin
 		); err != nil {
 			return nil, nil, fmt.Errorf("scan slot: %w", err)
 		}
-		s.SlotType = model.ParseSlotType(slotType)
+		s.SlotType = domain.ParseSlotType(slotType)
 		s.IsActive = active != 0
 		meta[s.SlotID] = SlotWithMeta{
 			Slot:        s,
-			Category:    model.ParseContractCategory(cat),
+			Category:    domain.ParseContractCategory(cat),
 			DeployBlock: deployBlock,
 		}
 		order = append(order, s.SlotID)

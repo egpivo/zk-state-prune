@@ -7,11 +7,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/egpivo/zk-state-prune/internal/model"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 )
 
 // schemaVersion is the current on-disk schema version. Bumps whenever
-// model.Schema adds a constraint that could fail on existing rows, so
+// domain.Schema adds a constraint that could fail on existing rows, so
 // the migration path can dedup / backfill before the new DDL runs.
 //
 // History:
@@ -37,7 +37,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			return fmt.Errorf("dedup access_events before unique index: %w", err)
 		}
 	}
-	if _, err := db.ExecContext(ctx, model.Schema); err != nil {
+	if _, err := db.ExecContext(ctx, domain.Schema); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
 	}
 	if _, err := db.ExecContext(ctx,

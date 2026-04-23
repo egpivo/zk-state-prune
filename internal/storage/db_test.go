@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/egpivo/zk-state-prune/internal/model"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 )
 
 func TestOpenAndRoundTrip(t *testing.T) {
@@ -19,9 +19,9 @@ func TestOpenAndRoundTrip(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	contract := model.ContractMeta{
+	contract := domain.ContractMeta{
 		Address:      "0xabc",
-		ContractType: model.ContractERC20,
+		ContractType: domain.ContractERC20,
 		DeployBlock:  100,
 		TotalSlots:   2,
 		ActiveSlots:  2,
@@ -30,9 +30,9 @@ func TestOpenAndRoundTrip(t *testing.T) {
 		t.Fatalf("UpsertContract: %v", err)
 	}
 
-	slots := []model.StateSlot{
-		{SlotID: "s1", ContractAddr: "0xabc", SlotIndex: 0, SlotType: model.SlotTypeBalance, CreatedAt: 100, LastAccess: 150, AccessCount: 3, IsActive: true},
-		{SlotID: "s2", ContractAddr: "0xabc", SlotIndex: 1, SlotType: model.SlotTypeMapping, CreatedAt: 110, LastAccess: 200, AccessCount: 1, IsActive: true},
+	slots := []domain.StateSlot{
+		{SlotID: "s1", ContractAddr: "0xabc", SlotIndex: 0, SlotType: domain.SlotTypeBalance, CreatedAt: 100, LastAccess: 150, AccessCount: 3, IsActive: true},
+		{SlotID: "s2", ContractAddr: "0xabc", SlotIndex: 1, SlotType: domain.SlotTypeMapping, CreatedAt: 110, LastAccess: 200, AccessCount: 1, IsActive: true},
 	}
 	for _, s := range slots {
 		if err := db.UpsertSlot(ctx, s); err != nil {
@@ -40,11 +40,11 @@ func TestOpenAndRoundTrip(t *testing.T) {
 		}
 	}
 
-	events := []model.AccessEvent{
-		{SlotID: "s1", BlockNumber: 100, AccessType: model.AccessWrite, TxHash: "0x1"},
-		{SlotID: "s1", BlockNumber: 130, AccessType: model.AccessRead, TxHash: "0x2"},
-		{SlotID: "s1", BlockNumber: 150, AccessType: model.AccessRead, TxHash: "0x3"},
-		{SlotID: "s2", BlockNumber: 200, AccessType: model.AccessWrite, TxHash: "0x4"},
+	events := []domain.AccessEvent{
+		{SlotID: "s1", BlockNumber: 100, AccessType: domain.AccessWrite, TxHash: "0x1"},
+		{SlotID: "s1", BlockNumber: 130, AccessType: domain.AccessRead, TxHash: "0x2"},
+		{SlotID: "s1", BlockNumber: 150, AccessType: domain.AccessRead, TxHash: "0x3"},
+		{SlotID: "s2", BlockNumber: 200, AccessType: domain.AccessWrite, TxHash: "0x4"},
 	}
 	if _, err := db.InsertAccessEvents(ctx, events); err != nil {
 		t.Fatalf("InsertAccessEvents: %v", err)
@@ -75,7 +75,7 @@ func TestMigrate_V1ToV2DedupsAccessEvents(t *testing.T) {
 	// Simulate an on-disk v1 DB that was populated by an older build
 	// which used plain INSERT (no dedup). The new migrate() must
 	// (a) spot the v1 stamp, (b) run the dedup DELETE, (c) apply
-	// model.Schema's unique index without error, and (d) stamp the
+	// domain.Schema's unique index without error, and (d) stamp the
 	// new version.
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "legacy.db")
@@ -84,13 +84,13 @@ func TestMigrate_V1ToV2DedupsAccessEvents(t *testing.T) {
 		t.Fatalf("Open #1: %v", err)
 	}
 	// Seed a slot + contract so the events have FK parents.
-	if err := db.UpsertContract(ctx, model.ContractMeta{
-		Address: "0xlegacy", ContractType: model.ContractERC20,
+	if err := db.UpsertContract(ctx, domain.ContractMeta{
+		Address: "0xlegacy", ContractType: domain.ContractERC20,
 	}); err != nil {
 		t.Fatalf("UpsertContract: %v", err)
 	}
-	if err := db.UpsertSlot(ctx, model.StateSlot{
-		SlotID: "s1", ContractAddr: "0xlegacy", SlotType: model.SlotTypeBalance,
+	if err := db.UpsertSlot(ctx, domain.StateSlot{
+		SlotID: "s1", ContractAddr: "0xlegacy", SlotType: domain.SlotTypeBalance,
 		CreatedAt: 1, LastAccess: 1, IsActive: true,
 	}); err != nil {
 		t.Fatalf("UpsertSlot: %v", err)
@@ -159,16 +159,16 @@ func TestInsertAccessEvents_IsIdempotent(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	if err := db.UpsertContract(ctx, model.ContractMeta{
+	if err := db.UpsertContract(ctx, domain.ContractMeta{
 		Address:      "0xabc",
-		ContractType: model.ContractERC20,
+		ContractType: domain.ContractERC20,
 	}); err != nil {
 		t.Fatalf("UpsertContract: %v", err)
 	}
-	if err := db.UpsertSlot(ctx, model.StateSlot{
+	if err := db.UpsertSlot(ctx, domain.StateSlot{
 		SlotID:       "s1",
 		ContractAddr: "0xabc",
-		SlotType:     model.SlotTypeBalance,
+		SlotType:     domain.SlotTypeBalance,
 		CreatedAt:    1,
 		LastAccess:   1,
 		IsActive:     true,
@@ -176,9 +176,9 @@ func TestInsertAccessEvents_IsIdempotent(t *testing.T) {
 		t.Fatalf("UpsertSlot: %v", err)
 	}
 
-	events := []model.AccessEvent{
-		{SlotID: "s1", BlockNumber: 100, AccessType: model.AccessWrite, TxHash: "0xaa"},
-		{SlotID: "s1", BlockNumber: 101, AccessType: model.AccessRead, TxHash: "0xbb"},
+	events := []domain.AccessEvent{
+		{SlotID: "s1", BlockNumber: 100, AccessType: domain.AccessWrite, TxHash: "0xaa"},
+		{SlotID: "s1", BlockNumber: 101, AccessType: domain.AccessRead, TxHash: "0xbb"},
 	}
 	inserted, err := db.InsertAccessEvents(ctx, events)
 	if err != nil {
@@ -204,8 +204,8 @@ func TestInsertAccessEvents_IsIdempotent(t *testing.T) {
 	}
 
 	// Distinct tuples still insert fine.
-	fresh := []model.AccessEvent{
-		{SlotID: "s1", BlockNumber: 102, AccessType: model.AccessWrite, TxHash: "0xcc"},
+	fresh := []domain.AccessEvent{
+		{SlotID: "s1", BlockNumber: 102, AccessType: domain.AccessWrite, TxHash: "0xcc"},
 	}
 	inserted, err = db.InsertAccessEvents(ctx, fresh)
 	if err != nil {
@@ -225,8 +225,8 @@ func TestInsertAccessEvents_IsIdempotent(t *testing.T) {
 type observedSlot struct {
 	slotID string
 	blocks []uint64
-	cat    model.ContractCategory
-	slot   model.SlotType
+	cat    domain.ContractCategory
+	slot   domain.SlotType
 }
 
 func seedIterateSlotEventsFixture(t *testing.T) *DB {
@@ -238,26 +238,26 @@ func seedIterateSlotEventsFixture(t *testing.T) *DB {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	if err := db.UpsertContract(ctx, model.ContractMeta{
-		Address: "0xaa", ContractType: model.ContractERC20, DeployBlock: 10,
+	if err := db.UpsertContract(ctx, domain.ContractMeta{
+		Address: "0xaa", ContractType: domain.ContractERC20, DeployBlock: 10,
 	}); err != nil {
 		t.Fatalf("UpsertContract: %v", err)
 	}
-	for _, s := range []model.StateSlot{
-		{SlotID: "a-slot", ContractAddr: "0xaa", SlotIndex: 0, SlotType: model.SlotTypeBalance, CreatedAt: 10, LastAccess: 300, IsActive: true},
-		{SlotID: "b-slot", ContractAddr: "0xaa", SlotIndex: 1, SlotType: model.SlotTypeMapping, CreatedAt: 10, LastAccess: 150, IsActive: true},
-		{SlotID: "c-empty", ContractAddr: "0xaa", SlotIndex: 2, SlotType: model.SlotTypeFixed, CreatedAt: 10, LastAccess: 10, IsActive: true},
+	for _, s := range []domain.StateSlot{
+		{SlotID: "a-slot", ContractAddr: "0xaa", SlotIndex: 0, SlotType: domain.SlotTypeBalance, CreatedAt: 10, LastAccess: 300, IsActive: true},
+		{SlotID: "b-slot", ContractAddr: "0xaa", SlotIndex: 1, SlotType: domain.SlotTypeMapping, CreatedAt: 10, LastAccess: 150, IsActive: true},
+		{SlotID: "c-empty", ContractAddr: "0xaa", SlotIndex: 2, SlotType: domain.SlotTypeFixed, CreatedAt: 10, LastAccess: 10, IsActive: true},
 	} {
 		if err := db.UpsertSlot(ctx, s); err != nil {
 			t.Fatalf("UpsertSlot %s: %v", s.SlotID, err)
 		}
 	}
 	// Events inserted out of chronological order to exercise ORDER BY.
-	if _, err := db.InsertAccessEvents(ctx, []model.AccessEvent{
-		{SlotID: "a-slot", BlockNumber: 300, AccessType: model.AccessRead, TxHash: "0x3"},
-		{SlotID: "a-slot", BlockNumber: 100, AccessType: model.AccessWrite, TxHash: "0x1"},
-		{SlotID: "b-slot", BlockNumber: 150, AccessType: model.AccessRead, TxHash: "0x4"},
-		{SlotID: "a-slot", BlockNumber: 200, AccessType: model.AccessRead, TxHash: "0x2"},
+	if _, err := db.InsertAccessEvents(ctx, []domain.AccessEvent{
+		{SlotID: "a-slot", BlockNumber: 300, AccessType: domain.AccessRead, TxHash: "0x3"},
+		{SlotID: "a-slot", BlockNumber: 100, AccessType: domain.AccessWrite, TxHash: "0x1"},
+		{SlotID: "b-slot", BlockNumber: 150, AccessType: domain.AccessRead, TxHash: "0x4"},
+		{SlotID: "a-slot", BlockNumber: 200, AccessType: domain.AccessRead, TxHash: "0x2"},
 	}); err != nil {
 		t.Fatalf("InsertAccessEvents: %v", err)
 	}
@@ -267,7 +267,7 @@ func seedIterateSlotEventsFixture(t *testing.T) *DB {
 func collectIterateSlotEvents(t *testing.T, db *DB) map[string]observedSlot {
 	t.Helper()
 	var got []observedSlot
-	err := db.IterateSlotEvents(context.Background(), func(meta SlotWithMeta, evs []model.AccessEvent) error {
+	err := db.IterateSlotEvents(context.Background(), func(meta SlotWithMeta, evs []domain.AccessEvent) error {
 		o := observedSlot{
 			slotID: meta.Slot.SlotID,
 			cat:    meta.Category,
@@ -309,10 +309,10 @@ func assertASlotChronologicallyOrdered(t *testing.T, byID map[string]observedSlo
 func assertMetaThreadedThrough(t *testing.T, byID map[string]observedSlot) {
 	t.Helper()
 	a := byID["a-slot"]
-	if a.cat != model.ContractERC20 {
+	if a.cat != domain.ContractERC20 {
 		t.Errorf("a-slot category=%v, want ContractERC20", a.cat)
 	}
-	if a.slot != model.SlotTypeBalance {
+	if a.slot != domain.SlotTypeBalance {
 		t.Errorf("a-slot slot type=%v, want SlotTypeBalance", a.slot)
 	}
 }
@@ -350,23 +350,23 @@ func TestIterateSlotEvents_PropagatesCallbackError(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	if err := db.UpsertContract(ctx, model.ContractMeta{Address: "0xaa", ContractType: model.ContractERC20}); err != nil {
+	if err := db.UpsertContract(ctx, domain.ContractMeta{Address: "0xaa", ContractType: domain.ContractERC20}); err != nil {
 		t.Fatalf("UpsertContract: %v", err)
 	}
-	if err := db.UpsertSlot(ctx, model.StateSlot{
-		SlotID: "s1", ContractAddr: "0xaa", SlotType: model.SlotTypeBalance,
+	if err := db.UpsertSlot(ctx, domain.StateSlot{
+		SlotID: "s1", ContractAddr: "0xaa", SlotType: domain.SlotTypeBalance,
 		CreatedAt: 1, LastAccess: 1, IsActive: true,
 	}); err != nil {
 		t.Fatalf("UpsertSlot: %v", err)
 	}
-	if _, err := db.InsertAccessEvents(ctx, []model.AccessEvent{
-		{SlotID: "s1", BlockNumber: 10, AccessType: model.AccessWrite, TxHash: "0x1"},
+	if _, err := db.InsertAccessEvents(ctx, []domain.AccessEvent{
+		{SlotID: "s1", BlockNumber: 10, AccessType: domain.AccessWrite, TxHash: "0x1"},
 	}); err != nil {
 		t.Fatalf("InsertAccessEvents: %v", err)
 	}
 
 	sentinel := fmt.Errorf("sentinel")
-	err = db.IterateSlotEvents(ctx, func(SlotWithMeta, []model.AccessEvent) error {
+	err = db.IterateSlotEvents(ctx, func(SlotWithMeta, []domain.AccessEvent) error {
 		return sentinel
 	})
 	if err == nil {
@@ -382,17 +382,17 @@ func TestReset_TruncatesAllDataTables(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	if err := db.UpsertContract(ctx, model.ContractMeta{Address: "0xaa", ContractType: model.ContractERC20}); err != nil {
+	if err := db.UpsertContract(ctx, domain.ContractMeta{Address: "0xaa", ContractType: domain.ContractERC20}); err != nil {
 		t.Fatalf("UpsertContract: %v", err)
 	}
-	if err := db.UpsertSlot(ctx, model.StateSlot{
-		SlotID: "s1", ContractAddr: "0xaa", SlotType: model.SlotTypeBalance,
+	if err := db.UpsertSlot(ctx, domain.StateSlot{
+		SlotID: "s1", ContractAddr: "0xaa", SlotType: domain.SlotTypeBalance,
 		CreatedAt: 1, LastAccess: 1, IsActive: true,
 	}); err != nil {
 		t.Fatalf("UpsertSlot: %v", err)
 	}
-	if _, err := db.InsertAccessEvents(ctx, []model.AccessEvent{
-		{SlotID: "s1", BlockNumber: 10, AccessType: model.AccessWrite, TxHash: "0x1"},
+	if _, err := db.InsertAccessEvents(ctx, []domain.AccessEvent{
+		{SlotID: "s1", BlockNumber: 10, AccessType: domain.AccessWrite, TxHash: "0x1"},
 	}); err != nil {
 		t.Fatalf("InsertAccessEvents: %v", err)
 	}
@@ -424,21 +424,21 @@ func TestReset_TruncatesAllDataTables(t *testing.T) {
 }
 
 func TestParseEnumsRoundTrip(t *testing.T) {
-	cases := []model.SlotType{
-		model.SlotTypeBalance, model.SlotTypeMapping, model.SlotTypeArray,
-		model.SlotTypeFixed, model.SlotTypeUnknown,
+	cases := []domain.SlotType{
+		domain.SlotTypeBalance, domain.SlotTypeMapping, domain.SlotTypeArray,
+		domain.SlotTypeFixed, domain.SlotTypeUnknown,
 	}
 	for _, c := range cases {
-		if got := model.ParseSlotType(c.String()); got != c {
+		if got := domain.ParseSlotType(c.String()); got != c {
 			t.Errorf("SlotType round trip %v -> %q -> %v", c, c.String(), got)
 		}
 	}
-	cats := []model.ContractCategory{
-		model.ContractERC20, model.ContractDEX, model.ContractNFT,
-		model.ContractBridge, model.ContractGovernance, model.ContractOther,
+	cats := []domain.ContractCategory{
+		domain.ContractERC20, domain.ContractDEX, domain.ContractNFT,
+		domain.ContractBridge, domain.ContractGovernance, domain.ContractOther,
 	}
 	for _, c := range cats {
-		if got := model.ParseContractCategory(c.String()); got != c {
+		if got := domain.ParseContractCategory(c.String()); got != c {
 			t.Errorf("ContractCategory round trip %v -> %q -> %v", c, c.String(), got)
 		}
 	}

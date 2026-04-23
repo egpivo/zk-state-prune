@@ -25,7 +25,7 @@ const (
 var modelFileSchemaVersionsSupported = map[int]bool{1: true, 2: true, 3: true}
 
 // ModelFile is the on-disk representation of a fitted + calibrated
-// Cox model. It captures every field prediction needs (coefficients,
+// Cox domain. It captures every field prediction needs (coefficients,
 // per-predictor scaling, baseline cumulative hazard, isotonic grid,
 // conformal ε, horizon τ) plus a schema version for forward
 // compatibility. Training diagnostics (StdErr, PValue, ZScore,
@@ -244,7 +244,7 @@ func validateBaselineHazards(cp *coxPersist) error {
 }
 
 // cloneFloat2D deep-copies a [][]float64 so the persisted struct
-// doesn't retain references into the live model. Returns nil on nil
+// doesn't retain references into the live domain. Returns nil on nil
 // input so the JSON encoder's omitempty elides the field.
 func cloneFloat2D(in [][]float64) [][]float64 {
 	if in == nil {

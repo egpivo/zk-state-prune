@@ -1,8 +1,8 @@
-// Package pruning hosts the tiering policy engine, the baseline simulator,
+// Package sim hosts the tiering policy engine, the baseline runner,
 // and the evaluation metrics used to compare policies on a trace.
 //
-// "Pruning" here is shorthand for the broader hot/cold tiering decision:
-// each slot is classified into a tier and the simulator scores how well a
+// Tiering here means the broader hot/cold placement decision:
+// each slot is classified into a tier and the runner scores how well a
 // policy trades RAM (the cost of keeping a slot hot) against the miss
 // penalty (the cost of fetching a cold slot when an access actually lands
 // on it). The cost-aware decision rule a future statistical policy will
@@ -19,13 +19,13 @@
 // will be measured against. The Policy interface is deliberately narrow so
 // the simulator can stay a pure function over pre-built survival intervals
 // without growing a stateful slot-tracking loop.
-package pruning
+package sim
 
 import (
 	"fmt"
 	"strings"
 
-	"github.com/egpivo/zk-state-prune/internal/model"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 )
 
 // Policy is a tiering decision rule. Given an inter-access interval, the
@@ -53,7 +53,7 @@ type Policy interface {
 
 	// HotBlocks returns the number of blocks the slot stayed in the hot
 	// tier during this interval. Must be in [0, it.Duration].
-	HotBlocks(it model.InterAccessInterval) uint64
+	HotBlocks(it domain.InterAccessInterval) uint64
 }
 
 // NoPrune is the all-hot baseline: slots stay in the hot tier forever.
@@ -61,8 +61,8 @@ type Policy interface {
 // rate (zero).
 type NoPrune struct{}
 
-func (NoPrune) Name() string                                  { return "no-prune" }
-func (NoPrune) HotBlocks(it model.InterAccessInterval) uint64 { return it.Duration }
+func (NoPrune) Name() string                                   { return "no-prune" }
+func (NoPrune) HotBlocks(it domain.InterAccessInterval) uint64 { return it.Duration }
 
 // FixedIdle demotes any slot that has been idle for at least IdleBlocks
 // blocks. This is the strawman that statistical policies must beat.
@@ -76,7 +76,7 @@ func (f FixedIdle) Name() string { return f.Label }
 // HotBlocks: the slot is hot for the first IdleBlocks of the interval
 // and cold thereafter. If the interval is shorter than IdleBlocks the
 // slot stayed hot for its entire span.
-func (f FixedIdle) HotBlocks(it model.InterAccessInterval) uint64 {
+func (f FixedIdle) HotBlocks(it domain.InterAccessInterval) uint64 {
 	if it.Duration <= f.IdleBlocks {
 		return it.Duration
 	}

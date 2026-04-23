@@ -9,14 +9,14 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/egpivo/zk-state-prune/internal/model"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 	"github.com/egpivo/zk-state-prune/internal/storage"
 )
 
 // IntervalBuildResult bundles the interval set with the diagnostics the EDA
 // report needs. All fields are raw counts; consumers format them as rates.
 type IntervalBuildResult struct {
-	Intervals     []model.InterAccessInterval
+	Intervals     []domain.InterAccessInterval
 	RightCensored int
 	// LeftTruncatedIntervals counts intervals that carry IsLeftTrunc=true,
 	// i.e. intervals that use Window.Start as a surrogate prior access.
@@ -61,13 +61,13 @@ type IntervalBuildResult struct {
 func BuildIntervals(
 	ctx context.Context,
 	db *storage.DB,
-	window model.ObservationWindow,
+	window domain.ObservationWindow,
 ) (IntervalBuildResult, error) {
 	if window.End <= window.Start {
 		return IntervalBuildResult{}, fmt.Errorf("invalid window: [%d, %d)", window.Start, window.End)
 	}
-	res := IntervalBuildResult{Intervals: make([]model.InterAccessInterval, 0, 1024)}
-	err := db.IterateSlotEvents(ctx, func(sm storage.SlotWithMeta, events []model.AccessEvent) error {
+	res := IntervalBuildResult{Intervals: make([]domain.InterAccessInterval, 0, 1024)}
+	err := db.IterateSlotEvents(ctx, func(sm storage.SlotWithMeta, events []domain.AccessEvent) error {
 		buildIntervalsForSlot(&res, sm, events, window)
 		return nil
 	})
@@ -85,8 +85,8 @@ func BuildIntervals(
 func buildIntervalsForSlot(
 	res *IntervalBuildResult,
 	sm storage.SlotWithMeta,
-	events []model.AccessEvent,
-	window model.ObservationWindow,
+	events []domain.AccessEvent,
+	window domain.ObservationWindow,
 ) {
 	slot := sm.Slot
 	if slot.CreatedAt >= window.End {
@@ -163,7 +163,7 @@ func buildIntervalsForSlot(
 // fragile inputs for KM/Cox libraries. Storage hands us events sorted
 // by (slot_id, block_number), so "previous block equals current
 // block" is sufficient for dedup.
-func filterAndDedupEvents(events []model.AccessEvent, entry uint64, window model.ObservationWindow) []uint64 {
+func filterAndDedupEvents(events []domain.AccessEvent, entry uint64, window domain.ObservationWindow) []uint64 {
 	out := make([]uint64, 0, len(events))
 	var prevBlock uint64
 	havePrev := false
@@ -202,7 +202,7 @@ func makeEmit(res *IntervalBuildResult, sm storage.SlotWithMeta, _ uint64) func(
 		return t - contractDeploy
 	}
 	return func(start, end uint64, observed, lt bool, accessCount uint64) {
-		res.Intervals = append(res.Intervals, model.InterAccessInterval{
+		res.Intervals = append(res.Intervals, domain.InterAccessInterval{
 			SlotID:        slot.SlotID,
 			IntervalStart: start,
 			IntervalEnd:   end,

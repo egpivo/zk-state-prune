@@ -6,9 +6,9 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -146,14 +146,12 @@ func TestCLI_ExtractRPC_ForceClearsHighWater(t *testing.T) {
 	dir := withIsolatedCWD(t)
 	dbPath := filepath.Join(dir, "rpc.db")
 
-	// Set up a tiny JSON-RPC server that returns two empty blocks.
-	// No Transfer events → no event rows produced, but the high-water
-	// mark must still advance.
-	server := fakeRPCServer(t, map[uint64]fakeBlock{
-		1: {Number: 1},
-		2: {Number: 2},
-	})
-	defer server.Close()
+	// Inject a tiny JSON-RPC client that returns empty blocks/receipts.
+	// No Transfer events → no event rows produced, but the high-water mark
+	// must still advance. We can't bind an httptest server in the sandbox,
+	// so the CLI uses the override hook in main.go.
+	rpcHTTPClientOverride = func() *http.Client { return fakeRPCClient(t) }
+	t.Cleanup(func() { rpcHTTPClientOverride = nil })
 
 	// Populate the DB with mock data and then plant a stale
 	// high-water mark, simulating a previous RPC run that got to
@@ -185,7 +183,7 @@ func TestCLI_ExtractRPC_ForceClearsHighWater(t *testing.T) {
 	if _, err := runCLI(t,
 		"extract", "--source", "rpc",
 		"--output", dbPath,
-		"--rpc", server.URL,
+		"--rpc", "http://fake-rpc.invalid",
 		"--start", "1", "--end", "2",
 		"--force",
 	); err != nil {
@@ -436,14 +434,6 @@ func TestCLI_ExtractRPC_InvalidRangeErrors(t *testing.T) {
 
 // ---- tiny JSON-RPC fake -----------------------------------------------
 
-// fakeBlock is the minimal shape the RPC extractor needs for
-// eth_getBlockByNumber + eth_getBlockReceipts — just a block number,
-// no transactions, no logs. That's enough to drive the Extract loop
-// past the "fetch a block" codepath without introducing event fixtures.
-type fakeBlock struct {
-	Number uint64
-}
-
 type rpcReq struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      json.RawMessage `json:"id"`
@@ -463,26 +453,34 @@ type rpcErr struct {
 	Message string `json:"message"`
 }
 
-func fakeRPCServer(t *testing.T, blocks map[uint64]fakeBlock) *httptest.Server {
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func fakeRPCClient(t *testing.T) *http.Client {
 	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+			return nil, err
 		}
 		var req rpcReq
 		if err := json.Unmarshal(body, &req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
+			return &http.Response{
+				StatusCode: http.StatusBadRequest,
+				Body:       io.NopCloser(strings.NewReader(err.Error())),
+				Header:     make(http.Header),
+			}, nil
 		}
 		resp := rpcResp{JSONRPC: "2.0", ID: req.ID}
 		switch req.Method {
 		case "eth_getBlockByNumber":
-			// Return an empty block with just a number. The extractor
-			// doesn't care about transactions when there are no logs.
+			// Return an empty block with just a number. The extractor doesn't
+			// care about transactions when there are no logs.
+			blockHex, _ := req.Params[0].(string)
+			n, _ := strconv.ParseUint(strings.TrimPrefix(blockHex, "0x"), 16, 64)
 			resp.Result = map[string]any{
-				"number":       "0x1",
+				"number":       "0x" + strconv.FormatUint(n, 16),
 				"hash":         "0xabc",
 				"timestamp":    "0x0",
 				"transactions": []any{},
@@ -492,6 +490,16 @@ func fakeRPCServer(t *testing.T, blocks map[uint64]fakeBlock) *httptest.Server {
 		default:
 			resp.Error = &rpcErr{Code: -32601, Message: "method not found"}
 		}
-		_ = json.NewEncoder(w).Encode(resp)
-	}))
+		b, err := json.Marshal(resp)
+		if err != nil {
+			return nil, err
+		}
+		h := make(http.Header)
+		h.Set("Content-Type", "application/json")
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewReader(b)),
+			Header:     h,
+		}, nil
+	})}
 }

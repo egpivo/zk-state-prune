@@ -10,7 +10,7 @@ import (
 	"github.com/kshedden/statmodel/duration"
 	"github.com/kshedden/statmodel/statmodel"
 
-	"github.com/egpivo/zk-state-prune/internal/model"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 )
 
 // CoxResult is a fitted Cox proportional-hazards model with the bookkeeping
@@ -64,7 +64,7 @@ type CoxResult struct {
 	// (CheckPH, calibration) don't have to be re-loaded from the DB.
 	// Phase-1 sizes (≤1e5 intervals × ~100B each) make the memory cost
 	// trivial compared with the convenience of a self-contained result.
-	intervals []model.InterAccessInterval
+	intervals []domain.InterAccessInterval
 }
 
 // CovarScale records the centering / scaling applied to one predictor at
@@ -165,7 +165,7 @@ var DefaultCoxPredictors = []string{ColAccessCount, ColContractAge, ColSlotAge}
 //     standardize before the fit and store the inverse transform.
 //   - The library's "Status must be 0/1" check is satisfied by the
 //     dstream adapter's encoding of IsObserved.
-func (f StatmodelFitter) FitCoxPH(intervals []model.InterAccessInterval, covariates []string) (*CoxResult, error) {
+func (f StatmodelFitter) FitCoxPH(intervals []domain.InterAccessInterval, covariates []string) (*CoxResult, error) {
 	return f.FitCoxPHStratified(intervals, covariates, "")
 }
 
@@ -184,7 +184,7 @@ func (f StatmodelFitter) FitCoxPH(intervals []model.InterAccessInterval, covaria
 // strataColumn is empty, the fit behaves exactly like the unstratified
 // FitCoxPH and the returned CoxResult's Stratum* fields stay empty.
 func (StatmodelFitter) FitCoxPHStratified(
-	intervals []model.InterAccessInterval,
+	intervals []domain.InterAccessInterval,
 	covariates []string,
 	strataColumn string,
 ) (*CoxResult, error) {
@@ -216,7 +216,7 @@ func (StatmodelFitter) FitCoxPHStratified(
 		}
 	}
 	fillBaselineHazards(out, ph, intervals, strataColumn)
-	out.intervals = append([]model.InterAccessInterval(nil), intervals...)
+	out.intervals = append([]domain.InterAccessInterval(nil), intervals...)
 	return out, nil
 }
 
@@ -224,7 +224,7 @@ func (StatmodelFitter) FitCoxPHStratified(
 // intervals, predictor/stratum collision, duration overflow). Empty
 // covariates is fine — the caller substitutes DefaultCoxPredictors
 // after the validation barrier.
-func validateCoxInputs(intervals []model.InterAccessInterval, covariates []string, strataColumn string) error {
+func validateCoxInputs(intervals []domain.InterAccessInterval, covariates []string, strataColumn string) error {
 	if len(intervals) == 0 {
 		return fmt.Errorf("FitCoxPH: empty intervals")
 	}
@@ -325,7 +325,7 @@ func assembleCoxResult(
 // of PHReg — a single (time, cumhaz) pair for unstratified fits, or
 // per-stratum grids aligned with StratumLabels when strataColumn is
 // set.
-func fillBaselineHazards(out *CoxResult, ph *duration.PHReg, intervals []model.InterAccessInterval, strataColumn string) {
+func fillBaselineHazards(out *CoxResult, ph *duration.PHReg, intervals []domain.InterAccessInterval, strataColumn string) {
 	if strataColumn == "" {
 		t, h := ph.BaselineCumHaz(0, out.Coef)
 		out.BaselineTime = append([]float64(nil), t...)
@@ -351,7 +351,7 @@ func fillBaselineHazards(out *CoxResult, ph *duration.PHReg, intervals []model.I
 // present in intervals. Matches statmodel's ascending-sort ordering so
 // the i-th value corresponds to statmodel's stratum index i in
 // BaselineCumHaz(i, params).
-func collectUniqueStrata(intervals []model.InterAccessInterval, col string) []float64 {
+func collectUniqueStrata(intervals []domain.InterAccessInterval, col string) []float64 {
 	seen := make(map[float64]struct{})
 	for _, it := range intervals {
 		seen[rawCovariate(it, col)] = struct{}{}
@@ -382,7 +382,7 @@ func padOrCopy(xs []float64, n int) []float64 {
 // rawCovariate pulls a single covariate value out of an interval by
 // predictor-column name. Returns 0 for unknown names so callers don't
 // have to special-case missing optional predictors.
-func rawCovariate(it model.InterAccessInterval, name string) float64 {
+func rawCovariate(it domain.InterAccessInterval, name string) float64 {
 	switch name {
 	case ColAccessCount:
 		return float64(it.AccessCount)
@@ -474,7 +474,7 @@ func (r *CoxResult) baselineFor(stratumVal float64) (times, hazards []float64) {
 // SurvivalForInterval is the InterAccessInterval analogue of Survival.
 // Uses the full predictor set fit on the model, plus the stratum
 // column (if any) so stratified fits can pick the right baseline.
-func (r *CoxResult) SurvivalForInterval(it model.InterAccessInterval, t float64) float64 {
+func (r *CoxResult) SurvivalForInterval(it domain.InterAccessInterval, t float64) float64 {
 	if r == nil {
 		return 1
 	}
@@ -501,7 +501,7 @@ func (r *CoxResult) PredictAccessProb(covariates map[string]float64, tau float64
 // silently zero out any predictor outside the default set (e.g. a model
 // fit with ContractType / SlotType would be evaluated on incomplete
 // covariates and return wrong probabilities).
-func (r *CoxResult) PredictAccessProbForInterval(it model.InterAccessInterval, tau float64) float64 {
+func (r *CoxResult) PredictAccessProbForInterval(it domain.InterAccessInterval, tau float64) float64 {
 	if r == nil {
 		return 0
 	}
@@ -542,7 +542,7 @@ func baselineCumHazAt(time, hz []float64, tau float64) float64 {
 // raw [][]float64 + names so we can standardize in place before handing
 // the result to statmodel.NewDataset. Keeping it separate from
 // ToSurvivalDataset means the KM path stays untouched.
-func buildCoxColumns(intervals []model.InterAccessInterval) ([][]float64, []string) {
+func buildCoxColumns(intervals []domain.InterAccessInterval) ([][]float64, []string) {
 	n := len(intervals)
 	dur := make([]float64, n)
 	status := make([]float64, n)

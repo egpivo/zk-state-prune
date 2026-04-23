@@ -5,8 +5,8 @@ import (
 	"math"
 	"testing"
 
+	"github.com/egpivo/zk-state-prune/internal/domain"
 	"github.com/egpivo/zk-state-prune/internal/extractor"
-	"github.com/egpivo/zk-state-prune/internal/model"
 )
 
 // makeIntervals is a tiny helper: each pair (duration, observed) becomes an
@@ -15,12 +15,12 @@ import (
 func makeIntervals(pairs ...struct {
 	Dur      uint64
 	Observed bool
-	Cat      model.ContractCategory
-	Slot     model.SlotType
-}) []model.InterAccessInterval {
-	out := make([]model.InterAccessInterval, 0, len(pairs))
+	Cat      domain.ContractCategory
+	Slot     domain.SlotType
+}) []domain.InterAccessInterval {
+	out := make([]domain.InterAccessInterval, 0, len(pairs))
 	for i, p := range pairs {
-		out = append(out, model.InterAccessInterval{
+		out = append(out, domain.InterAccessInterval{
 			SlotID:        "s",
 			IntervalStart: 0,
 			IntervalEnd:   p.Dur,
@@ -41,21 +41,21 @@ func TestKaplanMeier_AllObserved(t *testing.T) {
 		struct {
 			Dur      uint64
 			Observed bool
-			Cat      model.ContractCategory
-			Slot     model.SlotType
-		}{10, true, model.ContractERC20, model.SlotTypeBalance},
+			Cat      domain.ContractCategory
+			Slot     domain.SlotType
+		}{10, true, domain.ContractERC20, domain.SlotTypeBalance},
 		struct {
 			Dur      uint64
 			Observed bool
-			Cat      model.ContractCategory
-			Slot     model.SlotType
-		}{20, true, model.ContractERC20, model.SlotTypeBalance},
+			Cat      domain.ContractCategory
+			Slot     domain.SlotType
+		}{20, true, domain.ContractERC20, domain.SlotTypeBalance},
 		struct {
 			Dur      uint64
 			Observed bool
-			Cat      model.ContractCategory
-			Slot     model.SlotType
-		}{30, true, model.ContractERC20, model.SlotTypeBalance},
+			Cat      domain.ContractCategory
+			Slot     domain.SlotType
+		}{30, true, domain.ContractERC20, domain.SlotTypeBalance},
 	)
 
 	res, err := NewStatmodelFitter().FitKaplanMeier(ivs)
@@ -88,15 +88,15 @@ func TestKaplanMeier_AllCensored(t *testing.T) {
 		struct {
 			Dur      uint64
 			Observed bool
-			Cat      model.ContractCategory
-			Slot     model.SlotType
-		}{100, false, model.ContractERC20, model.SlotTypeBalance},
+			Cat      domain.ContractCategory
+			Slot     domain.SlotType
+		}{100, false, domain.ContractERC20, domain.SlotTypeBalance},
 		struct {
 			Dur      uint64
 			Observed bool
-			Cat      model.ContractCategory
-			Slot     model.SlotType
-		}{200, false, model.ContractERC20, model.SlotTypeBalance},
+			Cat      domain.ContractCategory
+			Slot     domain.SlotType
+		}{200, false, domain.ContractERC20, domain.SlotTypeBalance},
 	)
 
 	res, err := NewStatmodelFitter().FitKaplanMeier(ivs)
@@ -121,27 +121,27 @@ func TestKaplanMeier_MixedCensoring(t *testing.T) {
 		struct {
 			Dur      uint64
 			Observed bool
-			Cat      model.ContractCategory
-			Slot     model.SlotType
-		}{10, true, model.ContractERC20, model.SlotTypeBalance},
+			Cat      domain.ContractCategory
+			Slot     domain.SlotType
+		}{10, true, domain.ContractERC20, domain.SlotTypeBalance},
 		struct {
 			Dur      uint64
 			Observed bool
-			Cat      model.ContractCategory
-			Slot     model.SlotType
-		}{20, false, model.ContractERC20, model.SlotTypeBalance},
+			Cat      domain.ContractCategory
+			Slot     domain.SlotType
+		}{20, false, domain.ContractERC20, domain.SlotTypeBalance},
 		struct {
 			Dur      uint64
 			Observed bool
-			Cat      model.ContractCategory
-			Slot     model.SlotType
-		}{30, true, model.ContractERC20, model.SlotTypeBalance},
+			Cat      domain.ContractCategory
+			Slot     domain.SlotType
+		}{30, true, domain.ContractERC20, domain.SlotTypeBalance},
 		struct {
 			Dur      uint64
 			Observed bool
-			Cat      model.ContractCategory
-			Slot     model.SlotType
-		}{40, false, model.ContractERC20, model.SlotTypeBalance},
+			Cat      domain.ContractCategory
+			Slot     domain.SlotType
+		}{40, false, domain.ContractERC20, domain.SlotTypeBalance},
 	)
 	res, err := NewStatmodelFitter().FitKaplanMeier(ivs)
 	if err != nil {
@@ -180,7 +180,7 @@ func TestFitKaplanMeierStratified_OnMock(t *testing.T) {
 	cfg.SlotsPerContractXmin = 5
 	cfg.SlotsPerContractMax = 30
 	cfg.TotalBlocks = 10_000
-	cfg.Window = model.ObservationWindow{Start: 2_000, End: 10_000}
+	cfg.Window = domain.ObservationWindow{Start: 2_000, End: 10_000}
 	cfg.AccessRateXmin = 1e-4
 	cfg.MaxEventsPerSlot = 100
 	cfg.PeriodBlocks = 1_000

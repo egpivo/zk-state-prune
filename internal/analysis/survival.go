@@ -8,7 +8,7 @@ import (
 
 	"github.com/kshedden/statmodel/duration"
 
-	"github.com/egpivo/zk-state-prune/internal/model"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 )
 
 // KMResult is a fitted Kaplan–Meier curve with the diagnostics a pruning
@@ -97,10 +97,10 @@ func (k *KMResult) SurvAt(t float64) float64 {
 // ErrNotImplemented but the interface is already final so callers can be
 // written and tested against the eventual shape.
 type SurvivalFitter interface {
-	FitKaplanMeier(intervals []model.InterAccessInterval) (*KMResult, error)
-	FitCoxPH(intervals []model.InterAccessInterval, covariates []string) (*CoxResult, error)
+	FitKaplanMeier(intervals []domain.InterAccessInterval) (*KMResult, error)
+	FitCoxPH(intervals []domain.InterAccessInterval, covariates []string) (*CoxResult, error)
 	CheckPH(result *CoxResult) (*PHTestResult, error)
-	Calibrate(result *CoxResult, holdout []model.InterAccessInterval) (*CalibratedModel, error)
+	Calibrate(result *CoxResult, holdout []domain.InterAccessInterval) (*CalibratedModel, error)
 }
 
 // StatmodelFitter is the kshedden/statmodel/duration-backed implementation
@@ -112,7 +112,7 @@ type StatmodelFitter struct{}
 func NewStatmodelFitter() StatmodelFitter { return StatmodelFitter{} }
 
 // FitKaplanMeier fits a single (non-stratified) KM curve over all intervals.
-func (StatmodelFitter) FitKaplanMeier(intervals []model.InterAccessInterval) (*KMResult, error) {
+func (StatmodelFitter) FitKaplanMeier(intervals []domain.InterAccessInterval) (*KMResult, error) {
 	if len(intervals) == 0 {
 		return nil, fmt.Errorf("FitKaplanMeier: empty intervals")
 	}
@@ -163,13 +163,13 @@ func medianSurvivalTime(t, s []float64) float64 {
 // deterministic iteration-order inside this function).
 func FitKaplanMeierStratified(
 	fitter SurvivalFitter,
-	intervals []model.InterAccessInterval,
-	key func(model.InterAccessInterval) string,
+	intervals []domain.InterAccessInterval,
+	key func(domain.InterAccessInterval) string,
 ) (map[string]*KMResult, error) {
 	if fitter == nil {
 		return nil, fmt.Errorf("FitKaplanMeierStratified: nil fitter")
 	}
-	groups := make(map[string][]model.InterAccessInterval)
+	groups := make(map[string][]domain.InterAccessInterval)
 	for _, it := range intervals {
 		k := key(it)
 		groups[k] = append(groups[k], it)
@@ -193,7 +193,7 @@ func FitKaplanMeierStratified(
 }
 
 // StratumByContractType is a convenience key function for stratification.
-func StratumByContractType(it model.InterAccessInterval) string { return it.ContractType.String() }
+func StratumByContractType(it domain.InterAccessInterval) string { return it.ContractType.String() }
 
 // StratumBySlotType is a convenience key function for stratification.
-func StratumBySlotType(it model.InterAccessInterval) string { return it.SlotType.String() }
+func StratumBySlotType(it domain.InterAccessInterval) string { return it.SlotType.String() }

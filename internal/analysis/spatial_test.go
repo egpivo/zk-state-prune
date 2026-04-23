@@ -5,8 +5,8 @@ import (
 	"math"
 	"testing"
 
+	"github.com/egpivo/zk-state-prune/internal/domain"
 	"github.com/egpivo/zk-state-prune/internal/extractor"
-	"github.com/egpivo/zk-state-prune/internal/model"
 )
 
 func TestRunSpatial_DetectsMockClustering(t *testing.T) {
@@ -23,7 +23,7 @@ func TestRunSpatial_DetectsMockClustering(t *testing.T) {
 	cfg.SlotsPerContractXmin = 5
 	cfg.SlotsPerContractMax = 30
 	cfg.TotalBlocks = 20_000
-	cfg.Window = model.ObservationWindow{Start: 4_000, End: 20_000}
+	cfg.Window = domain.ObservationWindow{Start: 4_000, End: 20_000}
 	cfg.AccessRateXmin = 5e-4
 	cfg.MaxEventsPerSlot = 300
 	cfg.PeriodBlocks = 2_000
@@ -61,7 +61,7 @@ func TestRunSpatial_ZeroClusteringWhenRhoZero(t *testing.T) {
 	cfg.SlotsPerContractXmin = 5
 	cfg.SlotsPerContractMax = 30
 	cfg.TotalBlocks = 20_000
-	cfg.Window = model.ObservationWindow{Start: 4_000, End: 20_000}
+	cfg.Window = domain.ObservationWindow{Start: 4_000, End: 20_000}
 	cfg.AccessRateXmin = 5e-4
 	cfg.MaxEventsPerSlot = 300
 	cfg.PeriodBlocks = 2_000

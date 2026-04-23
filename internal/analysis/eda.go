@@ -9,7 +9,7 @@ import (
 
 	"gonum.org/v1/gonum/stat"
 
-	"github.com/egpivo/zk-state-prune/internal/model"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 	"github.com/egpivo/zk-state-prune/internal/storage"
 )
 
@@ -24,12 +24,12 @@ import (
 //   - the censoring diagnostic lets us confirm the window is well-chosen
 //     before we trust any survival fit
 type EDAReport struct {
-	Window model.ObservationWindow
+	Window domain.ObservationWindow
 
 	Frequency       DistributionSummary
 	InterAccessTime DistributionSummary
-	ByContractType  map[model.ContractCategory]ContractTypeSummary
-	BySlotType      map[model.SlotType]SlotTypeSummary
+	ByContractType  map[domain.ContractCategory]ContractTypeSummary
+	BySlotType      map[domain.SlotType]SlotTypeSummary
 
 	// Censoring diagnostics. Rate is a fraction in [0,1].
 	TotalIntervals     int
@@ -107,7 +107,7 @@ func (d DistributionSummary) MarshalJSON() ([]byte, error) {
 }
 
 // ContractTypeSummary aggregates per-category metrics that inform
-// stratification choices for the survival model.
+// stratification choices for the survival domain.
 type ContractTypeSummary struct {
 	Slots             int
 	Intervals         int
@@ -127,7 +127,7 @@ type SlotTypeSummary struct {
 // RunEDAFull runs the full EDA pass plus spatial and temporal analyses.
 // Callers that don't care about the spatiotemporal sections can use
 // RunEDA and save one storage scan per extra pass.
-func RunEDAFull(ctx context.Context, db *storage.DB, window model.ObservationWindow) (*EDAReport, error) {
+func RunEDAFull(ctx context.Context, db *storage.DB, window domain.ObservationWindow) (*EDAReport, error) {
 	rep, err := RunEDA(ctx, db, window)
 	if err != nil {
 		return nil, err
@@ -146,7 +146,7 @@ func RunEDAFull(ctx context.Context, db *storage.DB, window model.ObservationWin
 }
 
 // RunEDA builds intervals for the given window and produces an EDAReport.
-func RunEDA(ctx context.Context, db *storage.DB, window model.ObservationWindow) (*EDAReport, error) {
+func RunEDA(ctx context.Context, db *storage.DB, window domain.ObservationWindow) (*EDAReport, error) {
 	built, err := BuildIntervals(ctx, db, window)
 	if err != nil {
 		return nil, fmt.Errorf("build intervals: %w", err)
@@ -154,7 +154,7 @@ func RunEDA(ctx context.Context, db *storage.DB, window model.ObservationWindow)
 	return summarize(built, window), nil
 }
 
-func summarize(built IntervalBuildResult, window model.ObservationWindow) *EDAReport {
+func summarize(built IntervalBuildResult, window domain.ObservationWindow) *EDAReport {
 	intervals := built.Intervals
 	n := len(intervals)
 
@@ -174,8 +174,8 @@ func summarize(built IntervalBuildResult, window model.ObservationWindow) *EDARe
 	// DistributionSummary; censoring is reported separately.
 	iat := make([]float64, 0, n)
 
-	byCat := make(map[model.ContractCategory]*ctAgg)
-	bySlot := make(map[model.SlotType]*stAgg)
+	byCat := make(map[domain.ContractCategory]*ctAgg)
+	bySlot := make(map[domain.SlotType]*stAgg)
 
 	for _, it := range intervals {
 		total := int(it.AccessCount)
@@ -227,8 +227,8 @@ func summarize(built IntervalBuildResult, window model.ObservationWindow) *EDARe
 		Window:             window,
 		Frequency:          summarizeDistribution(freqVals),
 		InterAccessTime:    summarizeDistribution(iat),
-		ByContractType:     make(map[model.ContractCategory]ContractTypeSummary, len(byCat)),
-		BySlotType:         make(map[model.SlotType]SlotTypeSummary, len(bySlot)),
+		ByContractType:     make(map[domain.ContractCategory]ContractTypeSummary, len(byCat)),
+		BySlotType:         make(map[domain.SlotType]SlotTypeSummary, len(bySlot)),
 		TotalIntervals:     n,
 		RightCensoredCount: built.RightCensored,
 		LeftTruncatedCount: built.LeftTruncatedSlots,
@@ -250,8 +250,8 @@ func summarize(built IntervalBuildResult, window model.ObservationWindow) *EDARe
 // buildContractSummaries turns the per-category raw aggregates into
 // the public ContractTypeSummary map, computing the right-censored
 // rate per category in one place.
-func buildContractSummaries(byCat map[model.ContractCategory]*ctAgg) map[model.ContractCategory]ContractTypeSummary {
-	out := make(map[model.ContractCategory]ContractTypeSummary, len(byCat))
+func buildContractSummaries(byCat map[domain.ContractCategory]*ctAgg) map[domain.ContractCategory]ContractTypeSummary {
+	out := make(map[domain.ContractCategory]ContractTypeSummary, len(byCat))
 	for cat, agg := range byCat {
 		cr := 0.0
 		if agg.intervals > 0 {
@@ -271,8 +271,8 @@ func buildContractSummaries(byCat map[model.ContractCategory]*ctAgg) map[model.C
 // buildSlotTypeSummaries mirrors buildContractSummaries for the
 // SlotType axis. SlotTypeSummary omits AccessFrequency because we
 // don't currently track per-slot-type frequency in the aggregate.
-func buildSlotTypeSummaries(bySlot map[model.SlotType]*stAgg) map[model.SlotType]SlotTypeSummary {
-	out := make(map[model.SlotType]SlotTypeSummary, len(bySlot))
+func buildSlotTypeSummaries(bySlot map[domain.SlotType]*stAgg) map[domain.SlotType]SlotTypeSummary {
+	out := make(map[domain.SlotType]SlotTypeSummary, len(bySlot))
 	for st, agg := range bySlot {
 		cr := 0.0
 		if agg.intervals > 0 {
@@ -303,7 +303,7 @@ type stAgg struct {
 	iat       []float64
 }
 
-func getOrInit(m map[model.ContractCategory]*ctAgg, k model.ContractCategory) *ctAgg {
+func getOrInit(m map[domain.ContractCategory]*ctAgg, k domain.ContractCategory) *ctAgg {
 	if a, ok := m[k]; ok {
 		return a
 	}
@@ -312,7 +312,7 @@ func getOrInit(m map[model.ContractCategory]*ctAgg, k model.ContractCategory) *c
 	return a
 }
 
-func getOrInitSlot(m map[model.SlotType]*stAgg, k model.SlotType) *stAgg {
+func getOrInitSlot(m map[domain.SlotType]*stAgg, k domain.SlotType) *stAgg {
 	if a, ok := m[k]; ok {
 		return a
 	}

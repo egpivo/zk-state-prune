@@ -1,10 +1,11 @@
 package extractor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
-	"net/http/httptest"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -17,27 +18,48 @@ import (
 // RPC methods our extractor calls (eth_getBlockByNumber,
 // eth_getBlockReceipts) using a caller-supplied per-method function.
 // The fixture dispatches by method name; tests provide the bodies.
-func newMockRPC(t *testing.T, handlers map[string]func(params []any) any) *httptest.Server {
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// newMockRPCClient returns an http.Client that responds to the two JSON-RPC
+// methods our extractor calls (eth_getBlockByNumber, eth_getBlockReceipts)
+// using a caller-supplied per-method function. The sandbox disallows binding
+// httptest servers, so we inject a custom RoundTripper instead.
+func newMockRPCClient(t *testing.T, handlers map[string]func(params []any) any) *http.Client {
 	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
 		var req rpcRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Fatalf("decode request: %v", err)
+			return nil, err
 		}
 		fn, ok := handlers[req.Method]
 		if !ok {
-			http.Error(w, "no mock for "+req.Method, http.StatusInternalServerError)
-			return
+			return &http.Response{
+				StatusCode: http.StatusInternalServerError,
+				Body:       io.NopCloser(strings.NewReader("no mock for " + req.Method)),
+				Header:     make(http.Header),
+			}, nil
 		}
 		result := fn(req.Params)
 		resp := rpcResponse{JSONRPC: "2.0", ID: req.ID}
 		resultBytes, err := json.Marshal(result)
 		if err != nil {
-			t.Fatalf("marshal result: %v", err)
+			return nil, err
 		}
 		resp.Result = resultBytes
-		_ = json.NewEncoder(w).Encode(resp)
-	}))
+		b, err := json.Marshal(resp)
+		if err != nil {
+			return nil, err
+		}
+		h := make(http.Header)
+		h.Set("Content-Type", "application/json")
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewReader(b)),
+			Header:     h,
+		}, nil
+	})}
 }
 
 // transferLog shorthand builder for tests. kind="erc20" gives 3
@@ -90,7 +112,7 @@ func TestRPCExtractor_HappyPath(t *testing.T) {
 		},
 	}}
 
-	srv := newMockRPC(t, map[string]func(params []any) any{
+	client := newMockRPCClient(t, map[string]func(params []any) any{
 		"eth_getBlockByNumber": func(params []any) any {
 			return rpcBlock{
 				Number:    params[0].(string),
@@ -110,14 +132,14 @@ func TestRPCExtractor_HappyPath(t *testing.T) {
 			return []rpcReceipt{}
 		},
 	})
-	defer srv.Close()
 
 	ctx := context.Background()
 	db := openRPCTestDB(t)
 	ex, err := NewRPCExtractor(RPCConfig{
-		Endpoint: srv.URL,
-		Start:    100,
-		End:      101,
+		Endpoint:   "http://mock-rpc.invalid",
+		HTTPClient: client,
+		Start:      100,
+		End:        101,
 	})
 	if err != nil {
 		t.Fatalf("NewRPCExtractor: %v", err)
@@ -159,7 +181,7 @@ func TestRPCExtractor_HighWaterResumes(t *testing.T) {
 	// First run extracts blocks 200..201, high-water should be 201.
 	// Second run with Start=200..End=203 should skip 200-201 and only
 	// fetch 202-203, because the high-water mark resumes us.
-	srv := newMockRPC(t, map[string]func(params []any) any{
+	client := newMockRPCClient(t, map[string]func(params []any) any{
 		"eth_getBlockByNumber": func(params []any) any {
 			return rpcBlock{Number: params[0].(string)}
 		},
@@ -167,12 +189,11 @@ func TestRPCExtractor_HighWaterResumes(t *testing.T) {
 			return []rpcReceipt{} // no events; we're testing control flow
 		},
 	})
-	defer srv.Close()
 
 	ctx := context.Background()
 	db := openRPCTestDB(t)
 
-	ex1, _ := NewRPCExtractor(RPCConfig{Endpoint: srv.URL, Start: 200, End: 201})
+	ex1, _ := NewRPCExtractor(RPCConfig{Endpoint: "http://mock-rpc.invalid", HTTPClient: client, Start: 200, End: 201})
 	if err := ex1.Extract(ctx, db); err != nil {
 		t.Fatalf("Extract 1: %v", err)
 	}
@@ -187,7 +208,7 @@ func TestRPCExtractor_HighWaterResumes(t *testing.T) {
 	}
 
 	// Second run: overlapping range should resume.
-	ex2, _ := NewRPCExtractor(RPCConfig{Endpoint: srv.URL, Start: 200, End: 203})
+	ex2, _ := NewRPCExtractor(RPCConfig{Endpoint: "http://mock-rpc.invalid", HTTPClient: client, Start: 200, End: 203})
 	if err := ex2.Extract(ctx, db); err != nil {
 		t.Fatalf("Extract 2: %v", err)
 	}
@@ -271,7 +292,7 @@ func TestRPCExtractor_HighWaterAfterEventFlush(t *testing.T) {
 	holderB := "0x000000000000000000000000000000000000000000000000000000000000bbbb"
 	erc20 := "0x1111111111111111111111111111111111111111"
 	calls := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
 		var req rpcRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		calls++
@@ -279,8 +300,11 @@ func TestRPCExtractor_HighWaterAfterEventFlush(t *testing.T) {
 		blockHex, _ := req.Params[0].(string)
 		n, _ := strconv.ParseUint(strings.TrimPrefix(blockHex, "0x"), 16, 64)
 		if n == 2 && req.Method == "eth_getBlockReceipts" {
-			http.Error(w, "synthetic failure", http.StatusInternalServerError)
-			return
+			return &http.Response{
+				StatusCode: http.StatusInternalServerError,
+				Body:       io.NopCloser(strings.NewReader("synthetic failure")),
+				Header:     make(http.Header),
+			}, nil
 		}
 		resp := rpcResponse{JSONRPC: "2.0", ID: req.ID}
 		var result any
@@ -298,13 +322,15 @@ func TestRPCExtractor_HighWaterAfterEventFlush(t *testing.T) {
 		}
 		b, _ := json.Marshal(result)
 		resp.Result = b
-		_ = json.NewEncoder(w).Encode(resp)
-	}))
-	defer srv.Close()
+		out, _ := json.Marshal(resp)
+		h := make(http.Header)
+		h.Set("Content-Type", "application/json")
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(out)), Header: h}, nil
+	})}
 
 	ctx := context.Background()
 	db := openRPCTestDB(t)
-	ex, _ := NewRPCExtractor(RPCConfig{Endpoint: srv.URL, Start: 1, End: 2})
+	ex, _ := NewRPCExtractor(RPCConfig{Endpoint: "http://mock-rpc.invalid", HTTPClient: client, Start: 1, End: 2})
 	err := ex.Extract(ctx, db)
 	if err == nil {
 		t.Fatal("expected error from synthetic failure on block 2")
@@ -325,7 +351,7 @@ func TestRPCExtractor_HighWaterAfterEventFlush(t *testing.T) {
 }
 
 func TestRPCExtractor_PropagatesRPCError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
 		var req rpcRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		resp := rpcResponse{
@@ -333,11 +359,13 @@ func TestRPCExtractor_PropagatesRPCError(t *testing.T) {
 			ID:      req.ID,
 			Error:   &rpcError{Code: -32000, Message: "method not supported"},
 		}
-		_ = json.NewEncoder(w).Encode(resp)
-	}))
-	defer srv.Close()
+		out, _ := json.Marshal(resp)
+		h := make(http.Header)
+		h.Set("Content-Type", "application/json")
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(out)), Header: h}, nil
+	})}
 
-	ex, _ := NewRPCExtractor(RPCConfig{Endpoint: srv.URL, Start: 1, End: 1})
+	ex, _ := NewRPCExtractor(RPCConfig{Endpoint: "http://mock-rpc.invalid", HTTPClient: client, Start: 1, End: 1})
 	err := ex.Extract(context.Background(), openRPCTestDB(t))
 	if err == nil || !strings.Contains(err.Error(), "method not supported") {
 		t.Errorf("expected rpc error propagation, got %v", err)

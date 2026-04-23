@@ -1,4 +1,4 @@
-package model
+package domain
 
 // Schema is the canonical SQLite schema for the zksp analysis DB. It is
 // applied verbatim by the storage layer at Open() time; migrations live

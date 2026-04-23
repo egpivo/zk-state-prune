@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/egpivo/zk-state-prune/internal/model"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 	"github.com/egpivo/zk-state-prune/internal/storage"
 )
 
@@ -15,7 +15,7 @@ func smallConfig() MockConfig {
 	c.SlotsPerContractXmin = 5
 	c.SlotsPerContractMax = 50
 	c.TotalBlocks = 10_000
-	c.Window = model.ObservationWindow{Start: 2_000, End: 10_000}
+	c.Window = domain.ObservationWindow{Start: 2_000, End: 10_000}
 	c.AccessRateXmin = 1e-4
 	c.MaxEventsPerSlot = 200
 	c.PeriodBlocks = 1_000
@@ -195,11 +195,11 @@ func TestSamplePoisson_MeanMatchesLambda(t *testing.T) {
 
 func TestSlotTypeMix_ERC20DominatedByBalance(t *testing.T) {
 	r := newTestRand()
-	counts := map[model.SlotType]int{}
+	counts := map[domain.SlotType]int{}
 	for i := 0; i < 5000; i++ {
-		counts[sampleSlotType(r, model.ContractERC20)]++
+		counts[sampleSlotType(r, domain.ContractERC20)]++
 	}
-	if counts[model.SlotTypeBalance] < counts[model.SlotTypeMapping] {
+	if counts[domain.SlotTypeBalance] < counts[domain.SlotTypeMapping] {
 		t.Fatalf("expected balance to dominate ERC20 mix, got %v", counts)
 	}
 }
