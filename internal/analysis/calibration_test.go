@@ -7,17 +7,17 @@ import (
 	"math/rand/v2"
 	"testing"
 
+	"github.com/egpivo/zk-state-prune/internal/domain"
 	"github.com/egpivo/zk-state-prune/internal/extractor"
-	"github.com/egpivo/zk-state-prune/internal/model"
 )
 
 // phHoldsIntervals fabricates a Cox-friendly dataset: the hazard depends
 // on a single covariate with a *constant* multiplicative effect. Higher
 // AccessCount → shorter Duration, but the multiplier doesn't drift with
 // time. The Schoenfeld test should *fail to reject* PH (large p-values).
-func phHoldsIntervals(n int) []model.InterAccessInterval {
+func phHoldsIntervals(n int) []domain.InterAccessInterval {
 	r := rand.New(rand.NewPCG(2, 3))
-	out := make([]model.InterAccessInterval, 0, n)
+	out := make([]domain.InterAccessInterval, 0, n)
 	for i := 0; i < n; i++ {
 		ac := uint64(r.IntN(20))
 		// Exponential gap with rate proportional to (1 + ac), constant
@@ -27,7 +27,7 @@ func phHoldsIntervals(n int) []model.InterAccessInterval {
 			u = 1e-9
 		}
 		dur := uint64(math.Max(1, -math.Log(u)*100/float64(ac+1)))
-		out = append(out, model.InterAccessInterval{
+		out = append(out, domain.InterAccessInterval{
 			SlotID:      fmt.Sprintf("s%d", i),
 			Duration:    dur,
 			IsObserved:  true,
@@ -43,9 +43,9 @@ func phHoldsIntervals(n int) []model.InterAccessInterval {
 // Duration, for "late" rows higher AccessCount → longer Duration. That
 // is precisely what Cox cannot fit with a single proportional coefficient,
 // and Schoenfeld residuals should correlate strongly with time.
-func phViolatedIntervals(n int) []model.InterAccessInterval {
+func phViolatedIntervals(n int) []domain.InterAccessInterval {
 	r := rand.New(rand.NewPCG(5, 13))
-	out := make([]model.InterAccessInterval, 0, n)
+	out := make([]domain.InterAccessInterval, 0, n)
 	for i := 0; i < n; i++ {
 		ac := uint64(r.IntN(20))
 		// Sign of effect flips depending on row index, which after
@@ -56,7 +56,7 @@ func phViolatedIntervals(n int) []model.InterAccessInterval {
 		} else {
 			dur = uint64(math.Max(1, 200-float64(ac)*5+r.NormFloat64()*3))
 		}
-		out = append(out, model.InterAccessInterval{
+		out = append(out, domain.InterAccessInterval{
 			SlotID:      fmt.Sprintf("s%d", i),
 			Duration:    dur,
 			IsObserved:  true,
@@ -142,7 +142,7 @@ func TestCheckPH_OnMockEndToEnd(t *testing.T) {
 	cfg.SlotsPerContractXmin = 5
 	cfg.SlotsPerContractMax = 30
 	cfg.TotalBlocks = 20_000
-	cfg.Window = model.ObservationWindow{Start: 4_000, End: 20_000}
+	cfg.Window = domain.ObservationWindow{Start: 4_000, End: 20_000}
 	cfg.AccessRateXmin = 1e-4
 	cfg.MaxEventsPerSlot = 200
 	cfg.PeriodBlocks = 2_000
@@ -371,7 +371,7 @@ func TestCalibrate_MockTrainHoldoutEndToEnd(t *testing.T) {
 	cfg.SlotsPerContractXmin = 5
 	cfg.SlotsPerContractMax = 30
 	cfg.TotalBlocks = 20_000
-	cfg.Window = model.ObservationWindow{Start: 4_000, End: 20_000}
+	cfg.Window = domain.ObservationWindow{Start: 4_000, End: 20_000}
 	cfg.AccessRateXmin = 1e-4
 	cfg.MaxEventsPerSlot = 200
 	cfg.PeriodBlocks = 2_000

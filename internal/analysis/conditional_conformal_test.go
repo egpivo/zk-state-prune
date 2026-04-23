@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/egpivo/zk-state-prune/internal/model"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 )
 
 func TestConditionalConformal_OutOfSampleCoverage(t *testing.T) {
@@ -50,7 +50,7 @@ func TestConditionalConformal_OutOfSampleCoverage(t *testing.T) {
 // (evaluated, covered) pair for the caller to translate into a rate.
 func measureConditionalCoverage(
 	calib *CalibratedModel,
-	test []model.InterAccessInterval,
+	test []domain.InterAccessInterval,
 	r *rand.Rand,
 ) (evaluated, covered int) {
 	tau := calib.Tau
@@ -80,7 +80,7 @@ func measureConditionalCoverage(
 // 0 if (u + τ) still falls inside the observed duration, 1 if the
 // interval terminated with an observed event, or !ok for the
 // right-censored "we can't tell" case we skip for coverage.
-func conditionalLabel(it model.InterAccessInterval, u uint64, tau float64) (float64, bool) {
+func conditionalLabel(it domain.InterAccessInterval, u uint64, tau float64) (float64, bool) {
 	reach := u + uint64(tau+0.5)
 	switch {
 	case reach <= it.Duration:
@@ -95,7 +95,7 @@ func conditionalLabel(it model.InterAccessInterval, u uint64, tau float64) (floa
 // conditionalPred returns the raw Cox conditional access probability
 // at idle u with horizon τ, or !ok if the conditional is undefined
 // (S(u) ≤ 0 means the interval has already "died" at u).
-func conditionalPred(calib *CalibratedModel, it model.InterAccessInterval, u uint64, tau float64) (float64, bool) {
+func conditionalPred(calib *CalibratedModel, it domain.InterAccessInterval, u uint64, tau float64) (float64, bool) {
 	sU := calib.Base.SurvivalForInterval(it, float64(u))
 	if sU <= 0 {
 		return 0, false

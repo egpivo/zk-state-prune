@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/egpivo/zk-state-prune/internal/model"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 	"github.com/egpivo/zk-state-prune/internal/storage"
 )
 
@@ -24,9 +24,9 @@ func seed(t *testing.T, db *storage.DB, slotID string, createdAt uint64, events 
 	t.Helper()
 	ctx := context.Background()
 	contract := "0xaa"
-	if err := db.UpsertContract(ctx, model.ContractMeta{
+	if err := db.UpsertContract(ctx, domain.ContractMeta{
 		Address:      contract,
-		ContractType: model.ContractERC20,
+		ContractType: domain.ContractERC20,
 		DeployBlock:  createdAt,
 	}); err != nil {
 		t.Fatalf("UpsertContract: %v", err)
@@ -35,10 +35,10 @@ func seed(t *testing.T, db *storage.DB, slotID string, createdAt uint64, events 
 	if len(events) > 0 {
 		last = events[len(events)-1]
 	}
-	if err := db.UpsertSlot(ctx, model.StateSlot{
+	if err := db.UpsertSlot(ctx, domain.StateSlot{
 		SlotID:       slotID,
 		ContractAddr: contract,
-		SlotType:     model.SlotTypeBalance,
+		SlotType:     domain.SlotTypeBalance,
 		CreatedAt:    createdAt,
 		LastAccess:   last,
 		AccessCount:  uint64(len(events)),
@@ -49,13 +49,13 @@ func seed(t *testing.T, db *storage.DB, slotID string, createdAt uint64, events 
 	if len(events) == 0 {
 		return
 	}
-	evs := make([]model.AccessEvent, 0, len(events))
+	evs := make([]domain.AccessEvent, 0, len(events))
 	for i, b := range events {
-		at := model.AccessRead
+		at := domain.AccessRead
 		if i == 0 {
-			at = model.AccessWrite
+			at = domain.AccessWrite
 		}
-		evs = append(evs, model.AccessEvent{
+		evs = append(evs, domain.AccessEvent{
 			SlotID:      slotID,
 			BlockNumber: b,
 			AccessType:  at,
@@ -72,7 +72,7 @@ func TestBuildIntervals_AllObserved(t *testing.T) {
 	db := openDB(t)
 	seed(t, db, "s1", 100, 200, 300, 400) // created inside window, all events before window.End
 
-	res, err := BuildIntervals(ctx, db, model.ObservationWindow{Start: 100, End: 500})
+	res, err := BuildIntervals(ctx, db, domain.ObservationWindow{Start: 100, End: 500})
 	if err != nil {
 		t.Fatalf("BuildIntervals: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestBuildIntervals_FullyCensoredNoEvents(t *testing.T) {
 	db := openDB(t)
 	seed(t, db, "s1", 100) // created inside window, zero events
 
-	res, err := BuildIntervals(ctx, db, model.ObservationWindow{Start: 100, End: 500})
+	res, err := BuildIntervals(ctx, db, domain.ObservationWindow{Start: 100, End: 500})
 	if err != nil {
 		t.Fatalf("BuildIntervals: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestBuildIntervals_LeftTruncated(t *testing.T) {
 	// flagged as left-truncated.
 	seed(t, db, "s1", 50, 80 /*before window, must be dropped*/, 150, 300)
 
-	res, err := BuildIntervals(ctx, db, model.ObservationWindow{Start: 100, End: 500})
+	res, err := BuildIntervals(ctx, db, domain.ObservationWindow{Start: 100, End: 500})
 	if err != nil {
 		t.Fatalf("BuildIntervals: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestBuildIntervals_SlotBornAfterWindow(t *testing.T) {
 	db := openDB(t)
 	seed(t, db, "s1", 600, 700) // born after window.End — skipped
 
-	res, err := BuildIntervals(ctx, db, model.ObservationWindow{Start: 100, End: 500})
+	res, err := BuildIntervals(ctx, db, domain.ObservationWindow{Start: 100, End: 500})
 	if err != nil {
 		t.Fatalf("BuildIntervals: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestBuildIntervals_LTCountedEvenWhenFirstEventOnWindowStart(t *testing.T) {
 	db := openDB(t)
 	seed(t, db, "s1", 50 /*pre-window*/, 100 /*==Window.Start*/, 300)
 
-	res, err := BuildIntervals(ctx, db, model.ObservationWindow{Start: 100, End: 500})
+	res, err := BuildIntervals(ctx, db, domain.ObservationWindow{Start: 100, End: 500})
 	if err != nil {
 		t.Fatalf("BuildIntervals: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestBuildIntervals_DedupesSameBlockEvents(t *testing.T) {
 	// Three "events" at the same block 200 collapse to one logical touch.
 	seed(t, db, "s1", 100, 200, 200, 200, 400)
 
-	res, err := BuildIntervals(ctx, db, model.ObservationWindow{Start: 100, End: 500})
+	res, err := BuildIntervals(ctx, db, domain.ObservationWindow{Start: 100, End: 500})
 	if err != nil {
 		t.Fatalf("BuildIntervals: %v", err)
 	}
@@ -229,7 +229,7 @@ func TestBuildIntervals_FirstEventAtEntryIsConsumed(t *testing.T) {
 	// must be elided, leaving only the gap [100,200] and trailing censor.
 	seed(t, db, "s1", 100, 100, 200)
 
-	res, err := BuildIntervals(ctx, db, model.ObservationWindow{Start: 100, End: 500})
+	res, err := BuildIntervals(ctx, db, domain.ObservationWindow{Start: 100, End: 500})
 	if err != nil {
 		t.Fatalf("BuildIntervals: %v", err)
 	}
@@ -257,7 +257,7 @@ func TestBuildIntervals_NoZeroDurationOnMockBurst(t *testing.T) {
 	db := openDB(t)
 	seed(t, db, "s1", 100, 120, 120, 120, 121, 130, 130, 200, 200, 300)
 
-	res, err := BuildIntervals(ctx, db, model.ObservationWindow{Start: 100, End: 500})
+	res, err := BuildIntervals(ctx, db, domain.ObservationWindow{Start: 100, End: 500})
 	if err != nil {
 		t.Fatalf("BuildIntervals: %v", err)
 	}
@@ -276,7 +276,7 @@ func TestBuildIntervals_CovariatesAtIntervalStart(t *testing.T) {
 	db := openDB(t)
 	seed(t, db, "s1", 100, 150, 200, 300)
 
-	res, err := BuildIntervals(ctx, db, model.ObservationWindow{Start: 100, End: 500})
+	res, err := BuildIntervals(ctx, db, domain.ObservationWindow{Start: 100, End: 500})
 	if err != nil {
 		t.Fatalf("BuildIntervals: %v", err)
 	}

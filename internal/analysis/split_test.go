@@ -6,19 +6,19 @@ import (
 	"math/rand/v2"
 	"testing"
 
+	"github.com/egpivo/zk-state-prune/internal/domain"
 	"github.com/egpivo/zk-state-prune/internal/extractor"
-	"github.com/egpivo/zk-state-prune/internal/model"
 )
 
 // makeMultiSlotIntervals fabricates `slots` distinct slot ids, each
 // contributing 3 intervals. Useful for split tests that need the
 // "intervals from one slot stay together" invariant to be measurable.
-func makeMultiSlotIntervals(slots int) []model.InterAccessInterval {
-	out := make([]model.InterAccessInterval, 0, slots*3)
+func makeMultiSlotIntervals(slots int) []domain.InterAccessInterval {
+	out := make([]domain.InterAccessInterval, 0, slots*3)
 	for i := 0; i < slots; i++ {
 		id := stringInt(i)
 		for k := 0; k < 3; k++ {
-			out = append(out, model.InterAccessInterval{
+			out = append(out, domain.InterAccessInterval{
 				SlotID:   id,
 				Duration: uint64(10 + k*5),
 			})
@@ -165,7 +165,7 @@ func TestCalibrationCurveFromCox_ErrorPaths(t *testing.T) {
 	if _, err := CalibrationCurveFromCox(res, nil, 1, 5); err == nil {
 		t.Error("expected error on empty holdout")
 	}
-	if _, err := CalibrationCurveFromCox(res, []model.InterAccessInterval{{Duration: 5, IsObserved: true}}, 0, 5); err == nil {
+	if _, err := CalibrationCurveFromCox(res, []domain.InterAccessInterval{{Duration: 5, IsObserved: true}}, 0, 5); err == nil {
 		t.Error("expected error on tau=0")
 	}
 }
@@ -190,7 +190,7 @@ func TestCalibrationCurveFromCox_BinWiseKMKeepsCensoredRows(t *testing.T) {
 	// so S(100) = 0.75 and the bin's observed rate is 1 − 0.75 = 0.25.
 	// BrierN should be 3 (everything except the censored-before-τ row);
 	// NumKept should be 4 (bin-wise KM doesn't drop).
-	holdout := []model.InterAccessInterval{
+	holdout := []domain.InterAccessInterval{
 		{SlotID: "a", Duration: 50, IsObserved: false},
 		{SlotID: "b", Duration: 50, IsObserved: true},
 		{SlotID: "c", Duration: 200, IsObserved: false},
@@ -236,7 +236,7 @@ func TestCalibrationCurve_OnMockTrainHoldoutEndToEnd(t *testing.T) {
 	assertCalibrationCurveSane(t, curve)
 }
 
-func setupMockTrainHoldout(t *testing.T) (train, holdout []model.InterAccessInterval) {
+func setupMockTrainHoldout(t *testing.T) (train, holdout []domain.InterAccessInterval) {
 	t.Helper()
 	ctx := context.Background()
 	db := openDB(t)
@@ -245,7 +245,7 @@ func setupMockTrainHoldout(t *testing.T) (train, holdout []model.InterAccessInte
 	cfg.SlotsPerContractXmin = 5
 	cfg.SlotsPerContractMax = 30
 	cfg.TotalBlocks = 20_000
-	cfg.Window = model.ObservationWindow{Start: 4_000, End: 20_000}
+	cfg.Window = domain.ObservationWindow{Start: 4_000, End: 20_000}
 	cfg.AccessRateXmin = 1e-4
 	cfg.MaxEventsPerSlot = 200
 	cfg.PeriodBlocks = 2_000
@@ -263,7 +263,7 @@ func setupMockTrainHoldout(t *testing.T) (train, holdout []model.InterAccessInte
 	return train, holdout
 }
 
-func assertTrainHoldoutSlotDisjoint(t *testing.T, train, holdout []model.InterAccessInterval) {
+func assertTrainHoldoutSlotDisjoint(t *testing.T, train, holdout []domain.InterAccessInterval) {
 	t.Helper()
 	trainSlots := make(map[string]bool)
 	for _, it := range train {

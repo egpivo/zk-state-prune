@@ -19,8 +19,8 @@ import (
 
 	"github.com/egpivo/zk-state-prune/internal/analysis"
 	"github.com/egpivo/zk-state-prune/internal/app"
-	"github.com/egpivo/zk-state-prune/internal/model"
-	"github.com/egpivo/zk-state-prune/internal/pruning"
+	"github.com/egpivo/zk-state-prune/internal/domain"
+	"github.com/egpivo/zk-state-prune/internal/sim"
 )
 
 // EDA renders an EDAReport as the text block `zksp eda` prints. Spatial
@@ -46,7 +46,7 @@ func EDA(w io.Writer, r *analysis.EDAReport) error {
 	tw = tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "category\tslots\tintervals\tcensored%\tIAT_p50\tIAT_p99")
 	cats := make([]string, 0, len(r.ByContractType))
-	idx := make(map[string]model.ContractCategory)
+	idx := make(map[string]domain.ContractCategory)
 	for k := range r.ByContractType {
 		s := k.String()
 		cats = append(cats, s)
@@ -112,7 +112,7 @@ func KM(w io.Writer, curves []*analysis.KMResult) error {
 
 // SimResults renders the policy comparison table emitted by
 // `simulate` and the bottom half of `report`.
-func SimResults(w io.Writer, results []*pruning.SimResult) error {
+func SimResults(w io.Writer, results []*sim.Result) error {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "policy\tslots\tobs\tRAM%\thot_hit%\tmisses\tRAM_cost\tmiss_cost\ttotal_cost")
 	for _, r := range results {

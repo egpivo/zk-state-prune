@@ -1,4 +1,4 @@
-package pruning
+package sim
 
 // CostParams bundles the per-slot cost knobs the simulator uses to score
 // tiering policies. Values come from configs/default.yaml (Phase 2 wires
@@ -36,7 +36,7 @@ func DefaultCostParams() CostParams {
 	return CostParams{RAMUnitCost: 1.0, MissPenalty: 1e5}
 }
 
-// SimResult is the output of a single tiering simulation run. Every rate is
+// Result is the output of a single tiering simulation run. Every rate is
 // in [0,1]; counts are raw integers so callers can compute additional
 // derived metrics without losing precision.
 //
@@ -64,7 +64,7 @@ func DefaultCostParams() CostParams {
 // Legacy fields (StorageSavedFrac, FalsePruneRate) are kept populated so
 // Phase-1 call sites don't break; they are equivalent to
 // 1 − RAMRatio and 1 − HotHitCoverage respectively. Phase 3 removes them.
-type SimResult struct {
+type Result struct {
 	Policy string
 
 	TotalSlots        int

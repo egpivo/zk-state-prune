@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/egpivo/zk-state-prune/internal/model"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 )
 
 // osWriteFile is a thin alias so the test body below can write fixture
@@ -29,7 +29,7 @@ func TestModelFile_RoundTripPredictions(t *testing.T) {
 		t.Fatalf("Calibrate: %v", err)
 	}
 
-	path := filepath.Join(t.TempDir(), "model.json")
+	path := filepath.Join(t.TempDir(), "domain.json")
 	if err := SaveModelFile(path, calib); err != nil {
 		t.Fatalf("SaveModelFile: %v", err)
 	}
@@ -52,7 +52,7 @@ func TestModelFile_RoundTripPredictions(t *testing.T) {
 	}
 
 	// Round-trip predictions on a range of representative intervals.
-	probes := []model.InterAccessInterval{
+	probes := []domain.InterAccessInterval{
 		{SlotID: "p0", AccessCount: 0, SlotAge: 10, ContractAge: 20},
 		{SlotID: "p1", AccessCount: 5, SlotAge: 200, ContractAge: 300},
 		{SlotID: "p2", AccessCount: 15, SlotAge: 1_000, ContractAge: 1_500},

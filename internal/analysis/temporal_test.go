@@ -5,8 +5,8 @@ import (
 	"math"
 	"testing"
 
+	"github.com/egpivo/zk-state-prune/internal/domain"
 	"github.com/egpivo/zk-state-prune/internal/extractor"
-	"github.com/egpivo/zk-state-prune/internal/model"
 )
 
 func TestRunTemporal_SmokeOnMock(t *testing.T) {
@@ -22,7 +22,7 @@ func TestRunTemporal_SmokeOnMock(t *testing.T) {
 	cfg.SlotsPerContractXmin = 5
 	cfg.SlotsPerContractMax = 30
 	cfg.TotalBlocks = 30_000
-	cfg.Window = model.ObservationWindow{Start: 6_000, End: 30_000}
+	cfg.Window = domain.ObservationWindow{Start: 6_000, End: 30_000}
 	cfg.AccessRateXmin = 5e-4
 	cfg.MaxEventsPerSlot = 300
 	cfg.PeriodBlocks = 2_000

@@ -1,9 +1,9 @@
-package pruning
+package sim
 
 import (
 	"fmt"
 
-	"github.com/egpivo/zk-state-prune/internal/model"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 )
 
 // CondAccessProbFunc returns p(u) = P(slot is accessed within the next
@@ -16,7 +16,7 @@ import (
 // Callers that want the robust upper-bound rule should have their
 // predict function add the conformal ε to the raw conditional
 // probability and clip to [0, 1] before returning.
-type CondAccessProbFunc func(it model.InterAccessInterval, idle float64) float64
+type CondAccessProbFunc func(it domain.InterAccessInterval, idle float64) float64
 
 // StatisticalPolicy is the cost-aware tiering policy. It is the
 // plan-faithful realization of
@@ -91,7 +91,7 @@ func NewStatisticalPolicy(name string, predict CondAccessProbFunc, tau float64, 
 	}, nil
 }
 
-// Name reports the policy label, used by SimResult and CLI printers.
+// Name reports the policy label, used by Result and CLI printers.
 func (s *StatisticalPolicy) Name() string { return s.label }
 
 // PStar exposes the demotion threshold for diagnostics and CLI output.
@@ -110,7 +110,7 @@ func (s *StatisticalPolicy) Tau() float64 { return s.tau }
 // stays hot for the full interval. If the probability at u=0 is
 // already below p* (cold-dominant slot) the slot is demoted at the
 // start — recovering the Phase-2 "binary" shortcut as a special case.
-func (s *StatisticalPolicy) HotBlocks(it model.InterAccessInterval) uint64 {
+func (s *StatisticalPolicy) HotBlocks(it domain.InterAccessInterval) uint64 {
 	if s.predict == nil || it.Duration == 0 {
 		return it.Duration
 	}

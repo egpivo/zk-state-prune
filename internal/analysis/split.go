@@ -5,7 +5,7 @@ import (
 	"math/rand/v2"
 	"sort"
 
-	"github.com/egpivo/zk-state-prune/internal/model"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 )
 
 // TrainHoldoutSplitBySlot partitions intervals into a (train, holdout)
@@ -22,10 +22,10 @@ import (
 // Returns an error rather than panicking on out-of-range fractions so
 // the calling CLI flag can surface it cleanly.
 func TrainHoldoutSplitBySlot(
-	intervals []model.InterAccessInterval,
+	intervals []domain.InterAccessInterval,
 	holdoutFrac float64,
 	seed uint64,
-) (train, holdout []model.InterAccessInterval, err error) {
+) (train, holdout []domain.InterAccessInterval, err error) {
 	if holdoutFrac <= 0 || holdoutFrac >= 1 {
 		return nil, nil, fmt.Errorf("TrainHoldoutSplitBySlot: holdoutFrac %v not in (0,1)", holdoutFrac)
 	}

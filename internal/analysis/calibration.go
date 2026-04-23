@@ -7,7 +7,7 @@ import (
 
 	"gonum.org/v1/gonum/stat/distuv"
 
-	"github.com/egpivo/zk-state-prune/internal/model"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 )
 
 // PHTestResult holds the outcome of a Schoenfeld-residual test of the
@@ -105,7 +105,7 @@ func (c *CalibratedModel) PredictAccessProb(covariates map[string]float64) float
 // PredictAccessProb. It uses the model's full predictor set so a model
 // fit with extra covariates (ContractType, SlotType, …) does not get
 // silently evaluated on a truncated map.
-func (c *CalibratedModel) PredictAccessProbForInterval(it model.InterAccessInterval) float64 {
+func (c *CalibratedModel) PredictAccessProbForInterval(it domain.InterAccessInterval) float64 {
 	if c == nil || c.Base == nil {
 		return 0
 	}
@@ -136,7 +136,7 @@ func (c *CalibratedModel) PredictInterval(covariates map[string]float64) (lower,
 
 // PredictIntervalForInterval is the InterAccessInterval analogue of
 // PredictInterval.
-func (c *CalibratedModel) PredictIntervalForInterval(it model.InterAccessInterval) (lower, upper float64) {
+func (c *CalibratedModel) PredictIntervalForInterval(it domain.InterAccessInterval) (lower, upper float64) {
 	if c == nil || c.Base == nil {
 		return 0, 0
 	}
@@ -151,7 +151,7 @@ func (c *CalibratedModel) PredictIntervalForInterval(it model.InterAccessInterva
 // the conformal interval, which is the quantity the robust decision
 // rule plugs into the surrogate for d=cold. Uses Epsilon — the ε
 // fit for the calibrated point prediction at τ from idle=0.
-func (c *CalibratedModel) PredictUpperAccessProbForInterval(it model.InterAccessInterval) float64 {
+func (c *CalibratedModel) PredictUpperAccessProbForInterval(it domain.InterAccessInterval) float64 {
 	_, upper := c.PredictIntervalForInterval(it)
 	return upper
 }
@@ -173,7 +173,7 @@ func (c *CalibratedModel) PredictUpperAccessProbForInterval(it model.InterAccess
 // here means "cheapest valid pessimism layer", not "uniform over the
 // search grid". When ConditionalEpsilon is zero (no conformal fit)
 // the function returns the raw point estimate.
-func (c *CalibratedModel) PredictUpperConditionalAccessProb(it model.InterAccessInterval, idle float64) float64 {
+func (c *CalibratedModel) PredictUpperConditionalAccessProb(it domain.InterAccessInterval, idle float64) float64 {
 	if c == nil || c.Base == nil {
 		return 0
 	}
@@ -273,7 +273,7 @@ type CalibrationBin struct {
 // PredictForIntervalFunc is the predict-by-interval abstraction both
 // CoxResult and CalibratedModel satisfy. Pulling it out lets the
 // calibration machinery serve both model flavours without a switch.
-type PredictForIntervalFunc func(it model.InterAccessInterval) float64
+type PredictForIntervalFunc func(it domain.InterAccessInterval) float64
 
 // CalibrationCurveFromCox evaluates a fitted Cox model on the holdout
 // intervals at horizon tau and produces a reliability diagram with
@@ -282,14 +282,14 @@ type PredictForIntervalFunc func(it model.InterAccessInterval) float64
 // Cox baseline hazard.
 func CalibrationCurveFromCox(
 	res *CoxResult,
-	holdout []model.InterAccessInterval,
+	holdout []domain.InterAccessInterval,
 	tau float64,
 	nBins int,
 ) (*CalibrationCurve, error) {
 	if res == nil {
 		return nil, fmt.Errorf("CalibrationCurveFromCox: nil model")
 	}
-	predict := func(it model.InterAccessInterval) float64 {
+	predict := func(it domain.InterAccessInterval) float64 {
 		return res.PredictAccessProbForInterval(it, tau)
 	}
 	return CalibrationCurveFromPredict(predict, holdout, tau, nBins)
@@ -300,7 +300,7 @@ func CalibrationCurveFromCox(
 // censored-before-τ rows stay in the bins instead of being dropped.
 func CalibrationCurveFromPredict(
 	predict PredictForIntervalFunc,
-	holdout []model.InterAccessInterval,
+	holdout []domain.InterAccessInterval,
 	tau float64,
 	nBins int,
 ) (*CalibrationCurve, error) {
@@ -366,7 +366,7 @@ func CalibrationCurveFromPredict(
 // extracted bin-summary helper can take it as a parameter.
 type calibRow struct {
 	p  float64
-	it model.InterAccessInterval
+	it domain.InterAccessInterval
 }
 
 // summarizeCalibrationBin reduces one bin's rows to:
@@ -380,7 +380,7 @@ type calibRow struct {
 func summarizeCalibrationBin(fitter StatmodelFitter, rows []calibRow, tau float64) (CalibrationBin, float64, int) {
 	var sumP, brier float64
 	brierN := 0
-	ivs := make([]model.InterAccessInterval, 0, len(rows))
+	ivs := make([]domain.InterAccessInterval, 0, len(rows))
 	for _, r := range rows {
 		sumP += r.p
 		ivs = append(ivs, r.it)
@@ -409,7 +409,7 @@ func summarizeCalibrationBin(fitter StatmodelFitter, rows []calibRow, tau float6
 // on a fit failure (extremely small bin, pathological data) so the
 // reliability diagram still prints rather than blowing up the whole
 // report.
-func binwiseKMRate(fitter StatmodelFitter, ivs []model.InterAccessInterval, tau float64) float64 {
+func binwiseKMRate(fitter StatmodelFitter, ivs []domain.InterAccessInterval, tau float64) float64 {
 	km, err := fitter.FitKaplanMeier(ivs)
 	if err != nil || km == nil {
 		return 0
@@ -422,7 +422,7 @@ func binwiseKMRate(fitter StatmodelFitter, ivs []model.InterAccessInterval, tau 
 }
 
 // CheckPH runs a Schoenfeld-residuals proportional-hazards test on a
-// fitted Cox model. The result reports a per-covariate p-value plus a
+// fitted Cox domain. The result reports a per-covariate p-value plus a
 // Fisher-combined global p-value. Small p means the residuals correlate
 // with event time, i.e. the covariate's effect is itself time-dependent
 // and the PH assumption is violated.
@@ -521,7 +521,7 @@ func standardizeAndLinearPredictor(res *CoxResult) ([][]float64, []float64) {
 // Duration ascending. Stable so tie groups preserve their original
 // order; the Schoenfeld walker relies on all ties being adjacent,
 // not on their internal ordering.
-func orderByDurationAsc(intervals []model.InterAccessInterval) []int {
+func orderByDurationAsc(intervals []domain.InterAccessInterval) []int {
 	order := make([]int, len(intervals))
 	for i := range order {
 		order[i] = i
@@ -559,7 +559,7 @@ func schoenfeldResiduals(res *CoxResult, order []int, z [][]float64, lp []float6
 // tieGroupStart returns j such that [j+1, i] covers every index in
 // order sharing intervals[order[i]].Duration. Callers advance i to
 // j on the next iteration.
-func tieGroupStart(intervals []model.InterAccessInterval, order []int, i int) int {
+func tieGroupStart(intervals []domain.InterAccessInterval, order []int, i int) int {
 	j := i
 	curT := intervals[order[i]].Duration
 	for j >= 0 && intervals[order[j]].Duration == curT {
@@ -736,7 +736,7 @@ func averageRanks(xs []float64) []float64 {
 // median Duration of the training set (read off res.intervals).
 func (StatmodelFitter) CalibrateAt(
 	res *CoxResult,
-	holdout []model.InterAccessInterval,
+	holdout []domain.InterAccessInterval,
 	tau float64,
 ) (*CalibratedModel, error) {
 	if res == nil {
@@ -793,7 +793,7 @@ func (StatmodelFitter) CalibrateAt(
 //     horizon),
 //   - drop otherwise (censored-before-τ — we don't know whether the
 //     event would have landed in the horizon).
-func labelHoldoutForTau(res *CoxResult, holdout []model.InterAccessInterval, tau float64) []calPoint {
+func labelHoldoutForTau(res *CoxResult, holdout []domain.InterAccessInterval, tau float64) []calPoint {
 	out := make([]calPoint, 0, len(holdout))
 	for _, it := range holdout {
 		var label float64
@@ -966,7 +966,7 @@ func conformalIdleSample(slotID string, duration uint64) uint64 {
 // whatever quantity they need.
 type calPoint struct {
 	p, y float64
-	it   model.InterAccessInterval
+	it   domain.InterAccessInterval
 }
 
 // slotIDBucket deterministically hashes a slot id to {0, 1}. Used by
@@ -986,7 +986,7 @@ func slotIDBucket(id string) uint32 {
 // default horizon (median Duration of the training intervals retained
 // inside res) and delegates to CalibrateAt. Callers that want to pin
 // tau should invoke CalibrateAt directly.
-func (f StatmodelFitter) Calibrate(res *CoxResult, holdout []model.InterAccessInterval) (*CalibratedModel, error) {
+func (f StatmodelFitter) Calibrate(res *CoxResult, holdout []domain.InterAccessInterval) (*CalibratedModel, error) {
 	if res == nil {
 		return nil, fmt.Errorf("Calibrate: nil CoxResult")
 	}

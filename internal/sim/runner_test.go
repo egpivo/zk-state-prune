@@ -1,4 +1,4 @@
-package pruning
+package sim
 
 import (
 	"context"
@@ -7,15 +7,15 @@ import (
 	"testing"
 
 	"github.com/egpivo/zk-state-prune/internal/analysis"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 	"github.com/egpivo/zk-state-prune/internal/extractor"
-	"github.com/egpivo/zk-state-prune/internal/model"
 	"github.com/egpivo/zk-state-prune/internal/storage"
 )
 
 // mkInterval is a small helper to build a minimal InterAccessInterval for
 // the hand-crafted unit tests. Covariates default to zero.
-func mkInterval(slot string, dur uint64, observed bool) model.InterAccessInterval {
-	return model.InterAccessInterval{
+func mkInterval(slot string, dur uint64, observed bool) domain.InterAccessInterval {
+	return domain.InterAccessInterval{
 		SlotID:     slot,
 		Duration:   dur,
 		IsObserved: observed,
@@ -23,7 +23,7 @@ func mkInterval(slot string, dur uint64, observed bool) model.InterAccessInterva
 }
 
 func TestRun_NoPruneIsFreeAndLoseless(t *testing.T) {
-	ivs := []model.InterAccessInterval{
+	ivs := []domain.InterAccessInterval{
 		mkInterval("s1", 10, true),
 		mkInterval("s1", 50, true),
 		mkInterval("s1", 200, false),
@@ -46,7 +46,7 @@ func TestRun_NoPruneIsFreeAndLoseless(t *testing.T) {
 func TestRun_FixedIdleThresholdHit(t *testing.T) {
 	// Policy prunes at idle >= 20.
 	policy := FixedIdle{Label: "test", IdleBlocks: 20}
-	ivs := []model.InterAccessInterval{
+	ivs := []domain.InterAccessInterval{
 		mkInterval("s1", 10, true),  // below threshold → no savings
 		mkInterval("s1", 30, true),  // crosses threshold → reactivation + 10 saved
 		mkInterval("s1", 50, false), // trailing censored, 30 saved, final=pruned
@@ -84,7 +84,7 @@ func TestRun_ReactivationResetsFinalState(t *testing.T) {
 	// Slot gets pruned, reactivated, then left short-idle censored → not
 	// pruned at window end.
 	policy := FixedIdle{Label: "t", IdleBlocks: 10}
-	ivs := []model.InterAccessInterval{
+	ivs := []domain.InterAccessInterval{
 		mkInterval("s1", 50, true), // pruned then reactivated
 		mkInterval("s1", 5, false), // trailing short censored, not pruned
 	}
@@ -99,7 +99,7 @@ func TestRun_ReactivationResetsFinalState(t *testing.T) {
 
 func TestRun_ThresholdLargerThanAllIntervals(t *testing.T) {
 	policy := FixedIdle{Label: "huge", IdleBlocks: 1_000_000}
-	ivs := []model.InterAccessInterval{
+	ivs := []domain.InterAccessInterval{
 		mkInterval("s1", 100, true),
 		mkInterval("s1", 200, false),
 	}
@@ -115,7 +115,7 @@ func TestRun_CostAccounting(t *testing.T) {
 	// cold tail (Duration=50, 30 cold slot-blocks). Exposure 10+30+50=90.
 	// Hot = 90 − (10+30) = 50 slot-blocks.
 	policy := FixedIdle{Label: "t", IdleBlocks: 20}
-	ivs := []model.InterAccessInterval{
+	ivs := []domain.InterAccessInterval{
 		mkInterval("s1", 10, true),  // hot throughout, no reactivation
 		mkInterval("s1", 30, true),  // hot 20 + cold 10 → reactivation
 		mkInterval("s1", 50, false), // hot 20 + cold 30 → final=cold
@@ -163,7 +163,7 @@ func TestRun_CostAccounting(t *testing.T) {
 func TestRun_NoPruneAllHotBaseline(t *testing.T) {
 	// No-prune keeps every slot-block hot → RAMRatio=1, misses=0,
 	// TotalCost = RAMUnitCost * exposure. Sanity check the upper bound.
-	ivs := []model.InterAccessInterval{
+	ivs := []domain.InterAccessInterval{
 		mkInterval("s1", 10, true),
 		mkInterval("s1", 50, false),
 	}
@@ -226,7 +226,7 @@ func TestPolicyByName(t *testing.T) {
 	// Positive path: with a pre-built StatisticalPolicy in deps,
 	// PolicyByName("statistical") resolves to it.
 	stat, err := NewStatisticalPolicy("statistical",
-		func(_ model.InterAccessInterval, _ float64) float64 { return 0.5 },
+		func(_ domain.InterAccessInterval, _ float64) float64 { return 0.5 },
 		10, CostParams{RAMUnitCost: 1, MissPenalty: 10})
 	if err != nil {
 		t.Fatalf("NewStatisticalPolicy: %v", err)
@@ -259,7 +259,7 @@ func TestRunAll_EndToEndOnMock_MonotonicOrdering(t *testing.T) {
 	cfg.SlotsPerContractXmin = 5
 	cfg.SlotsPerContractMax = 30
 	cfg.TotalBlocks = 50_000
-	cfg.Window = model.ObservationWindow{Start: 10_000, End: 50_000}
+	cfg.Window = domain.ObservationWindow{Start: 10_000, End: 50_000}
 	cfg.AccessRateXmin = 1e-4
 	cfg.MaxEventsPerSlot = 300
 	cfg.PeriodBlocks = 5_000

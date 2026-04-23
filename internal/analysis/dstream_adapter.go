@@ -3,7 +3,7 @@ package analysis
 import (
 	"github.com/kshedden/statmodel/statmodel"
 
-	"github.com/egpivo/zk-state-prune/internal/model"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 )
 
 // Column names used throughout the analysis package. They are the contract
@@ -38,7 +38,7 @@ const (
 //     surrogate "previous access". The column is still populated so that a
 //     later calendar-time Cox fit can reuse the same adapter with a
 //     different time scale.
-func ToSurvivalDataset(intervals []model.InterAccessInterval) statmodel.Dataset {
+func ToSurvivalDataset(intervals []domain.InterAccessInterval) statmodel.Dataset {
 	n := len(intervals)
 	dur := make([]float64, n)
 	status := make([]float64, n)

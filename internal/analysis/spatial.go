@@ -6,7 +6,7 @@ import (
 	"math/rand/v2"
 	"sort"
 
-	"github.com/egpivo/zk-state-prune/internal/model"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 	"github.com/egpivo/zk-state-prune/internal/storage"
 )
 
@@ -21,7 +21,7 @@ import (
 // IntraContractCorrelation ρ parameter: on a synthetic dataset with
 // ρ=0.7, MeanJaccard should be meaningfully > 0.
 type SpatialReport struct {
-	Window model.ObservationWindow
+	Window domain.ObservationWindow
 
 	// Number of contracts whose slot set was large enough (>= 2 slots
 	// with events) to measure clustering on.
@@ -52,7 +52,7 @@ const spatialMaxPairs = 50
 // slot pairs (i, j) and computes Jaccard(S_i, S_j) = |S_i ∩ S_j| / |S_i ∪ S_j|.
 // The contract's score is the mean over sampled pairs. A contract with
 // fewer than 2 eligible slots is skipped.
-func RunSpatial(ctx context.Context, db *storage.DB, window model.ObservationWindow) (*SpatialReport, error) {
+func RunSpatial(ctx context.Context, db *storage.DB, window domain.ObservationWindow) (*SpatialReport, error) {
 	if window.End <= window.Start {
 		return nil, fmt.Errorf("RunSpatial: invalid window [%d, %d)", window.Start, window.End)
 	}
@@ -98,10 +98,10 @@ func RunSpatial(ctx context.Context, db *storage.DB, window model.ObservationWin
 func collectContractSlotBlocks(
 	ctx context.Context,
 	db *storage.DB,
-	window model.ObservationWindow,
+	window domain.ObservationWindow,
 ) (map[string]map[string][]uint64, error) {
 	byContract := make(map[string]map[string][]uint64)
-	err := db.IterateSlotEvents(ctx, func(sm storage.SlotWithMeta, events []model.AccessEvent) error {
+	err := db.IterateSlotEvents(ctx, func(sm storage.SlotWithMeta, events []domain.AccessEvent) error {
 		blocks := make([]uint64, 0, len(events))
 		var prev uint64
 		havePrev := false

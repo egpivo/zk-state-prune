@@ -36,7 +36,7 @@ pruning:
     ram_unit_cost: 1.0
     miss_penalty: 100000.0
   # Policy keys below are the same strings accepted by `zksp simulate
-  # --policy` and by pruning.PolicyByName. Dashes are canonical; the
+  # --policy` and by sim.PolicyByName. Dashes are canonical; the
   # factory also tolerates the YAML-idiomatic underscore form.
   policies:
     statistical:

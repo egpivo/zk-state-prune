@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/egpivo/zk-state-prune/internal/model"
+	"github.com/egpivo/zk-state-prune/internal/domain"
 )
 
 // twoStrataIntervals synthesizes a dataset where two contract categories
@@ -16,25 +16,25 @@ import (
 // is the cleanest way to test that stratified Cox builds visibly
 // different per-stratum baseline hazards while sharing a single
 // coefficient vector on the non-strata covariates.
-func twoStrataIntervals(n int) []model.InterAccessInterval {
+func twoStrataIntervals(n int) []domain.InterAccessInterval {
 	r := rand.New(rand.NewPCG(11, 13))
-	out := make([]model.InterAccessInterval, 0, n)
+	out := make([]domain.InterAccessInterval, 0, n)
 	for i := 0; i < n; i++ {
 		ac := uint64(r.IntN(10))
-		var cat model.ContractCategory
+		var cat domain.ContractCategory
 		var dur uint64
 		if i%2 == 0 {
-			cat = model.ContractERC20
+			cat = domain.ContractERC20
 			// Short gaps, modulated lightly by AccessCount.
 			base := 30.0 - float64(ac)*1.5
 			dur = uint64(math.Max(1, base+r.NormFloat64()*2))
 		} else {
-			cat = model.ContractBridge
+			cat = domain.ContractBridge
 			// Long gaps, same AccessCount slope but bigger intercept.
 			base := 200.0 - float64(ac)*1.5
 			dur = uint64(math.Max(1, base+r.NormFloat64()*8))
 		}
-		out = append(out, model.InterAccessInterval{
+		out = append(out, domain.InterAccessInterval{
 			SlotID:       fmt.Sprintf("s%d", i),
 			Duration:     dur,
 			IsObserved:   true,
@@ -42,7 +42,7 @@ func twoStrataIntervals(n int) []model.InterAccessInterval {
 			SlotAge:      uint64(i*7 + r.IntN(5)),
 			ContractAge:  uint64(i*11 + r.IntN(7)),
 			ContractType: cat,
-			SlotType:     model.SlotTypeBalance,
+			SlotType:     domain.SlotTypeBalance,
 		})
 	}
 	return out
@@ -96,11 +96,11 @@ func TestFitCoxPHStratified_PredictionsDifferByStratum(t *testing.T) {
 	// stratum value. Survival at a moderate horizon must differ — the
 	// whole point of stratification is that each category carries its
 	// own baseline.
-	probeERC := model.InterAccessInterval{
-		AccessCount: 3, SlotAge: 100, ContractAge: 100, ContractType: model.ContractERC20,
+	probeERC := domain.InterAccessInterval{
+		AccessCount: 3, SlotAge: 100, ContractAge: 100, ContractType: domain.ContractERC20,
 	}
 	probeBridge := probeERC
-	probeBridge.ContractType = model.ContractBridge
+	probeBridge.ContractType = domain.ContractBridge
 
 	for _, t0 := range []float64{20, 50, 100} {
 		sE := res.SurvivalForInterval(probeERC, t0)
@@ -178,8 +178,8 @@ func TestModelFile_StratifiedRoundTrip(t *testing.T) {
 
 	// End-to-end: the loaded model must produce identical predictions
 	// for a probe interval in each stratum.
-	for _, cat := range []model.ContractCategory{model.ContractERC20, model.ContractBridge} {
-		probe := model.InterAccessInterval{
+	for _, cat := range []domain.ContractCategory{domain.ContractERC20, domain.ContractBridge} {
+		probe := domain.InterAccessInterval{
 			AccessCount: 2, SlotAge: 50, ContractAge: 60, ContractType: cat,
 		}
 		for _, t0 := range []float64{20, 100} {

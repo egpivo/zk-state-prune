@@ -8,8 +8,8 @@ import (
 
 	"github.com/egpivo/zk-state-prune/internal/analysis"
 	"github.com/egpivo/zk-state-prune/internal/app"
-	"github.com/egpivo/zk-state-prune/internal/model"
-	"github.com/egpivo/zk-state-prune/internal/pruning"
+	"github.com/egpivo/zk-state-prune/internal/domain"
+	"github.com/egpivo/zk-state-prune/internal/sim"
 )
 
 // Smoke tests. We are not pinning exact byte-for-byte output (that
@@ -33,7 +33,7 @@ func assertContainsAll(t *testing.T, got string, wants ...string) {
 
 func makeEDAReport() *analysis.EDAReport {
 	return &analysis.EDAReport{
-		Window:             model.ObservationWindow{Start: 100, End: 1000},
+		Window:             domain.ObservationWindow{Start: 100, End: 1000},
 		TotalIntervals:     42,
 		RightCensoredCount: 7,
 		RightCensoredRate:  0.166,
@@ -51,8 +51,8 @@ func makeEDAReport() *analysis.EDAReport {
 			Count: 42, Mean: 150, StdDev: 80,
 			Min: 1, P50: 100, P90: 300, P99: 900, Max: 1000,
 		},
-		ByContractType: map[model.ContractCategory]analysis.ContractTypeSummary{
-			model.ContractERC20: {
+		ByContractType: map[domain.ContractCategory]analysis.ContractTypeSummary{
+			domain.ContractERC20: {
 				Slots: 20, Intervals: 30,
 				RightCensoredRate: 0.2,
 				InterAccessTime:   analysis.DistributionSummary{P50: 80, P99: 700},
@@ -233,7 +233,7 @@ func TestRenderCoxFit_NilInputIsNoop(t *testing.T) {
 // ------- SimResults -----------------------------------------------------
 
 func TestRenderSimResults_TableShape(t *testing.T) {
-	results := []*pruning.SimResult{
+	results := []*sim.Result{
 		{
 			Policy: "no-prune", TotalSlots: 100, ObservedIntervals: 200,
 			RAMRatio: 1.0, HotHitCoverage: 1.0, Reactivations: 0,

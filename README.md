@@ -72,8 +72,14 @@ Go 1.25+. Pure Go, no C dependencies.
   Transfer event. Non-Transfer writes and all reads are invisible; a full
   state-diff source (`debug_traceBlockByNumber` + prestate tracer) is a
   drop-in Extractor replacement.
-- Spatial / temporal EDA signals are *descriptive* — not fed back to the
-  Cox fit as covariates.
+- Co-access (per-contract Jaccard) and temporal-autocorrelation
+  signals are *descriptive* EDA diagnostics — not fed back to the
+  Cox fit as covariates. The pipeline is a **structured survival
+  model** (dependence structure as potential covariates), not a
+  "spatiotemporal" model in the kernel / covariance sense: slot
+  keys have no distance metric and there is no physical space.
+  Upgrading the Cox covariates with structural features is a
+  future direction.
 - Conditional conformal ε has marginal (single-probe) coverage, not
   simultaneous coverage over the T\*-search grid.
 

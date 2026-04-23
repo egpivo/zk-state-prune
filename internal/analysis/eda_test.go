@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
+	"github.com/egpivo/zk-state-prune/internal/domain"
 	"github.com/egpivo/zk-state-prune/internal/extractor"
-	"github.com/egpivo/zk-state-prune/internal/model"
 )
 
 func smallMock() extractor.MockConfig {
@@ -14,7 +14,7 @@ func smallMock() extractor.MockConfig {
 	c.SlotsPerContractXmin = 5
 	c.SlotsPerContractMax = 50
 	c.TotalBlocks = 10_000
-	c.Window = model.ObservationWindow{Start: 2_000, End: 10_000}
+	c.Window = domain.ObservationWindow{Start: 2_000, End: 10_000}
 	c.AccessRateXmin = 1e-4
 	c.MaxEventsPerSlot = 200
 	c.PeriodBlocks = 1_000
