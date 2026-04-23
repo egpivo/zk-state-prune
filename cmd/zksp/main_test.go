@@ -373,15 +373,28 @@ func TestCLI_Simulate_StatisticalRobustCostOverride(t *testing.T) {
 		t.Fatalf("simulate statistical --robust: %v\n%s", err, out)
 	}
 	// JSON output must parse and contain a policy row.
-	var results []map[string]any
-	if err := json.Unmarshal([]byte(out), &results); err != nil {
+	var envelope struct {
+		DataSource *extractor.Capability `json:"data_source"`
+		Results    []map[string]any      `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(out), &envelope); err != nil {
 		t.Fatalf("not valid JSON: %v\n%s", err, out)
 	}
-	if len(results) != 1 {
-		t.Fatalf("expected 1 result row, got %d", len(results))
+	if len(envelope.Results) != 1 {
+		t.Fatalf("expected 1 result row, got %d", len(envelope.Results))
 	}
-	if name, _ := results[0]["Policy"].(string); name != "statistical-robust" {
+	if name, _ := envelope.Results[0]["Policy"].(string); name != "statistical-robust" {
 		t.Errorf("Policy = %q, want 'statistical-robust'", name)
+	}
+	// The extract step earlier in this test populated the DB with the
+	// mock extractor, so the simulate JSON must round-trip its
+	// capability stamp — this is the guardrail that
+	// extractor.WriteCapability + ReadCapability stay wired together.
+	if envelope.DataSource == nil {
+		t.Fatal("data_source missing from simulate JSON envelope")
+	}
+	if envelope.DataSource.Source != "mock" {
+		t.Errorf("DataSource.Source = %q, want mock", envelope.DataSource.Source)
 	}
 }
 

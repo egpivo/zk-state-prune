@@ -124,8 +124,14 @@ func ParseContractCategory(s string) ContractCategory {
 	}
 }
 
-// StateSlot is one storage slot tracked by zksp. SlotID is the canonical
-// keccak256 of (contract, index) and serves as the primary key.
+// StateSlot is one storage slot tracked by zksp. SlotID is an opaque
+// deterministic key that serves as the primary key. The exact format
+// is chosen per-extractor (e.g. the mock uses a synthetic string; the
+// Transfer-log surrogate uses "contract:holder"; the statediff source
+// uses "contract:<32-byte-slotKey>") and callers downstream treat it
+// strictly as an opaque token — it is never parsed back into contract
+// / index pairs. Two extractions by the same extractor must produce
+// the same SlotID for the same underlying slot.
 type StateSlot struct {
 	SlotID       string
 	ContractAddr string

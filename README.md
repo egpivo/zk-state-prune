@@ -55,6 +55,24 @@ zksp report   --db <db>                  [--model <path.json>]
 config. `zksp extract --force` wipes the target DB and clears the RPC
 high-water mark.
 
+### Data-source capability matrix
+
+Each extractor self-declares what slot touches it observes. After
+every `extract`, the capability is stamped into `schema_meta` so
+`report --format json` and `simulate --format json` carry a
+`data_source` field; the text modes print a one-line header.
+
+| `--source`  | reads | non-Transfer writes | `slot_id` form                |
+|-------------|:-----:|:-------------------:|-------------------------------|
+| `mock`      |   ✓   |          ✓          | synthetic / deterministic     |
+| `rpc`       |   ✗   |          ✗          | `contract:holder` (Transfer-log surrogate) |
+| `statediff` |   ✓   |          ✓          | `contract:slotkey` *(planned — Phase 4a PR2)* |
+
+Reading a Brier score or a cost table without the capability stamp is
+an honest-scope violation: a Transfer-log surrogate systematically
+under-reports writes, which skews both the heavy-tail diagnostics and
+the cost-regime finding.
+
 ## Build
 
 ```
