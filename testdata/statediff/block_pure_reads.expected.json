@@ -1,0 +1,15 @@
+{
+  "description": "view-only call — slots appear only in pre, never in post → all reads",
+  "touches": [
+    {
+      "contract": "0x00000000000000000000000000000000000000aa",
+      "slotKey":  "0x0000000000000000000000000000000000000000000000000000000000000001",
+      "access":   "read"
+    },
+    {
+      "contract": "0x00000000000000000000000000000000000000aa",
+      "slotKey":  "0x0000000000000000000000000000000000000000000000000000000000000002",
+      "access":   "read"
+    }
+  ]
+}

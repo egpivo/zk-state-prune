@@ -1,0 +1,20 @@
+{
+  "description": "three txs across two contracts — tx1 reads slot1, tx2 writes slot1, tx3 writes slot2 on a different contract. parseStateDiff returns one touch per tx (per-block aggregation is the next layer up).",
+  "touches": [
+    {
+      "contract": "0x00000000000000000000000000000000000000aa",
+      "slotKey":  "0x0000000000000000000000000000000000000000000000000000000000000001",
+      "access":   "read"
+    },
+    {
+      "contract": "0x00000000000000000000000000000000000000aa",
+      "slotKey":  "0x0000000000000000000000000000000000000000000000000000000000000001",
+      "access":   "write"
+    },
+    {
+      "contract": "0x00000000000000000000000000000000000000bb",
+      "slotKey":  "0x0000000000000000000000000000000000000000000000000000000000000002",
+      "access":   "write"
+    }
+  ]
+}

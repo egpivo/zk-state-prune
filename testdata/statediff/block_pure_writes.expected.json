@@ -1,0 +1,10 @@
+{
+  "description": "single tx with one write to a balance slot — slot in both pre and post means write",
+  "touches": [
+    {
+      "contract": "0x00000000000000000000000000000000000000aa",
+      "slotKey":  "0x0000000000000000000000000000000000000000000000000000000000000001",
+      "access":   "write"
+    }
+  ]
+}
