@@ -1,0 +1,4 @@
+{
+  "description": "plain ETH transfer between two EOAs — pre/post move balance but no storage maps appear, so parseStateDiff yields zero touches. Guards against regressing into 'every account in pre is a touch'.",
+  "touches": []
+}
