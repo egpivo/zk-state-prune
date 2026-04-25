@@ -1,7 +1,12 @@
-# SQLite DBs and intermediate logs from experiment runs are not
-# checked in — they're large and machine-specific. Only the small
-# JSON outputs / report.json land in commits via the README's
-# explicit list.
+# Per-developer sanity-check runs are ephemeral — every
+# `make scroll-smoke` overwrites the contents, so committing them
+# is just churn. Only the headline experiment runs (e.g.
+# scroll_100k/) land in git.
+scroll_smoke/
+
+# Universal: SQLite + extractor logs from any run dir. Even
+# inside a committed experiment dir we don't want the DB or the
+# stderr log — they balloon and they're locally regeneratable.
 *.db
 *.db-shm
 *.db-wal
