@@ -125,6 +125,23 @@ func NewRPCExtractor(cfg RPCConfig) (*RPCExtractor, error) {
 // Zero value if Extract has not been called yet.
 func (e *RPCExtractor) LastDiagnostics() RPCDiagnostics { return e.last }
 
+// Capability declares this extractor as a Transfer-log surrogate:
+// it only sees slot touches emitted as ERC-20 / ERC-721 Transfer
+// events. Non-Transfer writes (arbitrary SSTORE, DEX pool updates,
+// governance state) and all reads are invisible. A full state-diff
+// replacement (debug_traceBlockByNumber + prestateTracer) is
+// planned — see the statediff extractor when it lands — and will
+// differ from this one by both ObservesReads and
+// ObservesNonTransferWrite being true.
+func (*RPCExtractor) Capability() Capability {
+	return Capability{
+		Source:                   "rpc",
+		ObservesReads:            false,
+		ObservesNonTransferWrite: false,
+		SlotIDForm:               "contract:holder (Transfer-log surrogate)",
+	}
+}
+
 // Extract honours the Extractor interface. Walks blocks in [Start, End]
 // fetching each block and its receipts, synthesizing (slot, event)
 // rows from Transfer logs. Persists contracts/slots/events to db.

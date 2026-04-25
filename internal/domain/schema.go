@@ -5,12 +5,17 @@ package domain
 // alongside it in internal/storage/migrations.go.
 //
 // Design notes:
-//   - state_slots is keyed by slot_id (keccak256 of contract||index) so the
-//     extractor can upsert without extra lookups.
+//   - state_slots is keyed by slot_id — an opaque deterministic string
+//     each extractor mints in its own format (see StateSlot docs); the
+//     storage layer treats it as a black-box primary key.
 //   - access_events is append-only and indexed on (slot_id, block_number) so
 //     survival analysis can stream inter-access intervals per slot.
-//   - Enums are stored as TEXT so the DB stays human-inspectable; the model
-//     package owns the parse/format functions.
+//   - Enums are stored as TEXT so the DB stays human-inspectable; the
+//     domain package owns the parse/format functions.
+//   - schema_meta is a small key/value table for schema version, the
+//     RPC high-water mark, and the most-recent extractor capability
+//     stamp (so downstream report / simulate output can self-document
+//     which data source produced the numbers).
 const Schema = `
 CREATE TABLE IF NOT EXISTS contracts (
     address       TEXT PRIMARY KEY,
