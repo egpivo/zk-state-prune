@@ -41,14 +41,15 @@ extract → EDA → survival fit → calibration → tiering simulation
 ## CLI
 
 ```
-zksp extract  --source mock|rpc          --output <db>
-zksp eda      --db <db>                  [--format text|json]
-zksp fit      --db <db> --model km|cox   [--stratify contract-type]
-                                         [--save <path.json>]
+zksp extract  --source mock|rpc|statediff  --output <db>
+                                          [--rpc <url> --start N --end M]
+zksp eda      --db <db>                    [--format text|json]
+zksp fit      --db <db> --model km|cox     [--stratify contract-type]
+                                          [--save <path.json>]
 zksp simulate --db <db> --policy no-prune|fixed-30d|fixed-90d|statistical
-                                         [--model <path.json>] [--robust]
-                                         [--ram-unit-cost N --miss-penalty N]
-zksp report   --db <db>                  [--model <path.json>]
+                                          [--model <path.json>] [--robust]
+                                          [--ram-unit-cost N --miss-penalty N]
+zksp report   --db <db>                    [--model <path.json>]
 ```
 
 `--config configs/default.yaml` overrides hardcoded defaults; flags override
@@ -66,12 +67,19 @@ every `extract`, the capability is stamped into `schema_meta` so
 |-------------|:-----:|:-------------------:|-------------------------------|
 | `mock`      |   ✓   |          ✓          | synthetic / deterministic     |
 | `rpc`       |   ✗   |          ✗          | `contract:holder` (Transfer-log surrogate) |
-| `statediff` |   ✓   |          ✓          | `contract:slotkey` *(planned — Phase 4a PR2)* |
+| `statediff` |   ✓   |          ✓          | `contract:slotkey` (real `debug_traceBlockByNumber` + `prestateTracer`) |
 
 Reading a Brier score or a cost table without the capability stamp is
 an honest-scope violation: a Transfer-log surrogate systematically
 under-reports writes, which skews both the heavy-tail diagnostics and
 the cost-regime finding.
+
+`--source statediff` requires an archive-capable RPC endpoint that
+exposes `debug_traceBlockByNumber` (Alchemy Growth, QuickNode
+archive, self-hosted Erigon, …). Public chain endpoints generally
+refuse the method; the extractor surfaces a directly actionable
+error when that happens instead of silently degrading to the
+surrogate.
 
 ## Build
 
