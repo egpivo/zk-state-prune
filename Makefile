@@ -1,4 +1,4 @@
-.PHONY: build test lint tidy clean run cover
+.PHONY: build test lint tidy clean run cover scroll-smoke scroll-100k
 
 BIN := bin/zksp
 PKG := ./...
@@ -25,3 +25,18 @@ tidy:
 
 clean:
 	rm -rf bin coverage.out
+
+# ---- experiment runners ---------------------------------------------
+# scroll-smoke: 1k-block sanity run (~5 min) to verify the pipeline
+# end-to-end against rpc.scroll.io before committing to scroll-100k.
+# scroll-100k:  full 100k-block Transfer-log surrogate run (3-10h
+# wall clock; uses the canonical window from
+# testdata/scroll_window.yaml). Both write artifacts under
+# testdata/runs/scroll_*/ — the SQLite DB is gitignored.
+#
+# Override the RPC endpoint via SCROLL_RPC=<url> on the make line.
+scroll-smoke: build
+	./scripts/scroll_100k_surrogate.sh --smoke
+
+scroll-100k: build
+	./scripts/scroll_100k_surrogate.sh
