@@ -1,0 +1,8 @@
+# SQLite DBs and intermediate logs from experiment runs are not
+# checked in — they're large and machine-specific. Only the small
+# JSON outputs / report.json land in commits via the README's
+# explicit list.
+*.db
+*.db-shm
+*.db-wal
+extract.log
