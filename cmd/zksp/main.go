@@ -195,19 +195,20 @@ func costsFromFlags(cmd *cobra.Command, ramUnit, missPen float64) sim.CostParams
 
 func newExtractCmd() *cobra.Command {
 	var (
-		source       string
-		output       string
-		seed         uint64
-		numContracts int
-		totalBlocks  uint64
-		force        bool
-		rpcEndpoint  string
-		rpcStart     uint64
-		rpcEnd       uint64
+		source           string
+		output           string
+		seed             uint64
+		numContracts     int
+		totalBlocks      uint64
+		force            bool
+		rpcEndpoint      string
+		rpcStart         uint64
+		rpcEnd           uint64
+		strictCategories bool
 	)
 	cmd := &cobra.Command{
 		Use:   "extract",
-		Short: "Populate the analysis DB with state-diff data (mock or real RPC)",
+		Short: "Populate the analysis DB with state-diff data (mock, Transfer-log surrogate, or real state-diff)",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
 			switch source {
@@ -215,20 +216,23 @@ func newExtractCmd() *cobra.Command {
 				return runMockExtract(ctx, output, seed, numContracts, totalBlocks, force)
 			case "rpc":
 				return runRPCExtract(ctx, output, rpcEndpoint, rpcStart, rpcEnd, force)
+			case "statediff":
+				return runStateDiffExtract(ctx, output, rpcEndpoint, rpcStart, rpcEnd, force, strictCategories)
 			default:
-				return fmt.Errorf("source %q not supported (use mock|rpc)", source)
+				return fmt.Errorf("source %q not supported (use mock|rpc|statediff)", source)
 			}
 		},
 	}
-	cmd.Flags().StringVar(&source, "source", "mock", "data source: mock|rpc (rpc = Transfer-log surrogate, not a full state-diff extractor)")
+	cmd.Flags().StringVar(&source, "source", "mock", "data source: mock|rpc|statediff (rpc = Transfer-log surrogate; statediff = full debug_traceBlockByNumber + prestateTracer, requires archive node)")
 	cmd.Flags().StringVar(&output, "output", defaultDBPath, "output SQLite DB path")
 	cmd.Flags().Uint64Var(&seed, "seed", 42, "(mock) PRNG seed for the generator")
 	cmd.Flags().IntVar(&numContracts, "num-contracts", 0, "(mock) override default contract count (0 = use built-in)")
 	cmd.Flags().Uint64Var(&totalBlocks, "total-blocks", 0, "(mock) override default block horizon (0 = use built-in)")
 	cmd.Flags().BoolVar(&force, "force", false, "overwrite the output DB even if it already has slots/events")
-	cmd.Flags().StringVar(&rpcEndpoint, "rpc", extractor.ScrollPublicRPC, "(rpc) JSON-RPC endpoint URL")
-	cmd.Flags().Uint64Var(&rpcStart, "start", 0, "(rpc) first block to extract")
-	cmd.Flags().Uint64Var(&rpcEnd, "end", 0, "(rpc) last block to extract (inclusive)")
+	cmd.Flags().StringVar(&rpcEndpoint, "rpc", extractor.ScrollPublicRPC, "(rpc/statediff) JSON-RPC endpoint URL")
+	cmd.Flags().Uint64Var(&rpcStart, "start", 0, "(rpc/statediff) first block to extract")
+	cmd.Flags().Uint64Var(&rpcEnd, "end", 0, "(rpc/statediff) last block to extract (inclusive)")
+	cmd.Flags().BoolVar(&strictCategories, "strict-categories", false, "(statediff) error out instead of warning when more than 20% of contracts can't be classified — use in CI / scheduled jobs to fail the run on classifier regression")
 	return cmd
 }
 
@@ -370,6 +374,73 @@ func runRPCExtract(ctx context.Context, output, endpoint string, start, end uint
 		"transfer_logs", d.TransferLogs,
 		"contracts_created", d.ContractsCreated,
 		"slots_created", d.SlotsCreated,
+		"events_attempted", d.EventsAttempted,
+		"events_persisted", d.EventsPersisted)
+	return nil
+}
+
+// runStateDiffExtract drives the real state-diff extractor
+// (debug_traceBlockByNumber + prestateTracer). Same `--force`
+// + high-water + ClearRPCState discipline as runRPCExtract because
+// they share the schema_meta key — switching --source between rpc
+// and statediff on the same DB requires --force.
+//
+// strictCategories propagates to RPCConfig.StrictCategories: when
+// true, the extractor fails the whole run if classification
+// fall-through to ContractOther exceeds the configured ratio,
+// instead of just emitting a slog.Warn. Use in CI / scheduled
+// jobs; leave false for dev iteration.
+func runStateDiffExtract(ctx context.Context, output, endpoint string, start, end uint64, force, strictCategories bool) error {
+	if end == 0 || end < start {
+		return fmt.Errorf("statediff extract: --end must be > 0 and >= --start (got start=%d end=%d)", start, end)
+	}
+	db, err := openDB(ctx, output)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := refuseOverwriteIfPopulated(ctx, db, output, force, true); err != nil {
+		return err
+	}
+	if force {
+		if err := extractor.ClearRPCState(ctx, db); err != nil {
+			return err
+		}
+	}
+	cfg := extractor.DefaultRPCConfig()
+	cfg.Endpoint = endpoint
+	cfg.Start = start
+	cfg.End = end
+	cfg.StrictCategories = strictCategories
+	if rpcHTTPClientOverride != nil {
+		cfg.HTTPClient = rpcHTTPClientOverride()
+	}
+	slog.Info("extract begin",
+		"source", "statediff",
+		"endpoint", cfg.Endpoint,
+		"start", cfg.Start,
+		"end", cfg.End,
+		"strict_categories", cfg.StrictCategories,
+		"output", output)
+	ex, err := extractor.NewStateDiffExtractor(cfg)
+	if err != nil {
+		return err
+	}
+	if err := ex.Extract(ctx, db); err != nil {
+		return fmt.Errorf("extract: %w", err)
+	}
+	if err := extractor.WriteCapability(ctx, db, ex.Capability()); err != nil {
+		return fmt.Errorf("stamp capability: %w", err)
+	}
+	d := ex.LastDiagnostics()
+	slog.Info("extract complete",
+		"blocks_fetched", d.BlocksFetched,
+		"storage_touches", d.StorageTouches,
+		"storage_reads", d.StorageReads,
+		"storage_writes", d.StorageWrites,
+		"contracts_created", d.ContractsCreated,
+		"slots_created", d.SlotsCreated,
+		"other_category_contracts", d.OtherCategoryContracts,
 		"events_attempted", d.EventsAttempted,
 		"events_persisted", d.EventsPersisted)
 	return nil

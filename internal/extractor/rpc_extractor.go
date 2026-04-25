@@ -37,6 +37,15 @@ type RPCConfig struct {
 	End        uint64
 	HTTPClient *http.Client
 	BatchSize  int
+
+	// StrictCategories, when true, makes a statediff Extract return
+	// an error (instead of a slog.Warn) if more than
+	// otherCategoryWarnRatio of contracts the run touched failed
+	// classification and landed in ContractOther. The Transfer-log
+	// surrogate (RPCExtractor) ignores this flag — its category
+	// signal comes from log.Topics, not from the function-selector
+	// + bytecode pipeline that this guardrail watches.
+	StrictCategories bool
 }
 
 // DefaultRPCConfig returns a Scroll-mainnet-friendly default. Callers
@@ -463,25 +472,36 @@ type rpcLog struct {
 	Data    string   `json:"data"`
 }
 
-// call performs one JSON-RPC round trip.
+// call performs one JSON-RPC round trip. Thin wrapper over rpcCall
+// so RPCExtractor can keep its reqID counter on the receiver.
 func (e *RPCExtractor) call(ctx context.Context, method string, params []any, out any) error {
 	e.reqID++
+	return rpcCall(ctx, e.cfg, &e.reqID, method, params, out)
+}
+
+// rpcCall is the shared JSON-RPC transport — used by both the
+// Transfer-log surrogate (RPCExtractor) and the real state-diff
+// extractor (StateDiffExtractor) so they agree on body shape, error
+// translation, and HTTP handling. The reqID pointer is mutated by
+// callers before each invocation; passing it by pointer keeps the
+// counter on whichever extractor owns it.
+func rpcCall(ctx context.Context, cfg RPCConfig, reqID *int, method string, params []any, out any) error {
 	body, err := json.Marshal(rpcRequest{
 		JSONRPC: "2.0",
 		Method:  method,
 		Params:  params,
-		ID:      e.reqID,
+		ID:      *reqID,
 	})
 	if err != nil {
 		return fmt.Errorf("marshal %s: %w", method, err)
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST", e.cfg.Endpoint, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", cfg.Endpoint, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("new request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := e.cfg.HTTPClient.Do(req)
+	resp, err := cfg.HTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("do %s: %w", method, err)
 	}
