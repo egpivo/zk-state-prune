@@ -1,0 +1,21 @@
+# Canonical Scroll mainnet block window used by Phase 4 experiments.
+#
+# Pinned so downstream comparisons (Transfer-log surrogate vs real
+# state-diff, in-window vs out-of-window cost regime) stay
+# apples-to-apples across runs, authors, and future extractor
+# implementations. Chosen to sit well inside the Scroll chain's
+# finalized segment (~24h after L1, so reorgs are not a concern)
+# and to be large enough (100k blocks, ~2 weeks of activity) that
+# the Hill α and cost-sweep findings from the 1.2k-block smoke
+# extend beyond sampling noise.
+#
+# Change the range only if you are preparing a new headline
+# experiment — and then bump a separate filename / comment so
+# older results remain reproducible.
+
+source: scroll-mainnet
+start: 33400000
+end:   33500000
+# inclusive/exclusive: [start, end) — consistent with
+# domain.ObservationWindow.Contains semantics.
+blocks: 100000

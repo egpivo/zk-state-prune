@@ -111,6 +111,18 @@ func NewMockExtractor(cfg MockConfig) *MockExtractor {
 // Zero value if Extract has not been called yet.
 func (m *MockExtractor) LastDiagnostics() Diagnostics { return m.last }
 
+// Capability describes what the mock extractor sees. The generator
+// is fully synthetic so by construction it captures every SLOAD and
+// every SSTORE — there is no Transfer-log surrogate gap.
+func (*MockExtractor) Capability() Capability {
+	return Capability{
+		Source:                   "mock",
+		ObservesReads:            true,
+		ObservesNonTransferWrite: true,
+		SlotIDForm:               "synthetic / deterministic",
+	}
+}
+
 // Extract generates contracts/slots/events according to cfg and writes them
 // to db. Reusing the same Seed produces byte-identical output.
 func (m *MockExtractor) Extract(ctx context.Context, db *storage.DB) error {

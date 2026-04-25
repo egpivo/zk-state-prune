@@ -299,6 +299,9 @@ func runMockExtract(ctx context.Context, output string, seed uint64, numContract
 	if err := ex.Extract(ctx, db); err != nil {
 		return fmt.Errorf("extract: %w", err)
 	}
+	if err := extractor.WriteCapability(ctx, db, ex.Capability()); err != nil {
+		return fmt.Errorf("stamp capability: %w", err)
+	}
 	d := ex.LastDiagnostics()
 	slog.Info("extract complete",
 		"contracts", d.Contracts,
@@ -355,6 +358,9 @@ func runRPCExtract(ctx context.Context, output, endpoint string, start, end uint
 	}
 	if err := ex.Extract(ctx, db); err != nil {
 		return fmt.Errorf("extract: %w", err)
+	}
+	if err := extractor.WriteCapability(ctx, db, ex.Capability()); err != nil {
+		return fmt.Errorf("stamp capability: %w", err)
 	}
 	d := ex.LastDiagnostics()
 	slog.Info("extract complete",
@@ -494,7 +500,7 @@ func runKMFit(out io.Writer, fitter analysis.SurvivalFitter, intervals []domain.
 
 // (app.CoxFitReport and the BuildCoxFitReport / CoxStrataColumn
 // helpers live in internal/app; the text renderer is in
-// internal/app/render. main.go only chooses between JSON and text.)
+// internal/render. main.go only chooses between JSON and text.)
 
 // runCoxFit is the `fit --model cox` handler. Thin adapter over
 // buildCoxFitReport that chooses the output path based on --format.
@@ -531,6 +537,16 @@ func runCoxFit(
 // internal/app. The CLI call sites below invoke them via app.*.)
 
 // --------------------------------------------------------------- simulate
+
+// simulateOutput is the JSON shape for `zksp simulate --format json`.
+// Wraps the results in a small envelope so the data-source capability
+// travels next to the numbers — a reader of a detached JSON file can
+// tell at a glance whether it came from a Transfer-log surrogate or a
+// full state-diff source.
+type simulateOutput struct {
+	DataSource *extractor.Capability `json:"data_source,omitempty"`
+	Results    []*sim.Result         `json:"results"`
+}
 
 func newSimulateCmd() *cobra.Command {
 	var dbPath, policyName, format, modelPath string
@@ -598,10 +614,24 @@ func newSimulateCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("simulate: %w", err)
 			}
-			if outputFormat(format).isJSON() {
-				return emitJSON(cmd.OutOrStdout(), []*sim.Result{res})
+			capStamp, capOK, err := extractor.ReadCapability(ctx, db)
+			if err != nil {
+				return fmt.Errorf("read capability: %w", err)
 			}
-			return render.SimResults(cmd.OutOrStdout(), []*sim.Result{res})
+			var dataSource *extractor.Capability
+			if capOK {
+				c := capStamp
+				dataSource = &c
+			}
+			out := cmd.OutOrStdout()
+			if outputFormat(format).isJSON() {
+				return emitJSON(out, simulateOutput{
+					DataSource: dataSource,
+					Results:    []*sim.Result{res},
+				})
+			}
+			renderDataSourceHeader(out, dataSource)
+			return render.SimResults(out, []*sim.Result{res})
 		},
 	}
 	cmd.Flags().StringVar(&dbPath, "db", defaultDBPath, "SQLite DB path")
@@ -624,10 +654,15 @@ func newSimulateCmd() *cobra.Command {
 // five sections bundled into one payload so downstream scripts can
 // parse it without stream-mode parsing the text output.
 type fullReport struct {
-	EDA      *analysis.EDAReport  `json:"eda"`
-	KMCurves []*analysis.KMResult `json:"km_curves"`
-	Tiering  []*sim.Result        `json:"tiering"`
-	Cox      *app.CoxFitReport    `json:"cox,omitempty"`
+	// DataSource stamps the capability of the most recent Extract call
+	// that populated this DB. Lets a downstream consumer distinguish
+	// "Brier computed on Transfer-only surrogate" from "Brier computed
+	// on full state diff" without re-running the pipeline.
+	DataSource *extractor.Capability `json:"data_source,omitempty"`
+	EDA        *analysis.EDAReport   `json:"eda"`
+	KMCurves   []*analysis.KMResult  `json:"km_curves"`
+	Tiering    []*sim.Result         `json:"tiering"`
+	Cox        *app.CoxFitReport     `json:"cox,omitempty"`
 }
 
 func newReportCmd() *cobra.Command {
@@ -647,6 +682,12 @@ func newReportCmd() *cobra.Command {
 			window := domain.ObservationWindow{Start: startBlock, End: endBlock}
 			out := cmd.OutOrStdout()
 			fmtMode := outputFormat(format)
+
+			// 0. Data-source stamp for self-documenting output.
+			capStamp, capOK, err := extractor.ReadCapability(ctx, db)
+			if err != nil {
+				return fmt.Errorf("read capability: %w", err)
+			}
 
 			// 1. EDA (full, with spatial + temporal)
 			rep, err := analysis.RunEDAFull(ctx, db, window)
@@ -684,14 +725,21 @@ func newReportCmd() *cobra.Command {
 			// compiler doesn't prune the return arity by accident.
 			coxReport, _, coxErr := app.BuildCoxFitReport(fitter, built.Intervals, 0.3, 1, 0, "")
 
+			var dataSource *extractor.Capability
+			if capOK {
+				c := capStamp
+				dataSource = &c
+			}
 			if fmtMode.isJSON() {
 				return emitJSON(out, fullReport{
-					EDA:      rep,
-					KMCurves: curves,
-					Tiering:  results,
-					Cox:      coxReport,
+					DataSource: dataSource,
+					EDA:        rep,
+					KMCurves:   curves,
+					Tiering:    results,
+					Cox:        coxReport,
 				})
 			}
+			renderDataSourceHeader(out, dataSource)
 			return renderReportText(out, rep, curves, results, coxReport, coxErr)
 		},
 	}
@@ -771,6 +819,21 @@ func buildReportPolicies(
 		policies = append(policies, p)
 	}
 	return policies, nil
+}
+
+// renderDataSourceHeader prints a one-line banner identifying which
+// extractor produced the DB rows the report is about to summarise.
+// When the DB has never been extracted against (fresh file) the
+// banner says "unknown data source" rather than silently printing
+// nothing — absence of the stamp is itself information the reader
+// should see.
+func renderDataSourceHeader(out io.Writer, cap *extractor.Capability) {
+	if cap == nil {
+		fmt.Fprintln(out, "# data source: unknown (no Extract has populated this DB)")
+		return
+	}
+	fmt.Fprintf(out, "# data source: %s  reads=%v  non-Transfer-writes=%v  slot_id=%s\n",
+		cap.Source, cap.ObservesReads, cap.ObservesNonTransferWrite, cap.SlotIDForm)
 }
 
 // renderReportText prints the four section blocks of the text-mode
