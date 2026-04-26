@@ -1,4 +1,4 @@
-.PHONY: build test lint tidy clean run cover scroll-smoke scroll-100k
+.PHONY: build test lint tidy clean run cover scroll-smoke scroll-100k qa-viz
 
 BIN := bin/zksp
 PKG := ./...
@@ -40,3 +40,21 @@ scroll-smoke: build
 
 scroll-100k: build
 	./scripts/scroll_100k_surrogate.sh
+
+# ---- QA / viz -------------------------------------------------------
+# qa-viz: stdlib-only Python script that reads either a single
+# `zksp report --format json` file OR a directory of simulate_*.json
+# files, and emits qa_summary.json, degeneracy_flags.json, and two
+# hand-written SVGs under $(QA_OUT) (default
+# testdata/runs/scroll_100k/qa/).
+#
+#   make qa-viz REPORT=testdata/runs/scroll_100k/report.json
+#   make qa-viz REPORT=testdata/runs/scroll_100k/sweep_v2 \
+#               QA_OUT=testdata/runs/scroll_100k/qa_v2
+QA_OUT ?= testdata/runs/scroll_100k/qa
+qa-viz:
+	@if [ -z "$(REPORT)" ]; then \
+	    echo "usage: make qa-viz REPORT=<report.json|sweep-dir> [QA_OUT=<dir>]"; \
+	    exit 2; \
+	fi
+	python3 scripts/qa_viz.py --report "$(REPORT)" --out-dir "$(QA_OUT)"

@@ -1,0 +1,72 @@
+{
+  "cost_consistency": {
+    "issues": [],
+    "n_checked": 40,
+    "n_issues": 0
+  },
+  "degenerate_cells": {
+    "count": 1,
+    "thresholds": {
+      "hot_hit_degen": 0.3,
+      "pruned_frac_degen": 0.99,
+      "ramratio_degen": 0.001
+    }
+  },
+  "ells_seen": [
+    32,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    16384
+  ],
+  "input": "/Users/joseph/zk-state-prune/testdata/runs/scroll_100k/sweep_v2",
+  "n_cells": 40,
+  "out_dir": "/Users/joseph/zk-state-prune/testdata/runs/scroll_100k/qa",
+  "policies": [
+    "fixed-10k",
+    "fixed-1k",
+    "no-prune",
+    "statistical"
+  ],
+  "same_ram_compare": {
+    "n_pairs": 1,
+    "pairs": [
+      {
+        "delta": {
+          "false_prune_rate": -0.10512371768709834,
+          "hot_hit_coverage": 0.10512371768709838
+        },
+        "ell": 512,
+        "fixed-1k": {
+          "false_prune_rate": 0.07914888318587744,
+          "hot_hit_coverage": 0.9208511168141226,
+          "miss_penalty_agg": 5858304,
+          "ramcost": 27025925,
+          "ramratio": 0.06155928110076628,
+          "reactivations": 11442,
+          "total_cost": 32884229
+        },
+        "statistical": {
+          "false_prune_rate": 0.18427260087297578,
+          "hot_hit_coverage": 0.8157273991270242,
+          "miss_penalty_agg": 13639168,
+          "ramcost": 26910492,
+          "ramratio": 0.061296349397399794,
+          "reactivations": 26639,
+          "total_cost": 40549660
+        }
+      }
+    ],
+    "policy_a": "fixed-1k",
+    "policy_b": "statistical",
+    "ramratio_band": [
+      0.06,
+      0.062
+    ]
+  }
+}
