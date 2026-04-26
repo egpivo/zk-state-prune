@@ -1,0 +1,28 @@
+{
+  "data_source": {
+    "source": "rpc",
+    "observes_reads": false,
+    "observes_non_transfer_write": false,
+    "slot_id_form": "contract:holder (Transfer-log surrogate)"
+  },
+  "results": [
+    {
+      "Policy": "statistical",
+      "TotalSlots": 6730,
+      "ObservedIntervals": 144563,
+      "CensoredIntervals": 6730,
+      "TotalExposure": 439022752,
+      "SlotBlocksPruned": 412112260,
+      "SlotBlocksHot": 26910492,
+      "RAMRatio": 0.061296349397399794,
+      "HotHitCoverage": 0.8157273991270242,
+      "RAMCost": 26910492,
+      "MissPenaltyAgg": 13639168,
+      "TotalCost": 40549660,
+      "Reactivations": 26639,
+      "FinalPrunedSlots": 6730,
+      "StorageSavedFrac": 0.9387036506026002,
+      "FalsePruneRate": 0.18427260087297578
+    }
+  ]
+}

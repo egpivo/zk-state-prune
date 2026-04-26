@@ -46,10 +46,30 @@ type RPCConfig struct {
 	// signal comes from log.Topics, not from the function-selector
 	// + bytecode pipeline that this guardrail watches.
 	StrictCategories bool
+
+	// MaxRetries is the number of *retries* (not total attempts)
+	// rpcCall will perform on transient HTTP-level failures
+	// (timeout / connection reset / 5xx). Default (0 in struct, 3
+	// after DefaultRPCConfig) is what production runs use; tests
+	// often set it to 0 to fail fast on the first error.
+	// Protocol-level RPC errors (e.g. -32601 method not found) are
+	// never retried — they don't recover by being asked again.
+	MaxRetries int
+
+	// RetryBaseDelay is the first-retry backoff. Subsequent
+	// retries double the delay (exponential), capped at 10s per
+	// attempt. Zero falls back to 200ms in rpcCall.
+	RetryBaseDelay time.Duration
 }
 
 // DefaultRPCConfig returns a Scroll-mainnet-friendly default. Callers
 // typically override Start/End to point at the block range they want.
+//
+// Retry defaults (3 retries, 200ms base) mean a single transient
+// blip eats ~3.4s before recovering, and a sustained outage takes
+// 200+400+800+1600 ≈ 3s of waits before the run fails. Tuned to
+// public-RPC reliability — `rpc.scroll.io` drops connections often
+// enough that without retry, multi-hour extracts almost never finish.
 func DefaultRPCConfig() RPCConfig {
 	return RPCConfig{
 		Endpoint:  ScrollPublicRPC,
@@ -57,6 +77,8 @@ func DefaultRPCConfig() RPCConfig {
 		HTTPClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		MaxRetries:     3,
+		RetryBaseDelay: 200 * time.Millisecond,
 	}
 }
 
@@ -482,10 +504,58 @@ func (e *RPCExtractor) call(ctx context.Context, method string, params []any, ou
 // rpcCall is the shared JSON-RPC transport — used by both the
 // Transfer-log surrogate (RPCExtractor) and the real state-diff
 // extractor (StateDiffExtractor) so they agree on body shape, error
-// translation, and HTTP handling. The reqID pointer is mutated by
-// callers before each invocation; passing it by pointer keeps the
-// counter on whichever extractor owns it.
+// translation, and HTTP handling. Wraps rpcCallOnce in
+// retry-with-backoff for transient HTTP failures (timeout,
+// connection reset, 5xx). Protocol-level errors (-32601, decode
+// failures) fail fast — those don't recover on retry.
+//
+// The reqID pointer is mutated by callers before each invocation;
+// retries reuse the same ID, since logically it's the same request.
 func rpcCall(ctx context.Context, cfg RPCConfig, reqID *int, method string, params []any, out any) error {
+	maxAttempts := cfg.MaxRetries + 1
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	base := cfg.RetryBaseDelay
+	if base <= 0 {
+		base = 200 * time.Millisecond
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			backoff := base << (attempt - 2) // exp: base, 2·base, 4·base, …
+			if backoff > 10*time.Second {
+				backoff = 10 * time.Second
+			}
+			slog.Warn("rpc transient error, retrying",
+				"method", method,
+				"attempt", attempt-1,
+				"max_retries", cfg.MaxRetries,
+				"backoff", backoff,
+				"err", lastErr)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+		err := rpcCallOnce(ctx, cfg, reqID, method, params, out)
+		if err == nil {
+			return nil
+		}
+		if !isTransientHTTPError(err) {
+			return err
+		}
+		lastErr = err
+	}
+	return fmt.Errorf("%s: gave up after %d transient failures: %w", method, maxAttempts, lastErr)
+}
+
+// rpcCallOnce performs exactly one JSON-RPC round trip — no retry.
+// Kept separate from rpcCall so the retry wrapper stays readable
+// and so tests can target either layer in isolation.
+func rpcCallOnce(ctx context.Context, cfg RPCConfig, reqID *int, method string, params []any, out any) error {
 	body, err := json.Marshal(rpcRequest{
 		JSONRPC: "2.0",
 		Method:  method,
@@ -523,6 +593,52 @@ func rpcCall(ctx context.Context, cfg RPCConfig, reqID *int, method string, para
 		}
 	}
 	return nil
+}
+
+// isTransientHTTPError classifies an rpcCallOnce error as
+// transport-level (worth retrying) or protocol-level (fail fast).
+// We match on substrings of the error message because Go wraps a
+// patchwork of net / context / http errors that don't share a
+// single typed root. The patterns cover Scroll public RPC's
+// observed failure modes:
+//
+//   - "context deadline exceeded": HTTP client Timeout fired
+//   - "connection reset by peer":  TCP RST mid-response
+//   - "connection refused":        endpoint actively rejecting
+//   - "broken pipe":               we wrote, then connection died
+//   - "i/o timeout":               read or dial timeout
+//   - "EOF" / "unexpected EOF":    server closed connection early
+//   - "no such host":              DNS NXDOMAIN — macOS resolver
+//     flakes briefly, clears on retry
+//   - "network is unreachable":    interface flap / VPN reconnect
+//   - "host is unreachable":       routing blip
+//   - "HTTP 5":                    any 5xx response
+//
+// Protocol errors ("rpc error -32601 method not found", "decode <m>",
+// "unmarshal <m>") return false — they reflect a request the server
+// can't fulfil, not a transient transport blip.
+func isTransientHTTPError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, pat := range []string{
+		"deadline exceeded",
+		"connection reset",
+		"connection refused",
+		"broken pipe",
+		"i/o timeout",
+		"EOF",
+		"no such host",
+		"network is unreachable",
+		"host is unreachable",
+		"HTTP 5", // any 5xx
+	} {
+		if strings.Contains(msg, pat) {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *RPCExtractor) fetchBlock(ctx context.Context, blockNum uint64) (*rpcBlock, error) {

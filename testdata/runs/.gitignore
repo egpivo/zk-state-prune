@@ -11,3 +11,5 @@ scroll_smoke/
 *.db-shm
 *.db-wal
 extract.log
+*.stderr
+cox.model # 如果你採我的建議
