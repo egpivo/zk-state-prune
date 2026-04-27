@@ -3,26 +3,35 @@
 
 Reads either:
   - a single `zksp report --format json` file (5 policies at one cost cell), or
-  - a directory of `simulate_*.json` files (one cell per file, ℓ encoded
-    in the filename as `..._l<N>.json`).
+  - a directory of `*_l<N>.json` envelopes (one cell per file, ℓ encoded
+    in the stem; matches both `simulate_<policy>_l<N>.json` (top-level)
+    and the unprefixed `<policy>_l<N>.json` shape used under sweep_v2/).
 
 Writes deterministic artifacts to --out-dir (default
 `testdata/runs/scroll_100k/qa/`):
-  - qa_summary.json        machine-readable summary
-  - degeneracy_flags.json  cells flagged as degenerate, with reasons
-  - cost_decomposition.svg stacked RAMCost + MissPenaltyAgg per cell
+  - qa_summary.json            machine-readable summary, all checks rolled up
+  - degeneracy_flags.json      cells flagged as degenerate, with reasons
+  - schema_issues.json         cells with missing fields, wrong types, out-of-range values
+  - grid_gaps.json             missing or duplicated (policy, ℓ) cells
+  - monotonic_violations.json  statistical-policy ℓ-trend violations
+  - same_ram_matches.json      auto-paired (policy_a, policy_b, ℓ) where |ΔRAMRatio| < eps
+  - cost_decomposition.svg     stacked RAMCost + MissPenaltyAgg per cell
   - pareto_ramratio_coverage.svg  RAMRatio (x) vs HotHitCoverage (y)
+  - qa_report.html             one-page dashboard (embeds the two SVGs)
 
 Determinism: all loops sort by (ℓ, policy); JSON dumps with sort_keys.
-SVG is hand-written (no matplotlib), so output bytes are stable across
-hosts as long as the Python decimal formatter is stable.
+SVG/HTML is hand-written (no matplotlib / Jinja), so output bytes are
+stable across hosts as long as the Python decimal formatter is stable.
 
-No external dependencies: stdlib only (json, argparse, math, pathlib, re).
+No external dependencies: stdlib only (json, argparse, html, itertools,
+math, pathlib, re).
 """
 
 from __future__ import annotations
 
 import argparse
+import html
+import itertools
 import json
 import math
 import re
@@ -35,8 +44,22 @@ from typing import Any
 DEFAULT_RAMRATIO_DEGEN = 0.001  # < 0.1% → "demote almost everything"
 DEFAULT_PRUNED_FRAC_DEGEN = 0.99  # > 99% of TotalExposure pruned
 DEFAULT_HOT_HIT_DEGEN = 0.30  # < 30% → "miss-heavy"
-DEFAULT_SAME_RAM_LO = 0.060  # 6.0%
-DEFAULT_SAME_RAM_HI = 0.062  # 6.2%
+DEFAULT_SAME_RAM_EPS = 0.005  # |ΔRAMRatio| < 0.5pp → comparable RAM budget
+
+# Numeric fields whose value should always lie in [0, 1]. Drift here is
+# usually a units/scale bug (e.g. percent vs fraction).
+UNIT_RANGE_FIELDS = ("RAMRatio", "HotHitCoverage", "FalsePruneRate", "StorageSavedFrac")
+# Numeric fields that must be ≥ 0 but have no upper bound.
+NON_NEGATIVE_FIELDS = (
+    "RAMCost", "MissPenaltyAgg", "TotalCost",
+    "TotalSlots", "TotalExposure", "SlotBlocksPruned", "SlotBlocksHot",
+    "ObservedIntervals", "CensoredIntervals",
+    "Reactivations", "FinalPrunedSlots",
+)
+# Required fields per cell.
+REQUIRED_FIELDS = ("Policy",) + UNIT_RANGE_FIELDS + NON_NEGATIVE_FIELDS
+# Policies whose ℓ-monotonicity properties we sanity-check.
+THRESHOLD_POLICIES = ("statistical", "statistical-robust")
 
 # ----- policies + colours (deterministic) ------------------------------
 
@@ -72,6 +95,16 @@ def parse_ell(stem: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def rel_to_cwd(p: Path) -> str:
+    """Return p as a repo-relative POSIX path when it sits under cwd, else
+    the absolute path. Keeps qa_summary.json diffs portable across hosts
+    without losing pointer fidelity for out-of-tree inputs."""
+    try:
+        return p.resolve().relative_to(Path.cwd().resolve()).as_posix()
+    except ValueError:
+        return p.resolve().as_posix()
+
+
 def load_results(input_path: Path) -> list[dict[str, Any]]:
     """Returns a flat list of cell dicts. Each cell carries the original
     fields from sim.Result plus internal `_source` and `_ell` keys.
@@ -89,27 +122,36 @@ def _load_single_report(p: Path) -> list[dict[str, Any]]:
     with p.open() as f:
         data = json.load(f)
     tiering = data.get("tiering") or data.get("Tiering") or []
-    return [{**r, "_source": str(p), "_ell": None} for r in tiering]
+    ds = data.get("data_source")
+    src = rel_to_cwd(p)
+    return [{**r, "_source": src, "_ell": None, "_data_source": ds} for r in tiering]
 
 
 def _load_sweep_dir(d: Path) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
+    # Sweep cells live under two naming conventions in this repo:
+    #   testdata/runs/scroll_100k/simulate_<policy>_l<ℓ>.json   (top-level)
+    #   testdata/runs/scroll_100k/sweep_v2/<policy>_l<ℓ>.json   (re-runs)
+    # Both encode ℓ as `_l<N>` in the stem, so gate inclusion on the
+    # ℓ-pattern instead of a name prefix. This also screens out
+    # qa_summary.json, report.json, and any other envelope that
+    # happens to carry a `results` key but isn't a sweep cell.
     for child in sorted(d.glob("*.json")):
-        if child.name == "qa_summary.json" or child.name.endswith(".expected.json"):
+        if parse_ell(child.stem) is None:
             continue
         try:
             with child.open() as f:
                 data = json.load(f)
         except json.JSONDecodeError:
             continue
-        # `simulate_*` JSONs are wrapped: {data_source, results: [...]}
-        # `report.json` is a different shape; we only treat envelope here.
         results = data.get("results")
         if not isinstance(results, list):
             continue
         ell = parse_ell(child.stem)
+        ds = data.get("data_source")
+        src = rel_to_cwd(child)
         for r in results:
-            out.append({**r, "_source": str(child), "_ell": ell})
+            out.append({**r, "_source": src, "_ell": ell, "_data_source": ds})
     return out
 
 
@@ -149,9 +191,11 @@ def flag_degenerate(
     pruned_frac_thr: float,
     hot_hit_thr: float,
 ) -> list[dict[str, Any]]:
-    """Tag any cell that hits one of the three degenerate corners and
-    record why. Each reason carries the actual value + the threshold so
-    a reader can re-tune the policy without rerunning the QA tool."""
+    """Flag a cell only when ALL THREE degenerate-corner conditions hold
+    simultaneously. The three metrics co-vary by construction (kept-few
+    ↔ pruned-most ↔ miss-heavy), so requiring all three avoids false
+    positives from a single extreme metric while still catching the
+    "demote everything and pay miss penalty" regime."""
     flags = []
     for r in results:
         ramratio = r.get("RAMRatio") or 0
@@ -175,7 +219,7 @@ def flag_degenerate(
                 f"HotHitCoverage {hot_hit:.6f} < {hot_hit_thr:.6f} "
                 f"(miss-heavy — most accesses fall on demoted slots)"
             )
-        if reasons:
+        if len(reasons) == 3:
             flags.append({
                 "source": r.get("_source"),
                 "policy": r.get("Policy"),
@@ -189,41 +233,46 @@ def flag_degenerate(
     return flags
 
 
-def same_ram_pairs(
-    results: list[dict[str, Any]],
-    lo: float,
-    hi: float,
-    policy_a: str,
-    policy_b: str,
-) -> list[dict[str, Any]]:
-    """For every ℓ where both policies have RAMRatio in [lo, hi], emit a
-    side-by-side comparison. Lets a reader spot prediction-quality
-    differences without the cost-arithmetic confound."""
-    by_ell: dict[int, dict[str, dict[str, Any]]] = {}
+def find_same_ram_matches(results: list[dict[str, Any]], eps: float) -> list[dict[str, Any]]:
+    """For every ℓ, emit one match per (policy_a, policy_b) pair whose
+    RAMRatio differs by less than `eps`. Replaces the old fixed-band
+    comparison: instead of forcing the reader to hand-pick a band that
+    happens to contain a comparable pair, surface every comparable pair
+    the sweep contains.
+
+    Lexicographic ordering on policy names makes (a, b) appear once
+    (no mirror duplicates), and the output is sorted by (ell,
+    policy_a, policy_b) for byte-stable diffs."""
+    by_ell: dict[int, list[dict[str, Any]]] = {}
     for r in results:
         ell = r.get("_ell")
-        if ell is None:
+        if ell is None or r.get("RAMRatio") is None:
             continue
-        if not (lo <= (r.get("RAMRatio") or 0) <= hi):
-            continue
-        by_ell.setdefault(ell, {})[r.get("Policy")] = r
+        by_ell.setdefault(ell, []).append(r)
 
-    pairs = []
+    matches = []
     for ell in sorted(by_ell):
-        plc = by_ell[ell]
-        a, b = plc.get(policy_a), plc.get(policy_b)
-        if a is None or b is None:
-            continue
-        pairs.append({
-            "ell": ell,
-            policy_a: _slice(a),
-            policy_b: _slice(b),
-            "delta": {
-                "hot_hit_coverage": (a.get("HotHitCoverage", 0) - b.get("HotHitCoverage", 0)),
-                "false_prune_rate": (a.get("FalsePruneRate", 0) - b.get("FalsePruneRate", 0)),
-            },
-        })
-    return pairs
+        cells = sorted(by_ell[ell], key=lambda r: r.get("Policy") or "")
+        for a, b in itertools.combinations(cells, 2):
+            ra = a.get("RAMRatio") or 0
+            rb = b.get("RAMRatio") or 0
+            if abs(ra - rb) >= eps:
+                continue
+            pol_a = a.get("Policy") or "?"
+            pol_b = b.get("Policy") or "?"
+            matches.append({
+                "ell": ell,
+                "policy_a": pol_a,
+                "policy_b": pol_b,
+                "ramratio_a": ra,
+                "ramratio_b": rb,
+                "delta_ramratio": ra - rb,
+                "delta_hot_hit_coverage": (a.get("HotHitCoverage", 0) - b.get("HotHitCoverage", 0)),
+                "delta_false_prune_rate": (a.get("FalsePruneRate", 0) - b.get("FalsePruneRate", 0)),
+                "delta_total_cost": (a.get("TotalCost", 0) - b.get("TotalCost", 0)),
+                "details": {pol_a: _slice(a), pol_b: _slice(b)},
+            })
+    return matches
 
 
 def _slice(r: dict[str, Any]) -> dict[str, Any]:
@@ -236,6 +285,162 @@ def _slice(r: dict[str, Any]) -> dict[str, Any]:
         "total_cost": r.get("TotalCost"),
         "reactivations": r.get("Reactivations"),
     }
+
+
+def check_grid_completeness(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Detect missing or duplicated (policy, ℓ) cells in a sweep.
+
+    Missing = cells absent from the cartesian product `policies × ells`,
+    where both axes are derived from what's actually in the input. (We
+    do not know the *intended* grid; the closest honest proxy is
+    "everything we'd expect if the sweep was a complete cartesian
+    product of what we observed").
+
+    Duplicate = a (policy, ℓ) pair that appears more than once across
+    files — usually a leftover from a half-cleaned re-run."""
+    counts: dict[tuple[str, int], int] = {}
+    sources: dict[tuple[str, int], list[str]] = {}
+    for r in results:
+        ell = r.get("_ell")
+        pol = r.get("Policy")
+        if ell is None or pol is None:
+            continue
+        key = (pol, ell)
+        counts[key] = counts.get(key, 0) + 1
+        sources.setdefault(key, []).append(r.get("_source") or "")
+
+    policies = sorted({pol for (pol, _) in counts})
+    ells = sorted({ell for (_, ell) in counts})
+    expected = {(pol, ell) for pol in policies for ell in ells}
+    present = set(counts)
+    missing = sorted(expected - present)
+    duplicates = sorted([k for k, c in counts.items() if c > 1])
+
+    return {
+        "policies": policies,
+        "ells": ells,
+        "n_expected": len(expected),
+        "n_present": len(present),
+        "missing": [{"policy": p, "ell": e} for (p, e) in missing],
+        "duplicates": [
+            {"policy": p, "ell": e, "count": counts[(p, e)], "sources": sources[(p, e)]}
+            for (p, e) in duplicates
+        ],
+    }
+
+
+def check_data_sources(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Capability/data-source guardrail. Mixing `rpc` (Transfer-log
+    surrogate) with `statediff` (true read+write trace) in the same
+    sweep would silently produce apples-to-oranges costs, since the
+    extractors observe different slot universes — flag that loudly."""
+    by_source: dict[str, int] = {}
+    full_capabilities: dict[str, dict[str, Any]] = {}
+    for r in results:
+        ds = r.get("_data_source")
+        if not isinstance(ds, dict):
+            continue
+        src = ds.get("source") or "?"
+        by_source[src] = by_source.get(src, 0) + 1
+        # Keep one full capability dict per source kind so the reader
+        # can spot drift even within a single source family.
+        full_capabilities.setdefault(src, ds)
+
+    sources = sorted(by_source)
+    return {
+        "sources": sources,
+        "n_distinct": len(sources),
+        "cells_per_source": {s: by_source[s] for s in sources},
+        "capabilities": {s: full_capabilities[s] for s in sources},
+        "mixed": len(sources) > 1,
+    }
+
+
+def check_schema_sanity(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per-cell schema/type/range checks. Catches drift earlier than the
+    cost-arithmetic verifier does — e.g. a renamed field, a percent that
+    snuck in where a fraction was expected, or a negative count."""
+    issues = []
+    for r in results:
+        cell_issues: list[str] = []
+        for f in REQUIRED_FIELDS:
+            if f not in r:
+                cell_issues.append(f"missing field {f!r}")
+                continue
+            v = r.get(f)
+            if f == "Policy":
+                if not isinstance(v, str) or not v:
+                    cell_issues.append(f"{f}: expected non-empty str, got {type(v).__name__} {v!r}")
+                continue
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                cell_issues.append(f"{f}: expected number, got {type(v).__name__} {v!r}")
+                continue
+            if math.isnan(v) or math.isinf(v):
+                cell_issues.append(f"{f}: non-finite ({v!r})")
+                continue
+            if f in UNIT_RANGE_FIELDS and not (0.0 <= v <= 1.0):
+                cell_issues.append(f"{f}: {v!r} not in [0, 1]")
+            elif f in NON_NEGATIVE_FIELDS and v < 0:
+                cell_issues.append(f"{f}: {v!r} < 0")
+        if cell_issues:
+            issues.append({
+                "source": r.get("_source"),
+                "policy": r.get("Policy"),
+                "ell": r.get("_ell"),
+                "issues": cell_issues,
+            })
+    return issues
+
+
+def check_monotonic_trends(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """For each threshold-based policy in `THRESHOLD_POLICIES`, walk
+    cells in increasing ℓ order and flag violations of:
+      - RAMRatio non-decreasing in ℓ (larger ℓ → higher c·τ/ℓ-derived
+        threshold p* → keep more slots hot → RAMRatio ↑)
+      - Reactivations non-increasing in ℓ (more slots kept hot → fewer
+        demoted → fewer reactivations needed)
+
+    We deliberately don't run this for `fixed-*` (idle threshold is in
+    blocks, not ℓ-driven) or `no-prune` (RAMRatio≡1, Reactivations≡0).
+    A small numeric tolerance avoids spurious flags from rounding."""
+    tol = 1e-9
+    violations = []
+    by_policy: dict[str, list[dict[str, Any]]] = {}
+    for r in results:
+        pol = r.get("Policy")
+        ell = r.get("_ell")
+        if pol not in THRESHOLD_POLICIES or ell is None:
+            continue
+        by_policy.setdefault(pol, []).append(r)
+
+    for pol in sorted(by_policy):
+        cells = sorted(by_policy[pol], key=lambda r: r.get("_ell") or 0)
+        for prev, cur in zip(cells, cells[1:]):
+            ramratio_drop = (prev.get("RAMRatio") or 0) - (cur.get("RAMRatio") or 0)
+            if ramratio_drop > tol:
+                violations.append({
+                    "policy": pol,
+                    "metric": "RAMRatio",
+                    "expected": "non-decreasing in ℓ",
+                    "ell_prev": prev.get("_ell"),
+                    "ell_cur": cur.get("_ell"),
+                    "value_prev": prev.get("RAMRatio"),
+                    "value_cur": cur.get("RAMRatio"),
+                    "delta": -(ramratio_drop),  # cur - prev (negative = bad)
+                })
+            react_jump = (cur.get("Reactivations") or 0) - (prev.get("Reactivations") or 0)
+            if react_jump > tol:
+                violations.append({
+                    "policy": pol,
+                    "metric": "Reactivations",
+                    "expected": "non-increasing in ℓ",
+                    "ell_prev": prev.get("_ell"),
+                    "ell_cur": cur.get("_ell"),
+                    "value_prev": prev.get("Reactivations"),
+                    "value_cur": cur.get("Reactivations"),
+                    "delta": react_jump,  # cur - prev (positive = bad)
+                })
+    return violations
 
 
 # ----- SVG rendering ---------------------------------------------------
@@ -376,7 +581,7 @@ def render_pareto(results: list[dict[str, Any]], out_path: Path) -> None:
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
         f'viewBox="0 0 {W} {H}" font-family="sans-serif" font-size="11">',
         f'<text x="{W//2}" y="28" text-anchor="middle" font-size="14" font-weight="bold">'
-        f'RAMRatio vs HotHitCoverage (lower-left = noisier policy)</text>',
+        f'RAMRatio vs HotHitCoverage (lower-left = cheap-but-low-coverage)</text>',
         f'<text x="{W//2}" y="46" text-anchor="middle" font-size="10" fill="#555">'
         f'top-left ↖ is ideal: low RAM, high coverage</text>',
     ]
@@ -477,6 +682,214 @@ def _empty_svg(title: str) -> str:
     )
 
 
+# ----- HTML dashboard --------------------------------------------------
+
+
+def render_html_dashboard(summary: dict[str, Any], out_path: Path) -> None:
+    """Single self-contained HTML page summarising every check, with the
+    two SVGs referenced from the same out_dir. Hand-written so we don't
+    pick up a Jinja / Mustache dependency."""
+
+    def h(s: Any) -> str:
+        return html.escape(str(s), quote=True)
+
+    def status(ok: bool) -> str:
+        return '<span class="ok">OK</span>' if ok else '<span class="bad">FAIL</span>'
+
+    cost = summary["cost_consistency"]
+    schema = summary["schema_sanity"]
+    grid = summary["grid_completeness"]
+    sources = summary["data_sources"]
+    degen = summary["degenerate_cells"]
+    mono = summary["monotonic_trends"]
+    sram = summary["same_ram_matches"]
+
+    def kv_table(rows: list[tuple[str, Any]]) -> str:
+        body = "".join(
+            f"<tr><th>{h(k)}</th><td>{h(v)}</td></tr>" for k, v in rows
+        )
+        return f"<table class='kv'>{body}</table>"
+
+    cost_ok = cost["n_issues"] == 0
+    schema_ok = schema["n_issues"] == 0
+    grid_ok = len(grid["missing"]) == 0 and len(grid["duplicates"]) == 0
+    sources_ok = not sources["mixed"] and sources["n_distinct"] >= 1
+    mono_ok = mono["n_violations"] == 0
+
+    summary_rows = [
+        ("input", summary["input"]),
+        ("cells", summary["n_cells"]),
+        ("policies", ", ".join(summary["policies"]) or "—"),
+        ("ℓ values seen", ", ".join(str(e) for e in summary["ells_seen"]) or "—"),
+        ("data sources", ", ".join(sources["sources"]) or "—"),
+    ]
+
+    check_rows = [
+        ("Schema sanity",
+         f"{status(schema_ok)} ({schema['n_issues']} cells with issues / {summary['n_cells']})"),
+        ("Cost arithmetic",
+         f"{status(cost_ok)} ({cost['n_issues']} of {cost['n_checked']} cells failed)"),
+        ("Data-source guardrail",
+         f"{status(sources_ok)} ({sources['n_distinct']} distinct, "
+         f"{'mixed!' if sources['mixed'] else 'consistent'})"),
+        ("Grid completeness",
+         f"{status(grid_ok)} ({grid['n_present']}/{grid['n_expected']} cells, "
+         f"{len(grid['missing'])} missing, {len(grid['duplicates'])} duplicate)"),
+        ("Degenerate cells (info)",
+         f"{degen['count']} flagged (RAMRatio &lt; {h(degen['thresholds']['ramratio_degen'])}, "
+         f"pruned_frac &gt; {h(degen['thresholds']['pruned_frac_degen'])}, "
+         f"HotHitCoverage &lt; {h(degen['thresholds']['hot_hit_degen'])})"),
+        ("Monotonic trends (statistical)",
+         f"{status(mono_ok)} ({mono['n_violations']} violations across "
+         f"{', '.join(THRESHOLD_POLICIES)})"),
+        ("Same-RAM matches",
+         f"{sram['n_matches']} pairs with |ΔRAMRatio| &lt; {h(sram['epsilon'])}"),
+    ]
+
+    def check_table(rows: list[tuple[str, str]]) -> str:
+        body = "".join(f"<tr><th>{h(k)}</th><td>{v}</td></tr>" for k, v in rows)
+        return f"<table class='checks'>{body}</table>"
+
+    same_ram_table = _html_same_ram_table(sram["matches"], h)
+    degen_table = _html_degen_table(summary.get("_degen_full", []), h)
+    grid_block = _html_grid_block(grid, h)
+    mono_block = _html_mono_block(mono["violations"], h)
+
+    parts = [
+        "<!DOCTYPE html>",
+        "<html lang='en'><head><meta charset='utf-8'>",
+        f"<title>qa_viz — {h(summary['input'])}</title>",
+        "<style>",
+        "body { font-family: system-ui, sans-serif; max-width: 1100px; margin: 24px auto; padding: 0 16px; color: #222; }",
+        "h1 { font-size: 1.4em; margin-bottom: 4px; }",
+        "h2 { font-size: 1.1em; margin-top: 28px; border-bottom: 1px solid #ddd; padding-bottom: 4px; }",
+        "table { border-collapse: collapse; margin: 8px 0; }",
+        "th, td { padding: 4px 10px; border-bottom: 1px solid #eee; text-align: left; vertical-align: top; }",
+        "table.kv th { width: 180px; color: #555; font-weight: 500; }",
+        "table.checks th { width: 260px; color: #555; font-weight: 500; }",
+        "table.data th { background: #f6f6f6; font-weight: 600; }",
+        "table.data { font-size: 0.9em; }",
+        "code { background: #f6f6f6; padding: 1px 4px; border-radius: 3px; font-size: 0.92em; }",
+        ".ok  { color: #1f7a1f; font-weight: 600; }",
+        ".bad { color: #b91c1c; font-weight: 600; }",
+        ".muted { color: #888; font-size: 0.9em; }",
+        "img { max-width: 100%; border: 1px solid #eee; padding: 4px; background: white; }",
+        "</style></head><body>",
+        f"<h1>qa_viz dashboard</h1>",
+        f"<p class='muted'>Auto-generated from <code>{h(summary['input'])}</code>. "
+        f"Re-run with <code>make qa-viz REPORT=&lt;path&gt;</code> to refresh.</p>",
+        "<h2>Run summary</h2>",
+        kv_table(summary_rows),
+        "<h2>Checks</h2>",
+        check_table(check_rows),
+        "<h2>Cost decomposition</h2>",
+        "<img src='cost_decomposition.svg' alt='RAMCost + MissPenaltyAgg per cell'>",
+        "<h2>RAMRatio × HotHitCoverage</h2>",
+        "<img src='pareto_ramratio_coverage.svg' alt='RAMRatio vs HotHitCoverage'>",
+        "<h2>Same-RAM matches</h2>",
+        same_ram_table,
+        "<h2>Degenerate cells</h2>",
+        degen_table,
+        "<h2>Grid gaps</h2>",
+        grid_block,
+        "<h2>Monotonic-trend violations</h2>",
+        mono_block,
+        "<p class='muted'>Detail JSON: "
+        "<code>qa_summary.json</code>, <code>schema_issues.json</code>, "
+        "<code>grid_gaps.json</code>, <code>same_ram_matches.json</code>, "
+        "<code>monotonic_violations.json</code>, <code>degeneracy_flags.json</code>.</p>",
+        "</body></html>",
+    ]
+    out_path.write_text("\n".join(parts) + "\n")
+
+
+def _html_same_ram_table(matches: list[dict[str, Any]], h) -> str:
+    if not matches:
+        return "<p class='muted'>No comparable pairs at the current epsilon.</p>"
+    rows = ["<table class='data'><tr>"
+            "<th>ℓ</th><th>policy A</th><th>policy B</th>"
+            "<th>RAMRatio A</th><th>RAMRatio B</th>"
+            "<th>ΔHotHitCov</th><th>ΔFalsePrune</th><th>ΔTotalCost</th></tr>"]
+    for m in matches:
+        rows.append(
+            f"<tr>"
+            f"<td>{h(m['ell'])}</td>"
+            f"<td>{h(m['policy_a'])}</td>"
+            f"<td>{h(m['policy_b'])}</td>"
+            f"<td>{m['ramratio_a']:.4f}</td>"
+            f"<td>{m['ramratio_b']:.4f}</td>"
+            f"<td>{m['delta_hot_hit_coverage']:+.4f}</td>"
+            f"<td>{m['delta_false_prune_rate']:+.4f}</td>"
+            f"<td>{m['delta_total_cost']:+,.0f}</td>"
+            f"</tr>"
+        )
+    rows.append("</table>")
+    return "".join(rows)
+
+
+def _html_degen_table(degen: list[dict[str, Any]], h) -> str:
+    if not degen:
+        return "<p class='muted'>None.</p>"
+    rows = ["<table class='data'><tr>"
+            "<th>policy</th><th>ℓ</th>"
+            "<th>RAMRatio</th><th>pruned_frac</th><th>HotHitCov</th>"
+            "<th>FalsePrune</th></tr>"]
+    for d in degen:
+        rows.append(
+            f"<tr>"
+            f"<td>{h(d.get('policy'))}</td>"
+            f"<td>{h(d.get('ell'))}</td>"
+            f"<td>{(d.get('ramratio') or 0):.6f}</td>"
+            f"<td>{(d.get('pruned_frac') or 0):.6f}</td>"
+            f"<td>{(d.get('hot_hit_coverage') or 0):.4f}</td>"
+            f"<td>{(d.get('false_prune_rate') or 0):.4f}</td>"
+            f"</tr>"
+        )
+    rows.append("</table>")
+    return "".join(rows)
+
+
+def _html_grid_block(grid: dict[str, Any], h) -> str:
+    if not grid["missing"] and not grid["duplicates"]:
+        return "<p class='muted'>Complete cartesian grid — no missing or duplicate cells.</p>"
+    parts: list[str] = []
+    if grid["missing"]:
+        parts.append("<p><b>Missing cells:</b></p><ul>")
+        for m in grid["missing"]:
+            parts.append(f"<li>{h(m['policy'])} @ ℓ={h(m['ell'])}</li>")
+        parts.append("</ul>")
+    if grid["duplicates"]:
+        parts.append("<p><b>Duplicate cells:</b></p><ul>")
+        for d in grid["duplicates"]:
+            parts.append(
+                f"<li>{h(d['policy'])} @ ℓ={h(d['ell'])} — appears {h(d['count'])} times "
+                f"({', '.join(h(s) for s in d['sources'])})</li>"
+            )
+        parts.append("</ul>")
+    return "".join(parts)
+
+
+def _html_mono_block(violations: list[dict[str, Any]], h) -> str:
+    if not violations:
+        return "<p class='muted'>None.</p>"
+    rows = ["<table class='data'><tr>"
+            "<th>policy</th><th>metric</th><th>expected</th>"
+            "<th>ℓ prev → cur</th><th>value prev → cur</th><th>Δ</th></tr>"]
+    for v in violations:
+        rows.append(
+            f"<tr>"
+            f"<td>{h(v['policy'])}</td>"
+            f"<td>{h(v['metric'])}</td>"
+            f"<td>{h(v['expected'])}</td>"
+            f"<td>{h(v['ell_prev'])} → {h(v['ell_cur'])}</td>"
+            f"<td>{h(v['value_prev'])} → {h(v['value_cur'])}</td>"
+            f"<td>{v['delta']:+}</td>"
+            f"</tr>"
+        )
+    rows.append("</table>")
+    return "".join(rows)
+
+
 # ----- main ------------------------------------------------------------
 
 
@@ -507,17 +920,15 @@ def main(argv: list[str] | None = None) -> int:
         help=f"HotHitCoverage threshold below which a cell is degenerate (default {DEFAULT_HOT_HIT_DEGEN})",
     )
     ap.add_argument(
-        "--same-ram-lo", type=float, default=DEFAULT_SAME_RAM_LO,
-        help=f"Lower bound of the same-RAM-budget band (default {DEFAULT_SAME_RAM_LO})",
+        "--same-ram-eps", type=float, default=DEFAULT_SAME_RAM_EPS,
+        help=f"Pair (policy_a, policy_b) at the same ℓ are 'same RAM' when "
+             f"|ΔRAMRatio| < eps (default {DEFAULT_SAME_RAM_EPS})",
     )
     ap.add_argument(
-        "--same-ram-hi", type=float, default=DEFAULT_SAME_RAM_HI,
-        help=f"Upper bound of the same-RAM-budget band (default {DEFAULT_SAME_RAM_HI})",
-    )
-    ap.add_argument(
-        "--compare", default="fixed-1k:statistical",
-        help="Two policy names separated by ':' for the same-RAM comparison "
-             "(default fixed-1k:statistical)",
+        "--strict", action="store_true",
+        help="Exit non-zero on any cost-arithmetic / schema-sanity / "
+             "data-source-mixing / monotonic-trend failure. "
+             "Default is to emit artifacts and exit 0 even with findings.",
     )
     args = ap.parse_args(argv)
 
@@ -530,29 +941,34 @@ def main(argv: list[str] | None = None) -> int:
         print(f"qa_viz: no cells found in {in_path}", file=sys.stderr)
         return 1
 
+    schema_issues = check_schema_sanity(results)
     cost_issues = verify_cost_consistency(results)
     degen = flag_degenerate(
         results, args.ramratio_degen, args.pruned_frac_degen, args.hot_hit_degen,
     )
-    pol_a, _, pol_b = args.compare.partition(":")
-    if not pol_b:
-        print(f"qa_viz: --compare must be 'policyA:policyB', got {args.compare!r}", file=sys.stderr)
-        return 2
-    same_ram = same_ram_pairs(
-        results, args.same_ram_lo, args.same_ram_hi, pol_a, pol_b,
-    )
+    grid = check_grid_completeness(results)
+    sources = check_data_sources(results)
+    mono = check_monotonic_trends(results)
+    same_ram = find_same_ram_matches(results, args.same_ram_eps)
 
     summary = {
-        "input": str(in_path),
-        "out_dir": str(out_dir),
+        "input": rel_to_cwd(in_path),
+        "out_dir": rel_to_cwd(out_dir),
         "n_cells": len(results),
         "policies": sorted({r.get("Policy") for r in results if r.get("Policy")}),
         "ells_seen": sorted({r["_ell"] for r in results if r.get("_ell") is not None}),
+        "schema_sanity": {
+            "n_checked": len(results),
+            "n_issues": len(schema_issues),
+            "issues": schema_issues,
+        },
         "cost_consistency": {
             "n_checked": len(results),
             "n_issues": len(cost_issues),
             "issues": cost_issues,
         },
+        "data_sources": sources,
+        "grid_completeness": grid,
         "degenerate_cells": {
             "count": len(degen),
             "thresholds": {
@@ -561,33 +977,54 @@ def main(argv: list[str] | None = None) -> int:
                 "hot_hit_degen": args.hot_hit_degen,
             },
         },
-        "same_ram_compare": {
-            "policy_a": pol_a,
-            "policy_b": pol_b,
-            "ramratio_band": [args.same_ram_lo, args.same_ram_hi],
-            "n_pairs": len(same_ram),
-            "pairs": same_ram,
+        "monotonic_trends": {
+            "policies_checked": list(THRESHOLD_POLICIES),
+            "n_violations": len(mono),
+            "violations": mono,
         },
+        "same_ram_matches": {
+            "epsilon": args.same_ram_eps,
+            "n_matches": len(same_ram),
+            "matches": same_ram,
+        },
+        # Pull-through for the HTML renderer; not consumed by JSON readers.
+        "_degen_full": degen,
     }
 
-    (out_dir / "qa_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    (out_dir / "qa_summary.json").write_text(
+        json.dumps({k: v for k, v in summary.items() if not k.startswith("_")},
+                   indent=2, sort_keys=True) + "\n"
+    )
     (out_dir / "degeneracy_flags.json").write_text(json.dumps(degen, indent=2, sort_keys=True) + "\n")
+    (out_dir / "schema_issues.json").write_text(json.dumps(schema_issues, indent=2, sort_keys=True) + "\n")
+    (out_dir / "grid_gaps.json").write_text(json.dumps(grid, indent=2, sort_keys=True) + "\n")
+    (out_dir / "monotonic_violations.json").write_text(json.dumps(mono, indent=2, sort_keys=True) + "\n")
+    (out_dir / "same_ram_matches.json").write_text(json.dumps(same_ram, indent=2, sort_keys=True) + "\n")
     render_cost_decomposition(results, out_dir / "cost_decomposition.svg")
     render_pareto(results, out_dir / "pareto_ramratio_coverage.svg")
+    render_html_dashboard(summary, out_dir / "qa_report.html")
 
     # tiny stdout report
-    print(f"::: qa_viz: input={in_path}")
+    print(f"::: qa_viz: input={rel_to_cwd(in_path)}")
     print(f"::: cells: {len(results)}")
     print(f"::: policies: {summary['policies']}")
     if summary["ells_seen"]:
         print(f"::: ells_seen: {summary['ells_seen']}")
-    print(f"::: cost-arithmetic issues: {len(cost_issues)} of {len(results)}")
+    print(f"::: data sources: {sources['sources']} (mixed={sources['mixed']})")
+    print(f"::: schema issues:           {len(schema_issues)} of {len(results)}")
+    print(f"::: cost-arithmetic issues:  {len(cost_issues)} of {len(results)}")
+    print(f"::: grid: {grid['n_present']}/{grid['n_expected']} cells "
+          f"(missing {len(grid['missing'])}, duplicate {len(grid['duplicates'])})")
     print(f"::: degenerate cells:        {len(degen)}")
-    print(f"::: same-RAM pairs ({pol_a} vs {pol_b}, "
-          f"[{args.same_ram_lo:.3f}, {args.same_ram_hi:.3f}]): {len(same_ram)}")
-    print(f"::: artifacts under {out_dir}")
+    print(f"::: monotonic violations:    {len(mono)}")
+    print(f"::: same-RAM matches (|Δ|<{args.same_ram_eps}): {len(same_ram)}")
+    print(f"::: artifacts under {rel_to_cwd(out_dir)}")
     # Suppress unused warnings; math is used implicitly via floats.
     _ = math
+
+    if args.strict:
+        if (schema_issues or cost_issues or sources["mixed"] or mono):
+            return 3
     return 0
 
 

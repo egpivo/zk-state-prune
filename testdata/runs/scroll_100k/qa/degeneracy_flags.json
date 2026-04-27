@@ -11,6 +11,6 @@
       "SlotBlocksPruned/TotalExposure 0.999552 > 0.990000 (prunes almost all exposure \u2014 same regime as above)",
       "HotHitCoverage 0.188167 < 0.300000 (miss-heavy \u2014 most accesses fall on demoted slots)"
     ],
-    "source": "/Users/joseph/zk-state-prune/testdata/runs/scroll_100k/sweep_v2/stat_l32.json"
+    "source": "testdata/runs/scroll_100k/sweep_v2/stat_l32.json"
   }
 ]
