@@ -1,0 +1,5 @@
+{
+  "description": "pre[addr].storage is null. Parser treats null map as zero-length and emits no touches (no panic).",
+  "expect": "ok",
+  "touches": []
+}

@@ -1,0 +1,15 @@
+[
+  {
+    "txHash": "0xdddd000000000000000000000000000000000000000000000000000000000004",
+    "result": {
+      "pre": {
+        "0x4444444444444444444444444444444444444444": {
+          "storage": {
+            "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff": "0x01"
+          }
+        }
+      },
+      "post": {}
+    }
+  }
+]

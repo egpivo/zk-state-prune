@@ -1,0 +1,5 @@
+{
+  "description": "Trace entry has txHash but no result field. Result unmarshals to zero-value (nil pre/post maps); parser ranges over nil maps and produces zero touches.",
+  "expect": "ok",
+  "touches": []
+}

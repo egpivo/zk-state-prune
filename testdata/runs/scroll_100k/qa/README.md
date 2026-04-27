@@ -27,6 +27,15 @@ Add `--strict` (`make qa-viz REPORT=... -- --strict` is awkward, so
 invoke the script directly when you need it) to fail the run on any
 schema / cost-arithmetic / source-mixing / monotonic-trend issue.
 
+## Repro checklist
+
+When citing numbers from these QA artifacts, record:
+
+- Chain + observation window `[start,end)` and the command used.
+- `data_source` stamp (do not compare across sources).
+- The sweep grid (policies, ℓ values) and cost params.
+- Repo commit SHA and any ingestion limits/skips (if present).
+
 Output is deterministic — two runs against the same input produce
 byte-identical files except for the `out_dir` field in
 `qa_summary.json` when `QA_OUT` differs.

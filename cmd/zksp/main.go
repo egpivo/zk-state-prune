@@ -206,6 +206,12 @@ func newExtractCmd() *cobra.Command {
 		rpcStart         uint64
 		rpcEnd           uint64
 		strictCategories bool
+		// Hard limits — opt-in. Zero = no limit (preserves existing
+		// behaviour). Calibrated values for rpc Transfer-log surrogate
+		// on 100k Scroll blocks: see .local/extract_limits_calibration.md.
+		maxEventsPerBlock    uint64
+		maxContractsPerBlock uint64
+		maxSlotsPerBlock     uint64
 	)
 	cmd := &cobra.Command{
 		Use:   "extract",
@@ -222,7 +228,8 @@ func newExtractCmd() *cobra.Command {
 				}
 				return runMockExtract(ctx, output, seed, numContracts, totalBlocks, force)
 			case "rpc":
-				return runRPCExtract(ctx, output, rpcEndpoint, rpcStart, rpcEnd, force, resume)
+				return runRPCExtract(ctx, output, rpcEndpoint, rpcStart, rpcEnd, force, resume,
+					maxEventsPerBlock, maxContractsPerBlock, maxSlotsPerBlock)
 			case "statediff":
 				return runStateDiffExtract(ctx, output, rpcEndpoint, rpcStart, rpcEnd, force, resume, strictCategories)
 			default:
@@ -241,6 +248,15 @@ func newExtractCmd() *cobra.Command {
 	cmd.Flags().Uint64Var(&rpcStart, "start", 0, "(rpc/statediff) first block to extract")
 	cmd.Flags().Uint64Var(&rpcEnd, "end", 0, "(rpc/statediff) last block to extract (inclusive)")
 	cmd.Flags().BoolVar(&strictCategories, "strict-categories", false, "(statediff) error out instead of warning when more than 20% of contracts can't be classified — use in CI / scheduled jobs to fail the run on classifier regression")
+	cmd.Flags().Uint64Var(&maxEventsPerBlock, "max-events-per-block", 0,
+		"(rpc) fail-closed when a single block would emit more than N access_events (0 = no limit). "+
+			"Calibrated reference: scroll_100k observed max=218 events/block; recommended threshold 2200 (10× headroom)")
+	cmd.Flags().Uint64Var(&maxContractsPerBlock, "max-contracts-per-block", 0,
+		"(rpc) fail-closed when a single block would touch more than N distinct contracts (0 = no limit). "+
+			"Calibrated reference: scroll_100k observed max=12; recommended threshold 120")
+	cmd.Flags().Uint64Var(&maxSlotsPerBlock, "max-slots-per-block", 0,
+		"(rpc) fail-closed when a single block would touch more than N distinct slot_ids (0 = no limit). "+
+			"Calibrated reference: scroll_100k observed max=218; recommended threshold 2200")
 	return cmd
 }
 
@@ -325,7 +341,11 @@ func runMockExtract(ctx context.Context, output string, seed uint64, numContract
 	return nil
 }
 
-func runRPCExtract(ctx context.Context, output, endpoint string, start, end uint64, force, resume bool) error {
+func runRPCExtract(
+	ctx context.Context, output, endpoint string,
+	start, end uint64, force, resume bool,
+	maxEventsPerBlock, maxContractsPerBlock, maxSlotsPerBlock uint64,
+) error {
 	if end == 0 || end < start {
 		return fmt.Errorf("rpc extract: --end must be > 0 and >= --start (got start=%d end=%d)", start, end)
 	}
@@ -362,6 +382,9 @@ func runRPCExtract(ctx context.Context, output, endpoint string, start, end uint
 	cfg.Endpoint = endpoint
 	cfg.Start = start
 	cfg.End = end
+	cfg.MaxEventsPerBlock = maxEventsPerBlock
+	cfg.MaxContractsPerBlock = maxContractsPerBlock
+	cfg.MaxSlotsPerBlock = maxSlotsPerBlock
 	if rpcHTTPClientOverride != nil {
 		cfg.HTTPClient = rpcHTTPClientOverride()
 	}

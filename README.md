@@ -81,6 +81,33 @@ refuse the method; the extractor surfaces a directly actionable
 error when that happens instead of silently degrading to the
 surrogate.
 
+## QA
+
+Two layers of QA matter in this repo:
+
+- **Deterministic QA (sanity / ingestion correctness)** — validate the
+  produced cost tables are internally consistent (schema, arithmetic,
+  degenerate "wins", apples-to-oranges comparisons).
+- **Probabilistic QA (product claim / risk)** — rolling train→test
+  backtests that measure out-of-sample performance and tail risk.
+
+Repro / audit checklist for any quoted numbers:
+
+- Chain + block window `[start,end)` and the run command used.
+- `data_source` capability stamp (`rpc` vs `statediff`) next to the
+  artifacts (do not compare across stamps).
+- Cost parameters (`ram_unit_cost`, `miss_penalty`) and `tau`.
+- Any ingestion limits / skips (if present) and the extractor endpoint
+  host/provider.
+- Repo commit SHA.
+
+Commands:
+
+```
+make qa-viz REPORT=testdata/runs/scroll_100k/sweep_v2
+make qa-backtest MISS_PENALTY=512
+```
+
 ## Build
 
 ```

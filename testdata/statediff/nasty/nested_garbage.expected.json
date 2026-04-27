@@ -1,0 +1,4 @@
+{
+  "description": "Top-level is an object, not an array. Unmarshal into []traceBlockEntry must fail.",
+  "expect": "unmarshal_error"
+}

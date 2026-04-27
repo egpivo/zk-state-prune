@@ -1,4 +1,4 @@
-.PHONY: build test lint tidy clean run cover scroll-smoke scroll-100k qa-viz qa-backtest
+.PHONY: build test lint tidy clean run cover scroll-smoke scroll-100k qa-viz qa-backtest fuzz-statediff
 
 BIN := bin/zksp
 PKG := ./...
@@ -86,3 +86,21 @@ qa-backtest: build
 	    --start "$(BT_START)" --end "$(BT_END)" \
 	    --train-span "$(BT_TRAIN_SPAN)" --test-span "$(BT_TEST_SPAN)" --step "$(BT_STEP)" \
 	    --tau "$(BT_TAU)" --miss-penalty "$(MISS_PENALTY)"
+
+# ---- Robustness QA fuzzing ------------------------------------------
+# fuzz-statediff: smoke-fuzzes the prestateTracer parsing path. Catches
+# panics / crashes the hand-written nasty fixtures didn't think of.
+#
+# This is a SMOKE fuzz at the default 10s — long enough for PR-CI to
+# catch obvious regressions, short enough not to dominate the build.
+# For real coverage fuzzing run with a much larger budget, e.g.
+#
+#   make fuzz-statediff FUZZTIME=30m
+#
+# Go's `-fuzz=` flag runs ONE fuzz function at a time, so add
+# FUZZ_FN=<name> when more fuzz targets land.
+FUZZTIME ?= 10s
+FUZZ_FN ?= FuzzStatediffParse
+FUZZ_PKG ?= ./internal/extractor/
+fuzz-statediff:
+	go test -run=^$$ -fuzz=$(FUZZ_FN) -fuzztime=$(FUZZTIME) $(FUZZ_PKG)

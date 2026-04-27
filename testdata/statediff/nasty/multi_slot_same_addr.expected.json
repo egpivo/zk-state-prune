@@ -1,0 +1,9 @@
+{
+  "description": "Three pre slots for one address; only slot 2 modified in post. Slot 2 → write, slots 1 and 3 → read. Confirms read/write classification per-slot, not per-address.",
+  "expect": "ok",
+  "touches": [
+    { "contract": "0x6666666666666666666666666666666666666666", "slotKey": "0x0000000000000000000000000000000000000000000000000000000000000001", "access": "read" },
+    { "contract": "0x6666666666666666666666666666666666666666", "slotKey": "0x0000000000000000000000000000000000000000000000000000000000000002", "access": "write" },
+    { "contract": "0x6666666666666666666666666666666666666666", "slotKey": "0x0000000000000000000000000000000000000000000000000000000000000003", "access": "read" }
+  ]
+}

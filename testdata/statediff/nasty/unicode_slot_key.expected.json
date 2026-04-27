@@ -1,0 +1,11 @@
+{
+  "description": "Slot key is non-hex unicode. Parser doesn't validate hex shape; passes through after lowercasing. Hex validation, if needed, belongs in a downstream layer — the parser must not crash on UTF-8.",
+  "expect": "ok",
+  "touches": [
+    {
+      "contract": "0x5555555555555555555555555555555555555555",
+      "slotKey": "🦀🦀🦀",
+      "access": "read"
+    }
+  ]
+}

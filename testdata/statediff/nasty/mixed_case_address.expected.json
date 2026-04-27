@@ -1,0 +1,11 @@
+{
+  "description": "EIP-55 mixed-case address + mixed-case slot key. Parser canonicalises both via strings.ToLower so the same slot from different casings will dedupe in storage.",
+  "expect": "ok",
+  "touches": [
+    {
+      "contract": "0xabcdef0123456789abcdef0123456789abcdef01",
+      "slotKey": "0x000000000000000000000000000000000000000000000000000000000000abcd",
+      "access": "write"
+    }
+  ]
+}

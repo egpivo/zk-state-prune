@@ -1,0 +1,4 @@
+{
+  "description": "storage is a number instead of a map. JSON unmarshal must fail loudly (not silently empty).",
+  "expect": "unmarshal_error"
+}
