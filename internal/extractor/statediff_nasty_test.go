@@ -54,6 +54,11 @@ func TestStateDiffExtractor_NastyFixtures(t *testing.T) {
 					t.Fatalf("panic during parse — robustness invariant broken: %v", r)
 				}
 			}()
+			markRobustness(t,
+				"panic-free-parse",
+				"statediff_extractor.parseStateDiff",
+				"nasty fixture: "+strings.TrimSuffix(name, ".json"),
+			)
 
 			tracePath := filepath.Join(nastyFixtureDir, name)
 			expectedPath := filepath.Join(nastyFixtureDir,

@@ -1,4 +1,4 @@
-.PHONY: build test lint tidy clean run cover scroll-smoke scroll-100k qa-viz qa-backtest fuzz-statediff
+.PHONY: build test lint tidy clean run cover scroll-smoke scroll-100k qa-viz qa-backtest fuzz-statediff qa-robustness
 
 BIN := bin/zksp
 PKG := ./...
@@ -104,3 +104,14 @@ FUZZ_FN ?= FuzzStatediffParse
 FUZZ_PKG ?= ./internal/extractor/
 fuzz-statediff:
 	go test -run=^$$ -fuzz=$(FUZZ_FN) -fuzztime=$(FUZZTIME) $(FUZZ_PKG)
+
+# qa-robustness: runs `go test -v` over the repo, greps the
+# `ROBUSTNESS_QA:` tag lines that markRobustness emits, and writes a
+# deterministic coverage summary to $(QA_OUT)/robustness_summary.json.
+# The JSON is generated from test output — adding a new tagged test
+# automatically extends coverage on the next run, so the file can't
+# silently drift away from reality.
+#
+# Pass --run to filter which tests execute (the runner forwards it).
+qa-robustness:
+	python3 scripts/qa_robustness.py --out-dir "$(QA_OUT)" $(QA_ROBUSTNESS_ARGS)

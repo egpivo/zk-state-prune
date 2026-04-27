@@ -83,13 +83,25 @@ surrogate.
 
 ## QA
 
-Two layers of QA matter in this repo:
+Three layers of QA cover different failure modes:
 
-- **Deterministic QA (sanity / ingestion correctness)** — validate the
-  produced cost tables are internally consistent (schema, arithmetic,
-  degenerate "wins", apples-to-oranges comparisons).
-- **Probabilistic QA (product claim / risk)** — rolling train→test
-  backtests that measure out-of-sample performance and tail risk.
+- **Layer 0 — Deterministic sanity** ([scripts/qa_viz.py](scripts/qa_viz.py)).
+  Schema sanity, `TotalCost = RAMCost + MissPenaltyAgg` arithmetic,
+  grid completeness, degenerate-cell flag, same-RAM-band auto-pairs,
+  data-source guardrail. Catches "the numbers are wrong / the
+  comparison isn't apples-to-apples".
+- **Layer 0.5 — Deterministic robustness** ([scripts/qa_robustness.py](scripts/qa_robustness.py)
+  + nasty fixtures + Go fuzz harness + per-block hard limits stamped
+  into `schema_meta`). Catches "ingestion misbehaves on hostile or
+  edge inputs (oversize payloads, schema drift, mixed-case addresses,
+  per-block spikes)". See
+  [internal/extractor/EXTRACT_LIMITS.md](internal/extractor/EXTRACT_LIMITS.md)
+  for the calibrated hard-limit thresholds and the rationale.
+- **Layer 1 — Probabilistic product QA** ([scripts/backtest.py](scripts/backtest.py)).
+  Rolling train→test backtests, in-sample/out-of-sample gap, per-fold
+  regret, tail / CVaR over folds, drift-aware `in_distribution` vs
+  `all_folds` reporting, fail-closed release gates. Catches "the
+  model looks fine on average but blows up at the tail".
 
 Repro / audit checklist for any quoted numbers:
 
@@ -97,16 +109,28 @@ Repro / audit checklist for any quoted numbers:
 - `data_source` capability stamp (`rpc` vs `statediff`) next to the
   artifacts (do not compare across stamps).
 - Cost parameters (`ram_unit_cost`, `miss_penalty`) and `tau`.
-- Any ingestion limits / skips (if present) and the extractor endpoint
-  host/provider.
+- Stamped `extract_limits` (in `schema_meta`) plus the extractor
+  endpoint host/provider.
 - Repo commit SHA.
 
 Commands:
 
 ```
 make qa-viz REPORT=testdata/runs/scroll_100k/sweep_v2
-make qa-backtest MISS_PENALTY=512
+make qa-robustness                               # Layer 0.5 — coverage summary
+make fuzz-statediff FUZZTIME=10s                 # smoke fuzz the parsing path
+make qa-backtest MISS_PENALTY=512                # Layer 1 — rolling backtest
 ```
+
+Scope mapping (to avoid goal drift):
+
+- **Covered**: endpoint / ingestion robustness (DoS-like failure modes,
+  schema drift, oversized payloads), capability/limits domain-binding,
+  and out-of-sample tiering performance + risk.
+- **Not covered**: censorship-resistance guarantees, data-availability
+  guarantees, bridge / fund-security vulnerabilities, or general L2
+  protocol security analysis. Robustness QA here is **ingestion
+  reliability + domain correctness**, not security research.
 
 ## Build
 

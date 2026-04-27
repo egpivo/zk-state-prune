@@ -70,6 +70,11 @@ func TestRPCExtractor_LimitTriggers(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			markRobustness(t,
+				"fail-closed-on-limit",
+				"rpc_extractor.checkBlockLimits",
+				tc.name+" exceeds threshold",
+			)
 			receipts := []rpcReceipt{{
 				TransactionHash: "0xaa",
 				BlockNumber:     "0x64",
@@ -127,6 +132,11 @@ func TestRPCExtractor_LimitTriggers(t *testing.T) {
 // any DB consumer (CLI / qa_viz / blog reader) can answer "what was
 // filtered out at extract time" by reading one row.
 func TestRPCExtractor_StampsExtractLimits(t *testing.T) {
+	markRobustness(t,
+		"domain-binding",
+		"rpc_extractor.writeExtractLimits",
+		"limits stamped into schema_meta after successful extract",
+	)
 	holderA := "0x000000000000000000000000000000000000000000000000000000000000aaaa"
 	holderB := "0x000000000000000000000000000000000000000000000000000000000000bbbb"
 	erc20 := "0x1111111111111111111111111111111111111111"
@@ -181,12 +191,77 @@ func TestRPCExtractor_StampsExtractLimits(t *testing.T) {
 	}
 }
 
+// TestRPCExtractor_CanonicalisesAddressCasing — when an RPC endpoint
+// returns the same contract address with two different casings (one
+// EIP-55 checksum, one lower) inside a single block, the canonical-
+// isation pass must collapse them so distinct-contract / distinct-slot
+// limits don't silently double-count, and so the persisted slot_id is
+// stable.
+func TestRPCExtractor_CanonicalisesAddressCasing(t *testing.T) {
+	markRobustness(t,
+		"canonicalisation",
+		"rpc_extractor.canonicalLog",
+		"mixed-case checksum and lowercase address collapse to one entity",
+	)
+	holderA := "0x000000000000000000000000000000000000000000000000000000000000aaaa"
+	holderB := "0x000000000000000000000000000000000000000000000000000000000000bbbb"
+	checksum := "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01"
+	lower := "0xabcdef0123456789abcdef0123456789abcdef01"
+
+	receipts := []rpcReceipt{{
+		TransactionHash: "0xaa",
+		BlockNumber:     "0x64",
+		Logs: []rpcLog{
+			transferLog(checksum, holderA, holderB, "", "erc20"),
+			transferLog(lower, holderB, holderA, "", "erc20"),
+		},
+	}}
+	client := newMockRPCClient(t, map[string]func(params []any) any{
+		"eth_getBlockByNumber": func(params []any) any {
+			return rpcBlock{Number: params[0].(string), Hash: "0xhash", Timestamp: "0x0"}
+		},
+		"eth_getBlockReceipts": func(params []any) any { return receipts },
+	})
+
+	ctx := context.Background()
+	db := openRPCTestDB(t)
+	// Set MaxContractsPerBlock=1: without canonicalisation the
+	// pre-tally would see two distinct contracts and trip the limit;
+	// with canonicalisation it sees one and the run succeeds.
+	ex, err := NewRPCExtractor(RPCConfig{
+		Endpoint:             "http://mock-rpc.invalid",
+		HTTPClient:           client,
+		Start:                100,
+		End:                  100,
+		MaxContractsPerBlock: 1,
+	})
+	if err != nil {
+		t.Fatalf("NewRPCExtractor: %v", err)
+	}
+	if err := ex.Extract(ctx, db); err != nil {
+		t.Fatalf("Extract: %v (mixed-case addresses should canonicalise to one contract)", err)
+	}
+	d := ex.LastDiagnostics()
+	if d.ContractsCreated != 1 {
+		t.Errorf("ContractsCreated=%d want 1 (case variants must collapse)", d.ContractsCreated)
+	}
+	// 2 holders × 1 contract = 2 distinct slots.
+	if d.SlotsCreated != 2 {
+		t.Errorf("SlotsCreated=%d want 2 (distinct holders only)", d.SlotsCreated)
+	}
+}
+
 // TestRPCExtractor_ResumeRejectsMismatchedLimits — once an Extract has
 // stamped limits, a second Extract pass against the same DB with
 // different limits must refuse to run (otherwise the resulting DB
 // would mix two filtering regimes — the analysis layer can't tell
 // which blocks were filtered at which threshold).
 func TestRPCExtractor_ResumeRejectsMismatchedLimits(t *testing.T) {
+	markRobustness(t,
+		"domain-binding",
+		"rpc_extractor.Extract",
+		"resume with mismatched limits is fail-closed",
+	)
 	ctx := context.Background()
 	db := openRPCTestDB(t)
 

@@ -208,7 +208,7 @@ func newExtractCmd() *cobra.Command {
 		strictCategories bool
 		// Hard limits — opt-in. Zero = no limit (preserves existing
 		// behaviour). Calibrated values for rpc Transfer-log surrogate
-		// on 100k Scroll blocks: see .local/extract_limits_calibration.md.
+		// on 100k Scroll blocks: see internal/extractor/EXTRACT_LIMITS.md.
 		maxEventsPerBlock    uint64
 		maxContractsPerBlock uint64
 		maxSlotsPerBlock     uint64

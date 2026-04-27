@@ -331,6 +331,21 @@ func (e *RPCExtractor) processBlock(
 	}
 	e.last.ReceiptsFetched += len(receipts)
 
+	// Canonicalise every log's address + topics in place BEFORE
+	// any tallying or handling. Production RPC endpoints generally
+	// return lowercase, but EIP-55 checksum addresses (and some
+	// proxies that re-serialize) can leak through. Without this,
+	// "0xAbCd…" and "0xabcd…" would count as two distinct
+	// contracts in checkBlockLimits AND produce two slot_ids in
+	// slotIDFor — silently doubling our row count for the same
+	// underlying entity. Doing it once here guarantees every
+	// downstream path keys off the same form.
+	for i := range receipts {
+		for j := range receipts[i].Logs {
+			receipts[i].Logs[j].canonicalize()
+		}
+	}
+
 	// First pass: pre-tally Transfer logs so we can fail closed
 	// without mutating state if any limit is exceeded. Cheap — at
 	// most a few hundred logs per block at the calibrated p99.9.
@@ -351,6 +366,23 @@ func (e *RPCExtractor) processBlock(
 		}
 	}
 	return nil
+}
+
+// canonicalize lowercases lg.Address and every entry in lg.Topics
+// in place. Topics may include 32-byte left-padded addresses
+// (Transfer's from/to) which are case-sensitive at the byte level
+// but encode the same Ethereum address regardless of casing —
+// canonicalising both fields keeps the slot-id derivation stable
+// across hostile / non-conforming RPC responses.
+//
+// In-place mutation (vs returning a copy) is deliberate: if rpcLog
+// gains a field later, copy-construction would silently drop it,
+// whereas mutating leaves the rest of the struct untouched.
+func (lg *rpcLog) canonicalize() {
+	lg.Address = strings.ToLower(lg.Address)
+	for i := range lg.Topics {
+		lg.Topics[i] = strings.ToLower(lg.Topics[i])
+	}
 }
 
 // checkBlockLimits walks the block's receipts once, tallies
