@@ -408,8 +408,9 @@ def render_html(summary: dict[str, Any], out_path: Path) -> None:
             "treat numbers as a lower bound for product validation."
         )
     if len(distinct_sources) > 1:
+        sources_html = ", ".join(f"<code>{h(s)}</code>" for s in distinct_sources)
         warns.append(
-            f"<b>Mixed data sources across folds:</b> {', '.join(distinct_sources)}. "
+            f"<b>Mixed data sources across folds:</b> {sources_html}. "
             "Aggregate metrics are not directly comparable; inspect per-fold rows."
         )
     if not primary_ds:
@@ -1201,4 +1202,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
