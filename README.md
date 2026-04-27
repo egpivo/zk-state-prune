@@ -58,79 +58,57 @@ high-water mark.
 
 ### Data-source capability matrix
 
-Each extractor self-declares what slot touches it observes. After
-every `extract`, the capability is stamped into `schema_meta` so
-`report --format json` and `simulate --format json` carry a
-`data_source` field; the text modes print a one-line header.
+Each extractor self-declares what it observes. The capability is
+stamped into `schema_meta` after every successful `extract`, and
+every `report` / `simulate` output carries a `data_source` field
+so any number can be traced back to its coverage. See
+[A Brier score without a capability stamp is a bug, not a
+number][cap-stamp-post] for the full rationale (and the bug in my
+own repo that motivated it).
 
-| `--source`  | reads | non-Transfer writes | `slot_id` form                |
-|-------------|:-----:|:-------------------:|-------------------------------|
-| `mock`      |   ✓   |          ✓          | synthetic / deterministic     |
-| `rpc`       |   ✗   |          ✗          | `contract:holder` (Transfer-log surrogate) |
-| `statediff` |   ✓   |          ✓          | `contract:slotkey` (real `debug_traceBlockByNumber` + `prestateTracer`) |
-
-Reading a Brier score or a cost table without the capability stamp is
-an honest-scope violation: a Transfer-log surrogate systematically
-under-reports writes, which skews both the heavy-tail diagnostics and
-the cost-regime finding.
+| `--source`  | reads | non-Transfer writes |
+|-------------|:-----:|:-------------------:|
+| `mock`      |   ✓   |          ✓          |
+| `rpc`       |   ✗   |          ✗          |
+| `statediff` |   ✓   |          ✓          |
 
 `--source statediff` requires an archive-capable RPC endpoint that
 exposes `debug_traceBlockByNumber` (Alchemy Growth, QuickNode
 archive, self-hosted Erigon, …). Public chain endpoints generally
 refuse the method; the extractor surfaces a directly actionable
-error when that happens instead of silently degrading to the
-surrogate.
+error rather than silently degrading to the surrogate.
+
+[cap-stamp-post]: TBD <!-- replace with published URL once article A goes live -->
+
 
 ## QA
 
-Three layers of QA cover different failure modes:
+Three layers, one make target each:
 
-- **Layer 0 — Deterministic sanity** ([scripts/qa_viz.py](scripts/qa_viz.py)).
-  Schema sanity, `TotalCost = RAMCost + MissPenaltyAgg` arithmetic,
-  grid completeness, degenerate-cell flag, same-RAM-band auto-pairs,
-  data-source guardrail. Catches "the numbers are wrong / the
-  comparison isn't apples-to-apples".
-- **Layer 0.5 — Deterministic robustness** ([scripts/qa_robustness.py](scripts/qa_robustness.py)
-  + nasty fixtures + Go fuzz harness + per-block hard limits stamped
-  into `schema_meta`). Catches "ingestion misbehaves on hostile or
-  edge inputs (oversize payloads, schema drift, mixed-case addresses,
-  per-block spikes)". See
-  [internal/extractor/EXTRACT_LIMITS.md](internal/extractor/EXTRACT_LIMITS.md)
-  for the calibrated hard-limit thresholds and the rationale.
-- **Layer 1 — Probabilistic product QA** ([scripts/backtest.py](scripts/backtest.py)).
-  Rolling train→test backtests, in-sample/out-of-sample gap, per-fold
-  regret, tail / CVaR over folds, drift-aware `in_distribution` vs
-  `all_folds` reporting, fail-closed release gates. Catches "the
-  model looks fine on average but blows up at the tail".
+| Layer | What it catches | Command |
+|---|---|---|
+| **0 — Deterministic sanity** | bad numbers / apples-to-oranges comparisons | `make qa-viz REPORT=...` |
+| **0.5 — Deterministic robustness** | hostile / edge ingestion inputs | `make qa-robustness` ・ `make fuzz-statediff` |
+| **1 — Probabilistic product QA** | tail risk / overfit / drift | `make qa-backtest MISS_PENALTY=...` |
 
-Repro / audit checklist for any quoted numbers:
+Long-form rationale lives in two posts:
+
+- [A Brier score without a capability stamp is a bug, not a number][cap-stamp-post] — Layer 0 / 0.5 domain-binding pattern.
+- *(forthcoming)* — Layer 1 development log: rolling backtests + Risk QA findings on the scroll_100k run.
+
+Repro / audit checklist for any quoted number:
 
 - Chain + block window `[start,end)` and the run command used.
-- `data_source` capability stamp (`rpc` vs `statediff`) next to the
-  artifacts (do not compare across stamps).
-- Cost parameters (`ram_unit_cost`, `miss_penalty`) and `tau`.
-- Stamped `extract_limits` (in `schema_meta`) plus the extractor
-  endpoint host/provider.
+- `data_source` capability stamp (`rpc` vs `statediff`).
+- Cost parameters (`ram_unit_cost`, `miss_penalty`, `tau`).
+- Stamped `extract_limits` from `schema_meta` (see
+  [internal/extractor/EXTRACT_LIMITS.md](internal/extractor/EXTRACT_LIMITS.md)
+  for the calibration).
 - Repo commit SHA.
 
-Commands:
-
-```
-make qa-viz REPORT=testdata/runs/scroll_100k/sweep_v2
-make qa-robustness                               # Layer 0.5 — coverage summary
-make fuzz-statediff FUZZTIME=10s                 # smoke fuzz the parsing path
-make qa-backtest MISS_PENALTY=512                # Layer 1 — rolling backtest
-```
-
-Scope mapping (to avoid goal drift):
-
-- **Covered**: endpoint / ingestion robustness (DoS-like failure modes,
-  schema drift, oversized payloads), capability/limits domain-binding,
-  and out-of-sample tiering performance + risk.
-- **Not covered**: censorship-resistance guarantees, data-availability
-  guarantees, bridge / fund-security vulnerabilities, or general L2
-  protocol security analysis. Robustness QA here is **ingestion
-  reliability + domain correctness**, not security research.
+Scope: ingestion reliability + domain correctness + out-of-sample
+policy evaluation. **Not** a protocol-security or
+data-availability analysis.
 
 ## Build
 
