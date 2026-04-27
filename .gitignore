@@ -37,3 +37,7 @@ go.work.sum
 # Build artifacts — `make build` regenerates bin/zksp on every run
 # (Go embeds a fresh build ID), committing it produces churn.
 bin/
+
+# Python bytecode caches from scripts/ (qa_viz.py, backtest.py).
+__pycache__/
+*.pyc

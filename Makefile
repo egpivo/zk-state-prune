@@ -1,4 +1,4 @@
-.PHONY: build test lint tidy clean run cover scroll-smoke scroll-100k qa-viz
+.PHONY: build test lint tidy clean run cover scroll-smoke scroll-100k qa-viz qa-backtest
 
 BIN := bin/zksp
 PKG := ./...
@@ -58,3 +58,27 @@ qa-viz:
 	    exit 2; \
 	fi
 	python3 scripts/qa_viz.py --report "$(REPORT)" --out-dir "$(QA_OUT)"
+
+# qa-backtest: rolling train→fit→simulate product-claim QA.
+# Runs multiple folds and writes `backtest_summary.json` +
+# `backtest_report.html` under $(BT_OUT).
+#
+# Required: MISS_PENALTY (ℓ). The other parameters have sensible defaults
+# for the canonical scroll_100k run but can be overridden.
+BT_DB ?= testdata/runs/scroll_100k/scroll.db
+BT_OUT ?= testdata/runs/scroll_100k/backtest
+BT_START ?= 33400000
+BT_END ?= 33500000
+BT_TRAIN_SPAN ?= 60000
+BT_TEST_SPAN ?= 20000
+BT_STEP ?= 20000
+BT_TAU ?= 0
+qa-backtest: build
+	@if [ -z "$(MISS_PENALTY)" ]; then \
+	    echo "usage: make qa-backtest MISS_PENALTY=<ℓ> [BT_DB=...] [BT_OUT=...]"; \
+	    exit 2; \
+	fi
+	python3 scripts/backtest.py --db "$(BT_DB)" --zksp "$(BIN)" --out-dir "$(BT_OUT)" \
+	    --start "$(BT_START)" --end "$(BT_END)" \
+	    --train-span "$(BT_TRAIN_SPAN)" --test-span "$(BT_TEST_SPAN)" --step "$(BT_STEP)" \
+	    --tau "$(BT_TAU)" --miss-penalty "$(MISS_PENALTY)"

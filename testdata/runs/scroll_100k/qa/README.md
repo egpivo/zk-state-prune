@@ -104,7 +104,8 @@ genuinely sparse hot set (small but not pathological) is not.
 
 ### 6. Monotonic trends (`statistical`, `statistical-robust` only)
 
-For threshold-based policies, the demote rule is `p_i(τ) > p* = c·τ/ℓ`,
+For threshold-based policies, the keep-hot rule is `p_i(τ) > p* = c·τ/ℓ`
+(equivalently, demote when `p_i(τ) < p*`),
 so as ℓ grows, `p*` falls and the policy keeps more slots hot. Two
 properties should hold along the ℓ axis:
 
