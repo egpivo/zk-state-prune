@@ -1,0 +1,122 @@
+{
+  "kinds": {
+    "canonicalisation": 1,
+    "domain-binding": 2,
+    "fail-closed-on-limit": 3,
+    "panic-free-parse": 11
+  },
+  "n_tags": 17,
+  "pkg": "./...",
+  "run_filter": null,
+  "subjects": {
+    "rpc_extractor.Extract": 1,
+    "rpc_extractor.canonicalLog": 1,
+    "rpc_extractor.checkBlockLimits": 3,
+    "rpc_extractor.writeExtractLimits": 1,
+    "statediff_extractor.parseStateDiff": 11
+  },
+  "tags": [
+    {
+      "failure_mode": "mixed-case checksum and lowercase address collapse to one entity",
+      "kind": "canonicalisation",
+      "subject": "rpc_extractor.canonicalLog",
+      "test": "TestRPCExtractor_CanonicalisesAddressCasing"
+    },
+    {
+      "failure_mode": "resume with mismatched limits is fail-closed",
+      "kind": "domain-binding",
+      "subject": "rpc_extractor.Extract",
+      "test": "TestRPCExtractor_ResumeRejectsMismatchedLimits"
+    },
+    {
+      "failure_mode": "limits stamped into schema_meta after successful extract",
+      "kind": "domain-binding",
+      "subject": "rpc_extractor.writeExtractLimits",
+      "test": "TestRPCExtractor_StampsExtractLimits"
+    },
+    {
+      "failure_mode": "contracts_per_block exceeds threshold",
+      "kind": "fail-closed-on-limit",
+      "subject": "rpc_extractor.checkBlockLimits",
+      "test": "TestRPCExtractor_LimitTriggers/contracts_per_block"
+    },
+    {
+      "failure_mode": "events_per_block exceeds threshold",
+      "kind": "fail-closed-on-limit",
+      "subject": "rpc_extractor.checkBlockLimits",
+      "test": "TestRPCExtractor_LimitTriggers/events_per_block"
+    },
+    {
+      "failure_mode": "slots_per_block exceeds threshold",
+      "kind": "fail-closed-on-limit",
+      "subject": "rpc_extractor.checkBlockLimits",
+      "test": "TestRPCExtractor_LimitTriggers/slots_per_block"
+    },
+    {
+      "failure_mode": "nasty fixture: empty_array",
+      "kind": "panic-free-parse",
+      "subject": "statediff_extractor.parseStateDiff",
+      "test": "TestStateDiffExtractor_NastyFixtures/empty_array"
+    },
+    {
+      "failure_mode": "nasty fixture: missing_post",
+      "kind": "panic-free-parse",
+      "subject": "statediff_extractor.parseStateDiff",
+      "test": "TestStateDiffExtractor_NastyFixtures/missing_post"
+    },
+    {
+      "failure_mode": "nasty fixture: mixed_case_address",
+      "kind": "panic-free-parse",
+      "subject": "statediff_extractor.parseStateDiff",
+      "test": "TestStateDiffExtractor_NastyFixtures/mixed_case_address"
+    },
+    {
+      "failure_mode": "nasty fixture: multi_slot_same_addr",
+      "kind": "panic-free-parse",
+      "subject": "statediff_extractor.parseStateDiff",
+      "test": "TestStateDiffExtractor_NastyFixtures/multi_slot_same_addr"
+    },
+    {
+      "failure_mode": "nasty fixture: nested_garbage",
+      "kind": "panic-free-parse",
+      "subject": "statediff_extractor.parseStateDiff",
+      "test": "TestStateDiffExtractor_NastyFixtures/nested_garbage"
+    },
+    {
+      "failure_mode": "nasty fixture: null_pre",
+      "kind": "panic-free-parse",
+      "subject": "statediff_extractor.parseStateDiff",
+      "test": "TestStateDiffExtractor_NastyFixtures/null_pre"
+    },
+    {
+      "failure_mode": "nasty fixture: null_pre_storage",
+      "kind": "panic-free-parse",
+      "subject": "statediff_extractor.parseStateDiff",
+      "test": "TestStateDiffExtractor_NastyFixtures/null_pre_storage"
+    },
+    {
+      "failure_mode": "nasty fixture: oversize_hex_slot",
+      "kind": "panic-free-parse",
+      "subject": "statediff_extractor.parseStateDiff",
+      "test": "TestStateDiffExtractor_NastyFixtures/oversize_hex_slot"
+    },
+    {
+      "failure_mode": "nasty fixture: storage_wrong_type",
+      "kind": "panic-free-parse",
+      "subject": "statediff_extractor.parseStateDiff",
+      "test": "TestStateDiffExtractor_NastyFixtures/storage_wrong_type"
+    },
+    {
+      "failure_mode": "nasty fixture: tx_missing_result",
+      "kind": "panic-free-parse",
+      "subject": "statediff_extractor.parseStateDiff",
+      "test": "TestStateDiffExtractor_NastyFixtures/tx_missing_result"
+    },
+    {
+      "failure_mode": "nasty fixture: unicode_slot_key",
+      "kind": "panic-free-parse",
+      "subject": "statediff_extractor.parseStateDiff",
+      "test": "TestStateDiffExtractor_NastyFixtures/unicode_slot_key"
+    }
+  ]
+}

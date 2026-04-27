@@ -46,10 +46,58 @@ type RPCConfig struct {
 	// signal comes from log.Topics, not from the function-selector
 	// + bytecode pipeline that this guardrail watches.
 	StrictCategories bool
+
+	// MaxRetries is the number of *retries* (not total attempts)
+	// rpcCall will perform on transient HTTP-level failures
+	// (timeout / connection reset / 5xx). Default (0 in struct, 3
+	// after DefaultRPCConfig) is what production runs use; tests
+	// often set it to 0 to fail fast on the first error.
+	// Protocol-level RPC errors (e.g. -32601 method not found) are
+	// never retried — they don't recover by being asked again.
+	MaxRetries int
+
+	// RetryBaseDelay is the first-retry backoff. Subsequent
+	// retries double the delay (exponential), capped at 10s per
+	// attempt. Zero falls back to 200ms in rpcCall.
+	RetryBaseDelay time.Duration
+
+	// Limits are per-block guardrails. Zero means "no limit"
+	// (preserves existing behaviour for callers that don't opt in).
+	// When > 0, processBlock fail-closes with a structured error
+	// the moment any tally exceeds the threshold.
+	//
+	// Calibration on scroll_100k (Transfer-log surrogate, 100k
+	// blocks): observed max events/block = 218, max distinct
+	// contracts/block = 12, max distinct slots/block = 218.
+	// Recommended thresholds are 10× headroom over those — see
+	// internal/extractor/EXTRACT_LIMITS.md for the full data,
+	// rationale, and the SQL used to derive them.
+	MaxEventsPerBlock    uint64
+	MaxContractsPerBlock uint64
+	MaxSlotsPerBlock     uint64
+}
+
+// ExtractLimits is the persisted form of MaxEventsPerBlock /
+// MaxContractsPerBlock / MaxSlotsPerBlock. Stamped into
+// schema_meta at the end of every successful Extract; the next
+// --resume reads it and refuses to continue if the new limits
+// don't match (different filtering would silently produce a
+// hybrid-DB the analysis layer can't reason about).
+type ExtractLimits struct {
+	Source               string `json:"source"`
+	MaxEventsPerBlock    uint64 `json:"max_events_per_block"`
+	MaxContractsPerBlock uint64 `json:"max_contracts_per_block"`
+	MaxSlotsPerBlock     uint64 `json:"max_slots_per_block"`
 }
 
 // DefaultRPCConfig returns a Scroll-mainnet-friendly default. Callers
 // typically override Start/End to point at the block range they want.
+//
+// Retry defaults (3 retries, 200ms base) mean a single transient
+// blip eats ~3.4s before recovering, and a sustained outage takes
+// 200+400+800+1600 ≈ 3s of waits before the run fails. Tuned to
+// public-RPC reliability — `rpc.scroll.io` drops connections often
+// enough that without retry, multi-hour extracts almost never finish.
 func DefaultRPCConfig() RPCConfig {
 	return RPCConfig{
 		Endpoint:  ScrollPublicRPC,
@@ -57,6 +105,8 @@ func DefaultRPCConfig() RPCConfig {
 		HTTPClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		MaxRetries:     3,
+		RetryBaseDelay: 200 * time.Millisecond,
 	}
 }
 
@@ -162,6 +212,30 @@ func (*RPCExtractor) Capability() Capability {
 func (e *RPCExtractor) Extract(ctx context.Context, db *storage.DB) error {
 	e.last = RPCDiagnostics{StartBlock: e.cfg.Start, EndBlock: e.cfg.End}
 
+	// Stamp / verify the extract limits BEFORE any block work, so
+	// the DB is self-describing the moment data starts landing
+	// and a mid-run crash leaves a coherent record. On resume,
+	// reject mismatched limits — silently mixing thresholds
+	// produces an analysis-incoherent DB.
+	thisRun := ExtractLimits{
+		Source:               e.Capability().Source,
+		MaxEventsPerBlock:    e.cfg.MaxEventsPerBlock,
+		MaxContractsPerBlock: e.cfg.MaxContractsPerBlock,
+		MaxSlotsPerBlock:     e.cfg.MaxSlotsPerBlock,
+	}
+	if stamped, ok, err := readExtractLimits(ctx, db); err != nil {
+		return fmt.Errorf("read extract_limits: %w", err)
+	} else if ok && stamped != thisRun {
+		return fmt.Errorf(
+			"extract_limits mismatch on resume: DB stamped %+v, this run %+v "+
+				"(rerun with --force to clear, or pass matching --max-* flags)",
+			stamped, thisRun,
+		)
+	}
+	if err := writeExtractLimits(ctx, db, thisRun); err != nil {
+		return err
+	}
+
 	// Resume from the stored high-water mark, if any.
 	start := e.cfg.Start
 	if hw, ok, err := readHighWater(ctx, db); err != nil {
@@ -231,6 +305,14 @@ func (s *rpcRunState) flush(ctx context.Context, db *storage.DB, diag *RPCDiagno
 // processBlock fetches one block + its receipts, walks every Transfer
 // log, and appends the synthesized (slot, event) rows to state. flush
 // is called whenever the buffer crosses BatchSize.
+//
+// Hard-limit enforcement: when MaxEventsPerBlock / MaxContractsPerBlock
+// / MaxSlotsPerBlock are non-zero, we tally each block's draft work
+// BEFORE writing anything to state and bail with a structured error
+// if any tally exceeds its limit. Fail-closed is deliberate: silent
+// truncation would corrupt the access_events stream the survival
+// model trains on, and a "skip block" mode would leave gaps the
+// resume / high-water logic isn't designed to bridge.
 func (e *RPCExtractor) processBlock(
 	ctx context.Context,
 	db *storage.DB,
@@ -249,6 +331,28 @@ func (e *RPCExtractor) processBlock(
 	}
 	e.last.ReceiptsFetched += len(receipts)
 
+	// Canonicalise every log's address + topics in place BEFORE
+	// any tallying or handling. Production RPC endpoints generally
+	// return lowercase, but EIP-55 checksum addresses (and some
+	// proxies that re-serialize) can leak through. Without this,
+	// "0xAbCd…" and "0xabcd…" would count as two distinct
+	// contracts in checkBlockLimits AND produce two slot_ids in
+	// slotIDFor — silently doubling our row count for the same
+	// underlying entity. Doing it once here guarantees every
+	// downstream path keys off the same form.
+	for i := range receipts {
+		for j := range receipts[i].Logs {
+			receipts[i].Logs[j].canonicalize()
+		}
+	}
+
+	// First pass: pre-tally Transfer logs so we can fail closed
+	// without mutating state if any limit is exceeded. Cheap — at
+	// most a few hundred logs per block at the calibrated p99.9.
+	if err := e.checkBlockLimits(blockNum, receipts); err != nil {
+		return err
+	}
+
 	for _, rec := range receipts {
 		for _, lg := range rec.Logs {
 			e.last.LogsSeen++
@@ -262,6 +366,83 @@ func (e *RPCExtractor) processBlock(
 		}
 	}
 	return nil
+}
+
+// canonicalize lowercases lg.Address and every entry in lg.Topics
+// in place. Topics may include 32-byte left-padded addresses
+// (Transfer's from/to) which are case-sensitive at the byte level
+// but encode the same Ethereum address regardless of casing —
+// canonicalising both fields keeps the slot-id derivation stable
+// across hostile / non-conforming RPC responses.
+//
+// In-place mutation (vs returning a copy) is deliberate: if rpcLog
+// gains a field later, copy-construction would silently drop it,
+// whereas mutating leaves the rest of the struct untouched.
+func (lg *rpcLog) canonicalize() {
+	lg.Address = strings.ToLower(lg.Address)
+	for i := range lg.Topics {
+		lg.Topics[i] = strings.ToLower(lg.Topics[i])
+	}
+}
+
+// checkBlockLimits walks the block's receipts once, tallies
+// Transfer-derived (events, distinct contracts, distinct slots), and
+// returns a structured error the moment any tally crosses its limit.
+// Returns nil when all limits are 0 (opt-in) or no tally exceeded.
+//
+// Each Transfer log emits two events (from-side + to-side balance
+// slot), matching handleTransferLog's loop over Topics[1:3]. We
+// mirror that arithmetic here so the pre-tally and the post-emit
+// counts agree.
+func (e *RPCExtractor) checkBlockLimits(blockNum uint64, receipts []rpcReceipt) error {
+	if e.cfg.MaxEventsPerBlock == 0 && e.cfg.MaxContractsPerBlock == 0 && e.cfg.MaxSlotsPerBlock == 0 {
+		return nil
+	}
+	var events uint64
+	contracts := make(map[string]struct{})
+	slots := make(map[string]struct{})
+	for _, rec := range receipts {
+		for _, lg := range rec.Logs {
+			if !isTransferLog(lg) {
+				continue
+			}
+			contracts[lg.Address] = struct{}{}
+			for _, holderTopic := range lg.Topics[1:3] {
+				events++
+				slots[slotIDFor(lg.Address, holderTopic)] = struct{}{}
+			}
+		}
+	}
+	if e.cfg.MaxEventsPerBlock > 0 && events > e.cfg.MaxEventsPerBlock {
+		return reportLimitViolation(blockNum, "events_per_block", events, e.cfg.MaxEventsPerBlock)
+	}
+	if e.cfg.MaxContractsPerBlock > 0 && uint64(len(contracts)) > e.cfg.MaxContractsPerBlock {
+		return reportLimitViolation(blockNum, "contracts_per_block", uint64(len(contracts)), e.cfg.MaxContractsPerBlock)
+	}
+	if e.cfg.MaxSlotsPerBlock > 0 && uint64(len(slots)) > e.cfg.MaxSlotsPerBlock {
+		return reportLimitViolation(blockNum, "slots_per_block", uint64(len(slots)), e.cfg.MaxSlotsPerBlock)
+	}
+	return nil
+}
+
+// reportLimitViolation logs a structured ERROR and returns an error
+// the caller can wrap or compare with errors.Is. The slog payload
+// gives a downstream alerting consumer everything it needs to act
+// without parsing the error string.
+func reportLimitViolation(blockNum uint64, kind string, observed, limit uint64) error {
+	// Map the structured kind ("events_per_block") to the actual
+	// CLI flag name ("--max-events-per-block") so the suggestion
+	// is copy-pasteable. Anything off-mapping falls back to the
+	// kind itself, which is still useful in the slog payload.
+	flag := "--max-" + strings.ReplaceAll(kind, "_", "-")
+	slog.Error("extract: per-block limit exceeded — fail-closed",
+		"block_number", blockNum,
+		"limit_kind", kind,
+		"observed", observed,
+		"limit", limit,
+		"suggestion", "investigate the block (likely token launch / spam) or rerun with a higher "+flag,
+	)
+	return fmt.Errorf("block %d: %s %d > limit %d", blockNum, kind, observed, limit)
 }
 
 // handleTransferLog upserts the contract (if first-seen) plus each
@@ -482,10 +663,58 @@ func (e *RPCExtractor) call(ctx context.Context, method string, params []any, ou
 // rpcCall is the shared JSON-RPC transport — used by both the
 // Transfer-log surrogate (RPCExtractor) and the real state-diff
 // extractor (StateDiffExtractor) so they agree on body shape, error
-// translation, and HTTP handling. The reqID pointer is mutated by
-// callers before each invocation; passing it by pointer keeps the
-// counter on whichever extractor owns it.
+// translation, and HTTP handling. Wraps rpcCallOnce in
+// retry-with-backoff for transient HTTP failures (timeout,
+// connection reset, 5xx). Protocol-level errors (-32601, decode
+// failures) fail fast — those don't recover on retry.
+//
+// The reqID pointer is mutated by callers before each invocation;
+// retries reuse the same ID, since logically it's the same request.
 func rpcCall(ctx context.Context, cfg RPCConfig, reqID *int, method string, params []any, out any) error {
+	maxAttempts := cfg.MaxRetries + 1
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	base := cfg.RetryBaseDelay
+	if base <= 0 {
+		base = 200 * time.Millisecond
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			backoff := base << (attempt - 2) // exp: base, 2·base, 4·base, …
+			if backoff > 10*time.Second {
+				backoff = 10 * time.Second
+			}
+			slog.Warn("rpc transient error, retrying",
+				"method", method,
+				"attempt", attempt-1,
+				"max_retries", cfg.MaxRetries,
+				"backoff", backoff,
+				"err", lastErr)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+		err := rpcCallOnce(ctx, cfg, reqID, method, params, out)
+		if err == nil {
+			return nil
+		}
+		if !isTransientHTTPError(err) {
+			return err
+		}
+		lastErr = err
+	}
+	return fmt.Errorf("%s: gave up after %d transient failures: %w", method, maxAttempts, lastErr)
+}
+
+// rpcCallOnce performs exactly one JSON-RPC round trip — no retry.
+// Kept separate from rpcCall so the retry wrapper stays readable
+// and so tests can target either layer in isolation.
+func rpcCallOnce(ctx context.Context, cfg RPCConfig, reqID *int, method string, params []any, out any) error {
 	body, err := json.Marshal(rpcRequest{
 		JSONRPC: "2.0",
 		Method:  method,
@@ -525,6 +754,52 @@ func rpcCall(ctx context.Context, cfg RPCConfig, reqID *int, method string, para
 	return nil
 }
 
+// isTransientHTTPError classifies an rpcCallOnce error as
+// transport-level (worth retrying) or protocol-level (fail fast).
+// We match on substrings of the error message because Go wraps a
+// patchwork of net / context / http errors that don't share a
+// single typed root. The patterns cover Scroll public RPC's
+// observed failure modes:
+//
+//   - "context deadline exceeded": HTTP client Timeout fired
+//   - "connection reset by peer":  TCP RST mid-response
+//   - "connection refused":        endpoint actively rejecting
+//   - "broken pipe":               we wrote, then connection died
+//   - "i/o timeout":               read or dial timeout
+//   - "EOF" / "unexpected EOF":    server closed connection early
+//   - "no such host":              DNS NXDOMAIN — macOS resolver
+//     flakes briefly, clears on retry
+//   - "network is unreachable":    interface flap / VPN reconnect
+//   - "host is unreachable":       routing blip
+//   - "HTTP 5":                    any 5xx response
+//
+// Protocol errors ("rpc error -32601 method not found", "decode <m>",
+// "unmarshal <m>") return false — they reflect a request the server
+// can't fulfil, not a transient transport blip.
+func isTransientHTTPError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, pat := range []string{
+		"deadline exceeded",
+		"connection reset",
+		"connection refused",
+		"broken pipe",
+		"i/o timeout",
+		"EOF",
+		"no such host",
+		"network is unreachable",
+		"host is unreachable",
+		"HTTP 5", // any 5xx
+	} {
+		if strings.Contains(msg, pat) {
+			return true
+		}
+	}
+	return false
+}
+
 func (e *RPCExtractor) fetchBlock(ctx context.Context, blockNum uint64) (*rpcBlock, error) {
 	var b rpcBlock
 	if err := e.call(ctx, "eth_getBlockByNumber", []any{hexU64(blockNum), false}, &b); err != nil {
@@ -554,13 +829,61 @@ func hexU64(v uint64) string {
 // data-table truncation, not an extractor-state wipe.
 const RPCHighWaterKey = "rpc_high_water_block"
 
+// ExtractLimitsKey is the schema_meta key holding the JSON-serialised
+// ExtractLimits used at extract time. On --resume we read this back
+// and refuse to continue if the new run's limits differ — otherwise
+// the resulting DB would be a hybrid (some blocks filtered at one
+// threshold, the rest at another), which the analysis layer can't
+// reason about.
+const ExtractLimitsKey = "extract_limits"
+
 // ClearRPCState removes the RPC extractor's schema_meta keys so a
 // forced re-extraction starts from the user-supplied --start rather
-// than resuming past the old high-water mark.
+// than resuming past the old high-water mark. Wipes the stamped
+// extract limits too so a follow-up run is free to choose new ones.
 func ClearRPCState(ctx context.Context, db *storage.DB) error {
 	if _, err := db.SQL().ExecContext(ctx,
-		`DELETE FROM schema_meta WHERE key = ?`, RPCHighWaterKey); err != nil {
+		`DELETE FROM schema_meta WHERE key IN (?, ?)`,
+		RPCHighWaterKey, ExtractLimitsKey); err != nil {
 		return fmt.Errorf("clear rpc state: %w", err)
+	}
+	return nil
+}
+
+// readExtractLimits returns the stamped ExtractLimits, (zero, false,
+// nil) when no prior run stamped any. Used by Extract to detect
+// limit drift across a resume boundary.
+func readExtractLimits(ctx context.Context, db *storage.DB) (ExtractLimits, bool, error) {
+	var v string
+	err := db.SQL().QueryRowContext(ctx,
+		`SELECT value FROM schema_meta WHERE key = ?`, ExtractLimitsKey).Scan(&v)
+	if err != nil {
+		if err.Error() == "sql: no rows in result set" {
+			return ExtractLimits{}, false, nil
+		}
+		return ExtractLimits{}, false, err
+	}
+	var lim ExtractLimits
+	if jerr := json.Unmarshal([]byte(v), &lim); jerr != nil {
+		return ExtractLimits{}, false, fmt.Errorf("decode extract_limits: %w", jerr)
+	}
+	return lim, true, nil
+}
+
+// writeExtractLimits stamps the limits used by this Extract into
+// schema_meta. Called once at the end of a successful run (or on the
+// first block of a fresh run, before any data is written, so a crash
+// mid-run still leaves the DB self-describing).
+func writeExtractLimits(ctx context.Context, db *storage.DB, lim ExtractLimits) error {
+	b, err := json.Marshal(lim)
+	if err != nil {
+		return fmt.Errorf("encode extract_limits: %w", err)
+	}
+	if _, err := db.SQL().ExecContext(ctx,
+		`INSERT INTO schema_meta(key, value) VALUES(?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+		ExtractLimitsKey, string(b)); err != nil {
+		return fmt.Errorf("write extract_limits: %w", err)
 	}
 	return nil
 }

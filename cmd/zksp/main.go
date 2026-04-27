@@ -201,23 +201,37 @@ func newExtractCmd() *cobra.Command {
 		numContracts     int
 		totalBlocks      uint64
 		force            bool
+		resume           bool
 		rpcEndpoint      string
 		rpcStart         uint64
 		rpcEnd           uint64
 		strictCategories bool
+		// Hard limits — opt-in. Zero = no limit (preserves existing
+		// behaviour). Calibrated values for rpc Transfer-log surrogate
+		// on 100k Scroll blocks: see internal/extractor/EXTRACT_LIMITS.md.
+		maxEventsPerBlock    uint64
+		maxContractsPerBlock uint64
+		maxSlotsPerBlock     uint64
 	)
 	cmd := &cobra.Command{
 		Use:   "extract",
 		Short: "Populate the analysis DB with state-diff data (mock, Transfer-log surrogate, or real state-diff)",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
+			if force && resume {
+				return fmt.Errorf("--force and --resume are mutually exclusive: --force wipes the DB and high-water mark, --resume preserves them")
+			}
 			switch source {
 			case "mock":
+				if resume {
+					return fmt.Errorf("--resume is only meaningful for rpc / statediff sources")
+				}
 				return runMockExtract(ctx, output, seed, numContracts, totalBlocks, force)
 			case "rpc":
-				return runRPCExtract(ctx, output, rpcEndpoint, rpcStart, rpcEnd, force)
+				return runRPCExtract(ctx, output, rpcEndpoint, rpcStart, rpcEnd, force, resume,
+					maxEventsPerBlock, maxContractsPerBlock, maxSlotsPerBlock)
 			case "statediff":
-				return runStateDiffExtract(ctx, output, rpcEndpoint, rpcStart, rpcEnd, force, strictCategories)
+				return runStateDiffExtract(ctx, output, rpcEndpoint, rpcStart, rpcEnd, force, resume, strictCategories)
 			default:
 				return fmt.Errorf("source %q not supported (use mock|rpc|statediff)", source)
 			}
@@ -228,11 +242,21 @@ func newExtractCmd() *cobra.Command {
 	cmd.Flags().Uint64Var(&seed, "seed", 42, "(mock) PRNG seed for the generator")
 	cmd.Flags().IntVar(&numContracts, "num-contracts", 0, "(mock) override default contract count (0 = use built-in)")
 	cmd.Flags().Uint64Var(&totalBlocks, "total-blocks", 0, "(mock) override default block horizon (0 = use built-in)")
-	cmd.Flags().BoolVar(&force, "force", false, "overwrite the output DB even if it already has slots/events")
+	cmd.Flags().BoolVar(&force, "force", false, "overwrite the output DB even if it already has slots/events (clears all rows AND the RPC high-water mark)")
+	cmd.Flags().BoolVar(&resume, "resume", false, "(rpc/statediff) keep existing rows + high-water mark and continue from the last successful block — use after a crash / network timeout to avoid re-doing work. mutually exclusive with --force")
 	cmd.Flags().StringVar(&rpcEndpoint, "rpc", extractor.ScrollPublicRPC, "(rpc/statediff) JSON-RPC endpoint URL")
 	cmd.Flags().Uint64Var(&rpcStart, "start", 0, "(rpc/statediff) first block to extract")
 	cmd.Flags().Uint64Var(&rpcEnd, "end", 0, "(rpc/statediff) last block to extract (inclusive)")
 	cmd.Flags().BoolVar(&strictCategories, "strict-categories", false, "(statediff) error out instead of warning when more than 20% of contracts can't be classified — use in CI / scheduled jobs to fail the run on classifier regression")
+	cmd.Flags().Uint64Var(&maxEventsPerBlock, "max-events-per-block", 0,
+		"(rpc) fail-closed when a single block would emit more than N access_events (0 = no limit). "+
+			"Calibrated reference: scroll_100k observed max=218 events/block; recommended threshold 2200 (10× headroom)")
+	cmd.Flags().Uint64Var(&maxContractsPerBlock, "max-contracts-per-block", 0,
+		"(rpc) fail-closed when a single block would touch more than N distinct contracts (0 = no limit). "+
+			"Calibrated reference: scroll_100k observed max=12; recommended threshold 120")
+	cmd.Flags().Uint64Var(&maxSlotsPerBlock, "max-slots-per-block", 0,
+		"(rpc) fail-closed when a single block would touch more than N distinct slot_ids (0 = no limit). "+
+			"Calibrated reference: scroll_100k observed max=218; recommended threshold 2200")
 	return cmd
 }
 
@@ -317,7 +341,11 @@ func runMockExtract(ctx context.Context, output string, seed uint64, numContract
 	return nil
 }
 
-func runRPCExtract(ctx context.Context, output, endpoint string, start, end uint64, force bool) error {
+func runRPCExtract(
+	ctx context.Context, output, endpoint string,
+	start, end uint64, force, resume bool,
+	maxEventsPerBlock, maxContractsPerBlock, maxSlotsPerBlock uint64,
+) error {
 	if end == 0 || end < start {
 		return fmt.Errorf("rpc extract: --end must be > 0 and >= --start (got start=%d end=%d)", start, end)
 	}
@@ -335,18 +363,28 @@ func runRPCExtract(ctx context.Context, output, endpoint string, start, end uint
 	// wipe), so we also nuke the RPC extractor's high-water key here
 	// or a forced re-run would still resume past the previous mark
 	// and silently skip part of the requested range.
-	if err := refuseOverwriteIfPopulated(ctx, db, output, force, true); err != nil {
-		return err
-	}
-	if force {
-		if err := extractor.ClearRPCState(ctx, db); err != nil {
+	//
+	// --resume bypasses both the populated-DB refuse check AND the
+	// high-water clear, leaning instead on the extractor's built-in
+	// resume-from-high-water path. Use after a network timeout /
+	// crash to skip blocks already extracted.
+	if !resume {
+		if err := refuseOverwriteIfPopulated(ctx, db, output, force, true); err != nil {
 			return err
+		}
+		if force {
+			if err := extractor.ClearRPCState(ctx, db); err != nil {
+				return err
+			}
 		}
 	}
 	cfg := extractor.DefaultRPCConfig()
 	cfg.Endpoint = endpoint
 	cfg.Start = start
 	cfg.End = end
+	cfg.MaxEventsPerBlock = maxEventsPerBlock
+	cfg.MaxContractsPerBlock = maxContractsPerBlock
+	cfg.MaxSlotsPerBlock = maxSlotsPerBlock
 	if rpcHTTPClientOverride != nil {
 		cfg.HTTPClient = rpcHTTPClientOverride()
 	}
@@ -390,7 +428,7 @@ func runRPCExtract(ctx context.Context, output, endpoint string, start, end uint
 // fall-through to ContractOther exceeds the configured ratio,
 // instead of just emitting a slog.Warn. Use in CI / scheduled
 // jobs; leave false for dev iteration.
-func runStateDiffExtract(ctx context.Context, output, endpoint string, start, end uint64, force, strictCategories bool) error {
+func runStateDiffExtract(ctx context.Context, output, endpoint string, start, end uint64, force, resume, strictCategories bool) error {
 	if end == 0 || end < start {
 		return fmt.Errorf("statediff extract: --end must be > 0 and >= --start (got start=%d end=%d)", start, end)
 	}
@@ -399,12 +437,16 @@ func runStateDiffExtract(ctx context.Context, output, endpoint string, start, en
 		return err
 	}
 	defer db.Close()
-	if err := refuseOverwriteIfPopulated(ctx, db, output, force, true); err != nil {
-		return err
-	}
-	if force {
-		if err := extractor.ClearRPCState(ctx, db); err != nil {
+	// --resume bypasses both refuse + high-water-clear (see
+	// runRPCExtract for the same rationale).
+	if !resume {
+		if err := refuseOverwriteIfPopulated(ctx, db, output, force, true); err != nil {
 			return err
+		}
+		if force {
+			if err := extractor.ClearRPCState(ctx, db); err != nil {
+				return err
+			}
 		}
 	}
 	cfg := extractor.DefaultRPCConfig()

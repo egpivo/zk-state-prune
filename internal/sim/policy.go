@@ -23,6 +23,7 @@ package sim
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/egpivo/zk-state-prune/internal/domain"
@@ -113,6 +114,14 @@ type PolicyDeps struct {
 // underscores are rewritten to dashes, so CLI idiom ("fixed-30d") and
 // YAML idiom ("fixed_30d") both resolve to the same policy. Surrounding
 // whitespace is trimmed.
+//
+// In addition to the named presets, a `fixed-<N>[k|m]` pattern
+// resolves to a FixedIdle with the parsed block count — e.g.
+// "fixed-1000", "fixed-10k", "fixed-1m". The named presets
+// (fixed-30d, fixed-90d) stay as block-count constants for
+// backward compatibility, but on small windows they degenerate to
+// no-prune (idle threshold > window span). Use fixed-<N> when you
+// need a baseline that actually demotes on the sample at hand.
 func PolicyByName(name string, deps PolicyDeps) (Policy, error) {
 	key := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(name)), "_", "-")
 	switch key {
@@ -127,7 +136,49 @@ func PolicyByName(name string, deps PolicyDeps) (Policy, error) {
 			return nil, fmt.Errorf("policy %q: PolicyDeps.Statistical must be a pre-built StatisticalPolicy (use NewStatisticalPolicy after fit + calibrate)", name)
 		}
 		return deps.Statistical, nil
-	default:
-		return nil, fmt.Errorf("unknown policy %q", name)
 	}
+	if n, ok := parseFixedBlocks(key); ok {
+		return FixedIdle{Label: key, IdleBlocks: n}, nil
+	}
+	return nil, fmt.Errorf("unknown policy %q", name)
+}
+
+// parseFixedBlocks accepts "fixed-<N>" / "fixed-<N>k" / "fixed-<N>m"
+// and returns the resolved block count. It is intentionally narrow:
+// only positive integers, only "k" (×1,000) and "m" (×1,000,000)
+// suffixes. Decimals, signs, scientific notation, or other suffixes
+// are rejected so a typo like "fixed-1.5k" doesn't silently round.
+func parseFixedBlocks(key string) (uint64, bool) {
+	const prefix = "fixed-"
+	if !strings.HasPrefix(key, prefix) {
+		return 0, false
+	}
+	tok := key[len(prefix):]
+	if tok == "" {
+		return 0, false
+	}
+	mult := uint64(1)
+	switch tok[len(tok)-1] {
+	case 'k':
+		mult = 1_000
+		tok = tok[:len(tok)-1]
+	case 'm':
+		mult = 1_000_000
+		tok = tok[:len(tok)-1]
+	}
+	if tok == "" {
+		return 0, false
+	}
+	n, err := strconv.ParseUint(tok, 10, 64)
+	if err != nil || n == 0 {
+		return 0, false
+	}
+	// Overflow check: tok ≤ 2^64 / mult so the multiplication stays
+	// in range. uint64 max ≈ 1.8e19, mult ≤ 1e6, so a sane
+	// IdleBlocks count couldn't possibly overflow — but a single
+	// guard makes the bounds explicit.
+	if n > (^uint64(0))/mult {
+		return 0, false
+	}
+	return n * mult, true
 }

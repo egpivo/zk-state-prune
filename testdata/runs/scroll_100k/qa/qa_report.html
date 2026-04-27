@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang='en'><head><meta charset='utf-8'>
+<title>qa_viz — testdata/runs/scroll_100k/sweep_v2</title>
+<style>
+body { font-family: system-ui, sans-serif; max-width: 1100px; margin: 24px auto; padding: 0 16px; color: #222; }
+h1 { font-size: 1.4em; margin-bottom: 4px; }
+h2 { font-size: 1.1em; margin-top: 28px; border-bottom: 1px solid #ddd; padding-bottom: 4px; }
+table { border-collapse: collapse; margin: 8px 0; }
+th, td { padding: 4px 10px; border-bottom: 1px solid #eee; text-align: left; vertical-align: top; }
+table.kv th { width: 180px; color: #555; font-weight: 500; }
+table.checks th { width: 260px; color: #555; font-weight: 500; }
+table.data th { background: #f6f6f6; font-weight: 600; }
+table.data { font-size: 0.9em; }
+code { background: #f6f6f6; padding: 1px 4px; border-radius: 3px; font-size: 0.92em; }
+.ok  { color: #1f7a1f; font-weight: 600; }
+.bad { color: #b91c1c; font-weight: 600; }
+.muted { color: #888; font-size: 0.9em; }
+img { max-width: 100%; border: 1px solid #eee; padding: 4px; background: white; }
+</style></head><body>
+<h1>qa_viz dashboard</h1>
+<p class='muted'>Auto-generated from <code>testdata/runs/scroll_100k/sweep_v2</code>. Re-run with <code>make qa-viz REPORT=&lt;path&gt;</code> to refresh.</p>
+<h2>Run summary</h2>
+<table class='kv'><tr><th>input</th><td>testdata/runs/scroll_100k/sweep_v2</td></tr><tr><th>cells</th><td>40</td></tr><tr><th>policies</th><td>fixed-10k, fixed-1k, no-prune, statistical</td></tr><tr><th>ℓ values seen</th><td>32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384</td></tr><tr><th>data sources</th><td>rpc</td></tr></table>
+<h2>Checks</h2>
+<table class='checks'><tr><th>Schema sanity</th><td><span class="ok">OK</span> (0 cells with issues / 40)</td></tr><tr><th>Cost arithmetic</th><td><span class="ok">OK</span> (0 of 40 cells failed)</td></tr><tr><th>Data-source guardrail</th><td><span class="ok">OK</span> (1 distinct, consistent)</td></tr><tr><th>Grid completeness</th><td><span class="ok">OK</span> (40/40 cells, 0 missing, 0 duplicate)</td></tr><tr><th>Degenerate cells (info)</th><td>1 flagged (RAMRatio &lt; 0.001, pruned_frac &gt; 0.99, HotHitCoverage &lt; 0.3)</td></tr><tr><th>Monotonic trends (statistical)</th><td><span class="ok">OK</span> (0 violations across statistical, statistical-robust)</td></tr><tr><th>Same-RAM matches</th><td>1 pairs with |ΔRAMRatio| &lt; 0.005</td></tr></table>
+<h2>Cost decomposition</h2>
+<img src='cost_decomposition.svg' alt='RAMCost + MissPenaltyAgg per cell'>
+<h2>RAMRatio × HotHitCoverage</h2>
+<img src='pareto_ramratio_coverage.svg' alt='RAMRatio vs HotHitCoverage'>
+<h2>Same-RAM matches</h2>
+<table class='data'><tr><th>ℓ</th><th>policy A</th><th>policy B</th><th>RAMRatio A</th><th>RAMRatio B</th><th>ΔHotHitCov</th><th>ΔFalsePrune</th><th>ΔTotalCost</th></tr><tr><td>512</td><td>fixed-1k</td><td>statistical</td><td>0.0616</td><td>0.0613</td><td>+0.1051</td><td>-0.1051</td><td>-7,665,431</td></tr></table>
+<h2>Degenerate cells</h2>
+<table class='data'><tr><th>policy</th><th>ℓ</th><th>RAMRatio</th><th>pruned_frac</th><th>HotHitCov</th><th>FalsePrune</th></tr><tr><td>statistical</td><td>32</td><td>0.000448</td><td>0.999552</td><td>0.1882</td><td>0.8118</td></tr></table>
+<h2>Grid gaps</h2>
+<p class='muted'>Complete cartesian grid — no missing or duplicate cells.</p>
+<h2>Monotonic-trend violations</h2>
+<p class='muted'>None.</p>
+<p class='muted'>Detail JSON: <code>qa_summary.json</code>, <code>schema_issues.json</code>, <code>grid_gaps.json</code>, <code>same_ram_matches.json</code>, <code>monotonic_violations.json</code>, <code>degeneracy_flags.json</code>.</p>
+</body></html>

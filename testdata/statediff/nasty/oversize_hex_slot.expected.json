@@ -1,0 +1,11 @@
+{
+  "description": "Slot key is 256 hex chars (4x normal). Parser must not validate length; passes through verbatim. Catching length pathology happens downstream (storage layer / hard limits) — this confirms the parser doesn't crash on it.",
+  "expect": "ok",
+  "touches": [
+    {
+      "contract": "0x4444444444444444444444444444444444444444",
+      "slotKey": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "access": "read"
+    }
+  ]
+}

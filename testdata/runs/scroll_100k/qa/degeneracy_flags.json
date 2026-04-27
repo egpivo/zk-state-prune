@@ -1,0 +1,16 @@
+[
+  {
+    "ell": 32,
+    "false_prune_rate": 0.8118329033016747,
+    "hot_hit_coverage": 0.18816709669832532,
+    "policy": "statistical",
+    "pruned_frac": 0.9995522601070115,
+    "ramratio": 0.00044773989298850736,
+    "reasons": [
+      "RAMRatio 0.000448 < 0.001000 (demote almost everything \u2014 TotalCost minimisation but no useful prediction)",
+      "SlotBlocksPruned/TotalExposure 0.999552 > 0.990000 (prunes almost all exposure \u2014 same regime as above)",
+      "HotHitCoverage 0.188167 < 0.300000 (miss-heavy \u2014 most accesses fall on demoted slots)"
+    ],
+    "source": "testdata/runs/scroll_100k/sweep_v2/stat_l32.json"
+  }
+]

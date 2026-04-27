@@ -37,3 +37,13 @@ go.work.sum
 # Build artifacts — `make build` regenerates bin/zksp on every run
 # (Go embeds a fresh build ID), committing it produces churn.
 bin/
+
+# Python bytecode caches from scripts/ (qa_viz.py, backtest.py).
+__pycache__/
+*.pyc
+
+# Go fuzz: keep the per-Fuzz corpus dir + any committed minimal
+# repros (e.g. testdata/fuzz/FuzzXxx/<hash>) — Go's convention is to
+# commit those so a regression always re-runs them as regular tests.
+# Skip the local mutation cache that lives under .../cache/.
+testdata/fuzz/*/cache/

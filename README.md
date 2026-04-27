@@ -58,28 +58,57 @@ high-water mark.
 
 ### Data-source capability matrix
 
-Each extractor self-declares what slot touches it observes. After
-every `extract`, the capability is stamped into `schema_meta` so
-`report --format json` and `simulate --format json` carry a
-`data_source` field; the text modes print a one-line header.
+Each extractor self-declares what it observes. The capability is
+stamped into `schema_meta` after every successful `extract`, and
+every `report` / `simulate` output carries a `data_source` field
+so any number can be traced back to its coverage. See
+[A Brier score without a capability stamp is a bug, not a
+number][cap-stamp-post] for the full rationale (and the bug in my
+own repo that motivated it).
 
-| `--source`  | reads | non-Transfer writes | `slot_id` form                |
-|-------------|:-----:|:-------------------:|-------------------------------|
-| `mock`      |   ✓   |          ✓          | synthetic / deterministic     |
-| `rpc`       |   ✗   |          ✗          | `contract:holder` (Transfer-log surrogate) |
-| `statediff` |   ✓   |          ✓          | `contract:slotkey` (real `debug_traceBlockByNumber` + `prestateTracer`) |
-
-Reading a Brier score or a cost table without the capability stamp is
-an honest-scope violation: a Transfer-log surrogate systematically
-under-reports writes, which skews both the heavy-tail diagnostics and
-the cost-regime finding.
+| `--source`  | reads | non-Transfer writes |
+|-------------|:-----:|:-------------------:|
+| `mock`      |   ✓   |          ✓          |
+| `rpc`       |   ✗   |          ✗          |
+| `statediff` |   ✓   |          ✓          |
 
 `--source statediff` requires an archive-capable RPC endpoint that
 exposes `debug_traceBlockByNumber` (Alchemy Growth, QuickNode
 archive, self-hosted Erigon, …). Public chain endpoints generally
 refuse the method; the extractor surfaces a directly actionable
-error when that happens instead of silently degrading to the
-surrogate.
+error rather than silently degrading to the surrogate.
+
+[cap-stamp-post]: TBD <!-- replace with published URL once article A goes live -->
+
+
+## QA
+
+Three layers, one make target each:
+
+| Layer | What it catches | Command |
+|---|---|---|
+| **0 — Deterministic sanity** | bad numbers / apples-to-oranges comparisons | `make qa-viz REPORT=...` |
+| **0.5 — Deterministic robustness** | hostile / edge ingestion inputs | `make qa-robustness` ・ `make fuzz-statediff` |
+| **1 — Probabilistic product QA** | tail risk / overfit / drift | `make qa-backtest MISS_PENALTY=...` |
+
+Long-form rationale lives in two posts:
+
+- [A Brier score without a capability stamp is a bug, not a number][cap-stamp-post] — Layer 0 / 0.5 domain-binding pattern.
+- *(forthcoming)* — Layer 1 development log: rolling backtests + Risk QA findings on the scroll_100k run.
+
+Repro / audit checklist for any quoted number:
+
+- Chain + block window `[start,end)` and the run command used.
+- `data_source` capability stamp (`rpc` vs `statediff`).
+- Cost parameters (`ram_unit_cost`, `miss_penalty`, `tau`).
+- Stamped `extract_limits` from `schema_meta` (see
+  [internal/extractor/EXTRACT_LIMITS.md](internal/extractor/EXTRACT_LIMITS.md)
+  for the calibration).
+- Repo commit SHA.
+
+Scope: ingestion reliability + domain correctness + out-of-sample
+policy evaluation. **Not** a protocol-security or
+data-availability analysis.
 
 ## Build
 

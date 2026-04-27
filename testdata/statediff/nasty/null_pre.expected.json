@@ -1,0 +1,5 @@
+{
+  "description": "Both pre and post explicitly null. Parser ranges over nil maps and produces zero touches without panicking.",
+  "expect": "ok",
+  "touches": []
+}

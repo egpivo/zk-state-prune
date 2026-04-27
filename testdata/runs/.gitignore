@@ -11,3 +11,17 @@ scroll_smoke/
 *.db-shm
 *.db-wal
 extract.log
+
+# qa-robustness debug log — full `go test -v` capture, several
+# thousand lines, regenerable in seconds. The aggregated JSON
+# summary lands beside it and IS committable.
+robustness_run.log
+*.stderr
+
+# Persisted Cox model is locally regeneratable from cox.json + the DB
+# via `zksp fit --model cox`; the binary blob has no diff value.
+cox.model
+
+# Rolling-backtest artifacts (per-fold cox.model.json + summary +
+# HTML) — regeneratable from scroll.db + git commit; multi-MB.
+backtest/

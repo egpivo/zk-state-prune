@@ -1,0 +1,24 @@
+{
+  "duplicates": [],
+  "ells": [
+    32,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    16384
+  ],
+  "missing": [],
+  "n_expected": 40,
+  "n_present": 40,
+  "policies": [
+    "fixed-10k",
+    "fixed-1k",
+    "no-prune",
+    "statistical"
+  ]
+}

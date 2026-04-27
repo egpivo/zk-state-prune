@@ -1,0 +1,5 @@
+{
+  "description": "Empty trace array — block with zero transactions. Parser must produce no touches.",
+  "expect": "ok",
+  "touches": []
+}
