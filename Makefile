@@ -69,9 +69,13 @@ BT_DB ?= testdata/runs/scroll_100k/scroll.db
 BT_OUT ?= testdata/runs/scroll_100k/backtest
 BT_START ?= 33400000
 BT_END ?= 33500000
-BT_TRAIN_SPAN ?= 60000
-BT_TEST_SPAN ?= 20000
-BT_STEP ?= 20000
+# Defaults are sized so n_folds is large enough for the tail / CVaR
+# metrics in Risk QA to be meaningful (n_folds=17 on 100k blocks).
+# Tradeoff: shorter train_span = noisier Cox fit per fold. Override on
+# the make line if you'd rather have fewer, beefier folds.
+BT_TRAIN_SPAN ?= 20000
+BT_TEST_SPAN ?= 10000
+BT_STEP ?= 5000
 BT_TAU ?= 0
 qa-backtest: build
 	@if [ -z "$(MISS_PENALTY)" ]; then \

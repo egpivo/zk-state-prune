@@ -40,11 +40,24 @@ import argparse
 import html
 import json
 import math
+import sqlite3
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
+
+# Risk QA needs ≥ this many fold samples before percentiles / CVaR are
+# considered statistically meaningful. Below this, we still compute the
+# numbers but mark them informational so a downstream reader can't
+# accidentally cite a fake-precise p99 over n=2.
+RISK_MIN_N = 5
+
+# A fold is treated as "in distribution" when each train→test ratio of
+# the simple workload summary stats stays inside this band. Picked to
+# admit normal week-over-week variation but flag obvious regime shifts;
+# tunable via --drift-ratio.
+DEFAULT_DRIFT_RATIO = 1.5
 
 
 def rel_to_cwd(p: Path) -> str:
@@ -213,6 +226,133 @@ def stdev(xs: list[float]) -> float | None:
     return math.sqrt(var)
 
 
+def percentile(xs: list[float], q: float) -> float | None:
+    """Linear-interpolated percentile (NumPy default). q in [0, 100].
+    Returns None for empty input. Uses no external deps."""
+    if not xs:
+        return None
+    s = sorted(xs)
+    if len(s) == 1:
+        return float(s[0])
+    pos = (q / 100.0) * (len(s) - 1)
+    lo = math.floor(pos)
+    hi = math.ceil(pos)
+    if lo == hi:
+        return float(s[lo])
+    return float(s[lo] + (s[hi] - s[lo]) * (pos - lo))
+
+
+def cvar(xs: list[float], q: float = 95.0) -> float | None:
+    """CVaR at q% — mean of the worst (100−q)% of values. For q=95
+    this is the mean of the top 5% (the "tail loss"). Falls back to
+    max(xs) when n is small enough that ⌈n·(1−q/100)⌉ = 1."""
+    if not xs:
+        return None
+    s = sorted(xs)
+    k = max(1, math.ceil(len(s) * (1.0 - q / 100.0)))
+    tail = s[-k:]
+    return sum(tail) / len(tail)
+
+
+def tail_summary(xs: list[float], min_n: int = RISK_MIN_N) -> dict[str, Any]:
+    """p50/p90/p95 + CVaR95 + max + n. The `informational` flag is set
+    when n < min_n so downstream readers know the percentiles are noisy
+    by construction (e.g. n=2 ⇒ p95 is just max)."""
+    return {
+        "n": len(xs),
+        "informational": len(xs) < min_n,
+        "min": None if not xs else float(min(xs)),
+        "p50": percentile(xs, 50),
+        "p90": percentile(xs, 90),
+        "p95": percentile(xs, 95),
+        "max": None if not xs else float(max(xs)),
+        "cvar95": cvar(xs, 95),
+        "mean": mean(xs),
+        "stdev": stdev(xs),
+    }
+
+
+def workload_summary(db: Path, start: int, end: int) -> dict[str, Any]:
+    """Cheap per-window workload summary used by the drift detector.
+    Pulls four stats directly from the DB (no Go side-channel needed):
+      - n_slots:              distinct slot_ids active in [start, end)
+      - n_events:             total accesses in [start, end)
+      - access_count_p50/p90: per-slot access-count quantiles
+      - mean_iat:             mean inter-arrival between consecutive
+                              accesses to the same slot, in blocks
+
+    A large train→test ratio in any of these is the signal we use to
+    mark a fold OOD.
+    """
+    # Plain path connect — URI mode requires `file:///abs/path` and is
+    # easy to get wrong for negligible benefit. We never write.
+    conn = sqlite3.connect(str(db.resolve()))
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COUNT(DISTINCT slot_id), COUNT(*) FROM access_events "
+            "WHERE block_number >= ? AND block_number < ?",
+            (start, end),
+        )
+        n_slots, n_events = cur.fetchone()
+
+        cur.execute(
+            "SELECT cnt FROM (SELECT slot_id, COUNT(*) AS cnt FROM access_events "
+            "WHERE block_number >= ? AND block_number < ? GROUP BY slot_id) "
+            "ORDER BY cnt",
+            (start, end),
+        )
+        per_slot_counts = [int(r[0]) for r in cur.fetchall()]
+
+        # IAT: gap between consecutive accesses to the same slot. We
+        # pull (slot_id, block_number) sorted and compute diffs in
+        # Python — the dataset for one window fits easily and avoids
+        # a SQL window-function dependency on older sqlite builds.
+        cur.execute(
+            "SELECT slot_id, block_number FROM access_events "
+            "WHERE block_number >= ? AND block_number < ? "
+            "ORDER BY slot_id, block_number",
+            (start, end),
+        )
+        last_block_by_slot: dict[str, int] = {}
+        iats: list[int] = []
+        for sid, bn in cur:
+            prev = last_block_by_slot.get(sid)
+            if prev is not None:
+                iats.append(int(bn) - int(prev))
+            last_block_by_slot[sid] = int(bn)
+    finally:
+        conn.close()
+
+    return {
+        "n_slots": int(n_slots or 0),
+        "n_events": int(n_events or 0),
+        "access_count_p50": percentile([float(x) for x in per_slot_counts], 50),
+        "access_count_p90": percentile([float(x) for x in per_slot_counts], 90),
+        "mean_iat": float(mean([float(x) for x in iats]) or 0) if iats else None,
+        "n_iat_samples": len(iats),
+    }
+
+
+def _drift_ratios(train: dict[str, Any], test: dict[str, Any]) -> dict[str, float | None]:
+    """train/test ratios for each drift-checked stat. None when either
+    side is missing/zero — downstream treats None as 'no signal'."""
+    out: dict[str, float | None] = {}
+    for key in ("n_slots", "n_events", "access_count_p50", "access_count_p90", "mean_iat"):
+        a, b = train.get(key), test.get(key)
+        if a is None or b is None or a == 0 or b == 0:
+            out[key] = None
+        else:
+            out[key] = float(max(a, b) / min(a, b))  # ≥ 1 by construction
+    return out
+
+
+def _drift_ok(ratios: dict[str, float | None], thr: float) -> bool:
+    """A fold is in-distribution when no drift ratio (skipping None
+    placeholders) exceeds the threshold."""
+    return all((r is None) or (r <= thr) for r in ratios.values())
+
+
 def _slim_fit_report(fit_json: dict[str, Any]) -> dict[str, Any]:
     """Drop Cox coefficients/baseline-hazard arrays and isotonic bins
     from the per-fold record. The pieces a reader actually wants —
@@ -297,6 +437,15 @@ def render_html(summary: dict[str, Any], out_path: Path) -> None:
         f"<p class='muted'>Input DB: <code>{h(summary.get('db'))}</code>. "
         f"Re-run with <code>make qa-backtest MISS_PENALTY=&lt;ℓ&gt;</code>.</p>",
     ]
+    risk = summary.get("risk") or {}
+    indep = risk.get("independence_caveat")
+    if indep:
+        warns.append(indep)
+    gates = risk.get("gates") or {}
+    if gates.get("violations"):
+        for v in gates["violations"]:
+            warns.append(f"<b class='bad'>release-gate violation:</b> {h(v)}")
+
     if warns:
         parts.append("<div class='warn'><b>Caveats:</b><ul>")
         for w in warns:
@@ -364,6 +513,92 @@ def render_html(summary: dict[str, Any], out_path: Path) -> None:
             )
         parts.append("</table>")
 
+    # ---- Risk QA section -------------------------------------------------
+    parts.append("<h2>Risk QA</h2>")
+    parts.append(
+        "<p class='muted'>Engineering risk indicators (worst-fold regret, "
+        "tail / CVaR over folds). Default scope = <code>all_folds</code>; "
+        "the <code>in_distribution</code> view excludes folds where the "
+        "train/test workload shifted beyond <code>--drift-ratio</code>. "
+        "Release gates evaluate against "
+        f"<code>{h(gates.get('scope', 'all_folds'))}</code>.</p>"
+    )
+
+    def _regret_block(label: str, blk: dict[str, Any]) -> str:
+        n = blk.get("n", 0)
+        if n == 0:
+            return f"<p class='muted'>{h(label)}: no folds.</p>"
+        flag = " <span class='muted'>(informational, n &lt; min)</span>" if blk.get("informational") else ""
+        return (
+            f"<p><b>{h(label)}</b> — n={h(n)}{flag}</p>"
+            f"<table>"
+            f"<tr><th>min</th><td>{fnum(blk.get('min'), '+,.0f')}</td>"
+            f"<th>p50</th><td>{fnum(blk.get('p50'), '+,.0f')}</td>"
+            f"<th>p95</th><td>{fnum(blk.get('p95'), '+,.0f')}</td>"
+            f"<th>max</th><td>{fnum(blk.get('max'), '+,.0f')}</td>"
+            f"<th>CVaR95</th><td>{fnum(blk.get('cvar95'), '+,.0f')}</td>"
+            f"</tr></table>"
+            f"<p class='muted'>Definition: {h(blk.get('definition', '—'))}</p>"
+        )
+
+    risk_all = risk.get("all_folds") or {}
+    risk_in = risk.get("in_distribution") or {}
+    parts.append("<h3>Worst-fold regret</h3>")
+    parts.append(_regret_block(f"all_folds (n={risk_all.get('n_folds')})", risk_all.get("regret") or {}))
+    parts.append(_regret_block(
+        f"in_distribution (n={risk_in.get('n_folds')}, "
+        f"excluded {risk_in.get('n_excluded_drift_folds', 0)} drift folds)",
+        risk_in.get("regret") or {},
+    ))
+
+    # Tail metrics for stat policy specifically (the most-watched row).
+    def _stat_tail_table(scope_label: str, scope: dict[str, Any]) -> str:
+        pols = scope.get("policies") or {}
+        stat = pols.get("statistical") or {}
+        if not stat:
+            return f"<p class='muted'>{h(scope_label)}: no <code>statistical</code> rows.</p>"
+        rows = ["<tr><th>metric</th><th>p50</th><th>p90</th><th>p95</th><th>max</th><th>CVaR95</th><th>n</th></tr>"]
+        for short in ("hot_hit_coverage", "false_prune_rate", "miss_penalty_agg", "reactivations", "total_cost"):
+            t = stat.get(short) or {}
+            flag = "*" if t.get("informational") else ""
+            fmt = ",.0f" if short in ("miss_penalty_agg", "reactivations", "total_cost") else ".4f"
+            rows.append(
+                "<tr>"
+                f"<td>{h(short)}</td>"
+                f"<td>{fnum(t.get('p50'), fmt)}</td>"
+                f"<td>{fnum(t.get('p90'), fmt)}</td>"
+                f"<td>{fnum(t.get('p95'), fmt)}</td>"
+                f"<td>{fnum(t.get('max'), fmt)}</td>"
+                f"<td>{fnum(t.get('cvar95'), fmt)}</td>"
+                f"<td>{h(t.get('n'))}{h(flag)}</td>"
+                "</tr>"
+            )
+        n_excl = scope.get("n_excluded_drift_folds")
+        excl_str = f" (excluded {n_excl} drift folds)" if n_excl else ""
+        return (
+            f"<p><b>statistical policy on test, {h(scope_label)}{excl_str}</b> "
+            "<span class='muted'>(* = informational, n &lt; min)</span></p>"
+            "<table>" + "".join(rows) + "</table>"
+        )
+
+    parts.append("<h3>Tail metrics — <code>statistical</code> policy on test</h3>")
+    parts.append(_stat_tail_table("all_folds", risk_all))
+    parts.append(_stat_tail_table("in_distribution", risk_in))
+
+    mns = risk.get("matched_n_stability") or {}
+    parts.append("<h3>Matched fixed-N stability</h3>")
+    if mns.get("values"):
+        parts.append(
+            "<p>Per-fold matched N: "
+            f"<code>{h(mns['values'])}</code></p>"
+            f"<p>n_jumps={h(mns.get('n_jumps'))} · "
+            f"max |ΔN|={h(mns.get('max_abs_jump'))} · "
+            f"p95 |ΔN|={fnum(mns.get('p95_abs_jump'), '.1f')} · "
+            f"mean |ΔN|={fnum(mns.get('mean_abs_jump'), '.1f')}</p>"
+        )
+    else:
+        parts.append("<p class='muted'>No matched-N values.</p>")
+
     # Per-fold table. The matched fixed-N changes across folds (fold 1
     # might pick fixed-540, fold 2 fixed-764), so we render a generic
     # "fixed-matched" column that pulls from each fold's fixed_match
@@ -383,7 +618,9 @@ def render_html(summary: dict[str, Any], out_path: Path) -> None:
             f"<th>{h(pol)}<br>HotHitCov</th>"
             f"<th>{h(pol)}<br>FalsePrune</th>"
         )
-    header.append("<th>same-RAM ok?</th>")
+    header.append("<th>regret</th>")
+    header.append("<th>same-RAM</th>")
+    header.append("<th>drift</th>")
     header.append("<th>flags</th></tr>")
     parts.append("<table>" + "".join(header))
     for f in summary.get("folds", []):
@@ -394,6 +631,12 @@ def render_html(summary: dict[str, Any], out_path: Path) -> None:
         same_label = (
             f'<span class="ok">OK</span>' if same_ram_ok is True else
             f'<span class="bad">drift</span>' if same_ram_ok is False else
+            "—"
+        )
+        drift_ok = f.get("drift_ok")
+        drift_label = (
+            f'<span class="ok">in</span>' if drift_ok is True else
+            f'<span class="bad">OOD</span>' if drift_ok is False else
             "—"
         )
         cells_html = []
@@ -407,6 +650,9 @@ def render_html(summary: dict[str, Any], out_path: Path) -> None:
                 f"<td>{fnum(cell.get('HotHitCoverage'))}</td>"
                 f"<td>{fnum(cell.get('FalsePruneRate'))}</td>"
             )
+        regret = f.get("regret")
+        regret_str = "—" if regret is None else f"{regret:+,.0f}"
+        regret_class = "bad" if regret is not None and regret > 0 else "ok" if regret is not None else "muted"
         parts.append(
             "<tr>"
             f"<td>{h(f.get('fold'))}</td>"
@@ -416,7 +662,9 @@ def render_html(summary: dict[str, Any], out_path: Path) -> None:
             f"<td>{fnum(matched.get('target_ramratio'))}</td>"
             f"<td>{fnum(matched.get('abs_error'))}</td>"
             + "".join(cells_html)
-            + f"<td>{same_label}</td>"
+            + f"<td><span class='{regret_class}'>{h(regret_str)}</span></td>"
+            f"<td>{same_label}</td>"
+            f"<td>{drift_label}</td>"
             f"<td>{', '.join(h(x) for x in flags) if flags else '—'}</td>"
             "</tr>"
         )
@@ -451,6 +699,24 @@ def main(argv: list[str] | None = None) -> int:
                     help="Per-fold flag: |test_fixed_RAMRatio − test_stat_RAMRatio| ≥ eps marks the comparison non-apples-to-apples")
 
     ap.add_argument("--include-robust", action="store_true", help="Also evaluate statistical-robust on test windows")
+
+    # Risk QA — Tier 1/2 thresholds. All optional; only activate the
+    # fail-closed gates when the user explicitly sets a threshold.
+    ap.add_argument("--drift-ratio", type=float, default=DEFAULT_DRIFT_RATIO,
+                    help=f"Fold is OOD when any train/test workload-stat ratio "
+                         f"exceeds this threshold (default {DEFAULT_DRIFT_RATIO})")
+    ap.add_argument("--strict-risk-scope", choices=("all_folds", "in_distribution"),
+                    default="all_folds",
+                    help="Which fold set the --max-* gates evaluate against (default: all_folds — "
+                         "deliberately conservative so OOD folds can't hide bad news)")
+    ap.add_argument("--max-regret", type=float, default=None,
+                    help="(release gate) fail when any fold's TotalCost(stat) − TotalCost(matched_fixed) "
+                         "exceeds this absolute value")
+    ap.add_argument("--min-coverage", type=float, default=None,
+                    help="(release gate) fail when any fold's stat HotHitCoverage drops below this")
+    ap.add_argument("--max-fpr", type=float, default=None,
+                    help="(release gate) fail when any fold's stat FalsePruneRate exceeds this")
+
     ap.add_argument("--strict", action="store_true",
                     help="Exit non-zero if any fold has mixed sources, same-RAM drift, or fixed-N search hit the upper bound")
     ap.add_argument("--dry-run", action="store_true", help="Print commands but do not execute")
@@ -580,6 +846,10 @@ def main(argv: list[str] | None = None) -> int:
         #    still produces artifacts; --strict gates a non-zero exit.
         flags: list[str] = []
         same_ram_ok: bool | None = None
+        regret = None  # TotalCost(stat) − TotalCost(matched_fixed); negative = stat wins
+        drift_summary: dict[str, Any] | None = None
+        drift_ok: bool | None = None
+
         if not args.dry_run:
             test_fixed = test_results.get(fixed_policy) or {}
             test_stat = test_results.get("statistical") or {}
@@ -597,12 +867,39 @@ def main(argv: list[str] | None = None) -> int:
             if ref_ds and ds and ds.get("source") != ref_ds.get("source"):
                 flags.append(f"mixed source: {ds.get('source')} vs {ref_ds.get('source')}")
 
+            # Regret on test: stat − matched_fixed. If matched_fixed is
+            # missing or stat is missing, leave regret None.
+            tc_stat = test_stat.get("TotalCost")
+            tc_fixed = test_fixed.get("TotalCost")
+            if tc_stat is not None and tc_fixed is not None:
+                regret = float(tc_stat) - float(tc_fixed)
+
+            # Drift summary: cheap workload stats on train vs test windows.
+            train_w = workload_summary(db, train_start, train_end)
+            test_w = workload_summary(db, test_start, test_end)
+            ratios = _drift_ratios(train_w, test_w)
+            drift_ok = _drift_ok(ratios, args.drift_ratio)
+            drift_summary = {"train": train_w, "test": test_w, "ratios": ratios}
+            if not drift_ok:
+                worst = max(
+                    ((k, v) for k, v in ratios.items() if v is not None),
+                    key=lambda kv: kv[1],
+                    default=(None, None),
+                )
+                if worst[0]:
+                    flags.append(
+                        f"OOD: train/test {worst[0]} ratio {worst[1]:.2f} > {args.drift_ratio}"
+                    )
+
         # Wall time is per-run noise, not a canonical artifact: report
         # it on stdout but keep it OUT of the persisted JSON so diffs
         # against a prior run stay clean.
         wall = time.time() - fold_t0
-        print(f":::   fold {fold} done in {wall:.1f}s "
-              f"(matched={fixed_policy}, same_ram_ok={same_ram_ok})", flush=True)
+        print(
+            f":::   fold {fold} done in {wall:.1f}s "
+            f"(matched={fixed_policy}, same_ram_ok={same_ram_ok}, drift_ok={drift_ok})",
+            flush=True,
+        )
 
         fold_record = {
             "fold": fold,
@@ -618,6 +915,9 @@ def main(argv: list[str] | None = None) -> int:
             "test_results": {pol: _slim_cell(c) for pol, c in test_results.items()},
             "flags": flags,
             "same_ram_ok": same_ram_ok,
+            "regret": regret,
+            "drift_ok": drift_ok,
+            "drift_summary": drift_summary,
         }
         folds.append(fold_record)
 
@@ -704,6 +1004,128 @@ def main(argv: list[str] | None = None) -> int:
     if args.include_robust:
         pol_columns.append("statistical-robust")
 
+    # ---- Risk QA --------------------------------------------------------
+    # The rolling design overlaps test windows when step < test_span, so
+    # folds aren't statistically independent. Treat percentile / CVaR
+    # numbers as engineering risk indicators, not strict statistical
+    # inference. We surface the same caveat in the persisted summary.
+    risk_independence_caveat = (
+        "Rolling folds with step < test_span overlap and are not "
+        "statistically independent. Treat percentile / CVaR figures as "
+        "engineering risk indicators, not strict statistical inference."
+    ) if args.step < args.test_span else (
+        "Folds do not overlap (step ≥ test_span); percentile / CVaR "
+        "figures are over near-independent samples but n_folds is still "
+        "the binding constraint."
+    )
+
+    def _per_policy_tails(fold_subset: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        """For each (policy, metric) pair, summarise the per-fold values
+        as a tail-stat dict — used by both the all-folds and the
+        in-distribution risk blocks."""
+        out: dict[str, dict[str, Any]] = {}
+        names: set[str] = set()
+        for f in fold_subset:
+            names |= set((f.get("test_results") or {}).keys())
+        for pol in sorted(n for n in names if isinstance(n, str)):
+            block: dict[str, Any] = {}
+            for short, full in (
+                ("ramratio", "RAMRatio"),
+                ("hot_hit_coverage", "HotHitCoverage"),
+                ("false_prune_rate", "FalsePruneRate"),
+                ("total_cost", "TotalCost"),
+                ("miss_penalty_agg", "MissPenaltyAgg"),
+                ("reactivations", "Reactivations"),
+            ):
+                xs = [
+                    float((f.get("test_results") or {}).get(pol, {}).get(full))
+                    for f in fold_subset
+                    if (f.get("test_results") or {}).get(pol, {}).get(full) is not None
+                ]
+                block[short] = tail_summary(xs)
+            out[pol] = block
+        return out
+
+    def _regret_tails(fold_subset: list[dict[str, Any]]) -> dict[str, Any]:
+        regrets = [float(f["regret"]) for f in fold_subset if f.get("regret") is not None]
+        return {
+            **tail_summary(regrets),
+            "definition": "TotalCost(statistical) − TotalCost(matched_fixed) per fold; negative = stat wins",
+        }
+
+    in_dist_folds = [f for f in folds if f.get("drift_ok") is True]
+    risk_all = {
+        "scope": "all_folds",
+        "n_folds": len(folds),
+        "policies": _per_policy_tails(folds),
+        "regret": _regret_tails(folds),
+    }
+    risk_in_dist = {
+        "scope": "in_distribution",
+        "n_folds": len(in_dist_folds),
+        "n_excluded_drift_folds": len(folds) - len(in_dist_folds),
+        "policies": _per_policy_tails(in_dist_folds),
+        "regret": _regret_tails(in_dist_folds),
+    }
+
+    # Tier 1 D — matched-N stability across folds. Captures whether the
+    # tuned baseline is itself a stable target or itself drifting.
+    matched_ns: list[int] = []
+    for f in folds:
+        n = (f.get("fixed_match") or {}).get("n")
+        if isinstance(n, int):
+            matched_ns.append(n)
+    matched_jumps = [
+        abs(matched_ns[i] - matched_ns[i - 1]) for i in range(1, len(matched_ns))
+    ]
+    matched_n_stability = {
+        "values": matched_ns,
+        "n_jumps": len(matched_jumps),
+        "max_abs_jump": max(matched_jumps) if matched_jumps else None,
+        "p95_abs_jump": percentile([float(x) for x in matched_jumps], 95),
+        "mean_abs_jump": mean([float(x) for x in matched_jumps]),
+    }
+
+    # Tier 1 F — fail-closed gates. We evaluate against the fold subset
+    # the user asked for via --strict-risk-scope. Defaults to all_folds
+    # so OOD folds can't quietly hide bad news in releases.
+    gate_scope_folds = in_dist_folds if args.strict_risk_scope == "in_distribution" else folds
+    risk_violations: list[str] = []
+    if args.max_regret is not None:
+        bad = [
+            f for f in gate_scope_folds
+            if f.get("regret") is not None and float(f["regret"]) > args.max_regret
+        ]
+        if bad:
+            risk_violations.append(
+                f"max-regret: {len(bad)}/{len(gate_scope_folds)} folds exceed "
+                f"{args.max_regret} (worst fold {max(int(f['fold']) for f in bad)})"
+            )
+    if args.min_coverage is not None:
+        bad = [
+            f for f in gate_scope_folds
+            if (f.get("test_results", {}).get("statistical") or {}).get("HotHitCoverage")
+            is not None
+            and float(f["test_results"]["statistical"]["HotHitCoverage"]) < args.min_coverage
+        ]
+        if bad:
+            risk_violations.append(
+                f"min-coverage: {len(bad)}/{len(gate_scope_folds)} folds drop stat "
+                f"HotHitCoverage below {args.min_coverage}"
+            )
+    if args.max_fpr is not None:
+        bad = [
+            f for f in gate_scope_folds
+            if (f.get("test_results", {}).get("statistical") or {}).get("FalsePruneRate")
+            is not None
+            and float(f["test_results"]["statistical"]["FalsePruneRate"]) > args.max_fpr
+        ]
+        if bad:
+            risk_violations.append(
+                f"max-fpr: {len(bad)}/{len(gate_scope_folds)} folds exceed stat "
+                f"FalsePruneRate {args.max_fpr}"
+            )
+
     summary = {
         # Deliberately no "generated_at": we want byte-identical re-runs
         # so a reader can `git diff` two backtests from the same DB
@@ -726,10 +1148,26 @@ def main(argv: list[str] | None = None) -> int:
             "tau": args.tau,
             "holdout": args.holdout,
             "same_ram_eps": args.same_ram_eps,
+            "drift_ratio": args.drift_ratio,
+            "strict_risk_scope": args.strict_risk_scope,
             "max_fixed_n": max_fixed_n,
+            "risk_min_n": RISK_MIN_N,
         },
         "aggregate": {"policies": agg_pols},
         "statistical_train_test_gap": gap,
+        "risk": {
+            "independence_caveat": risk_independence_caveat,
+            "all_folds": risk_all,
+            "in_distribution": risk_in_dist,
+            "matched_n_stability": matched_n_stability,
+            "gates": {
+                "scope": args.strict_risk_scope,
+                "max_regret": args.max_regret,
+                "min_coverage": args.min_coverage,
+                "max_fpr": args.max_fpr,
+                "violations": risk_violations,
+            },
+        },
         "folds": folds,
     }
 
@@ -739,16 +1177,26 @@ def main(argv: list[str] | None = None) -> int:
     # Concise stdout summary.
     n_drift = sum(1 for f in folds if f.get("same_ram_ok") is False)
     n_search_capped = sum(1 for f in folds if (f.get("fixed_match") or {}).get("note"))
+    n_ood = sum(1 for f in folds if f.get("drift_ok") is False)
     print(
         f"::: backtest: folds={len(folds)} sources={list(distinct_sources)} "
-        f"same-RAM-drift folds={n_drift} fixed-N-search-capped folds={n_search_capped} "
-        f"out={rel_to_cwd(out_dir)}"
+        f"same-RAM-drift={n_drift} OOD={n_ood} fixed-N-search-capped={n_search_capped} "
+        f"risk-violations={len(risk_violations)} out={rel_to_cwd(out_dir)}"
     )
+    for v in risk_violations:
+        print(f":::   risk gate failed: {v}")
 
-    if args.strict:
-        if (len(distinct_sources) > 1) or n_drift > 0 or n_search_capped > 0:
-            return 3
-    return 0
+    exit_code = 0
+    if args.strict and (
+        (len(distinct_sources) > 1) or n_drift > 0 or n_search_capped > 0
+    ):
+        exit_code = 3
+    if risk_violations:
+        # Risk gate failures are independent of --strict and always
+        # surface a distinct exit code so CI can tell them apart from
+        # data-integrity failures.
+        exit_code = 4
+    return exit_code
 
 
 if __name__ == "__main__":
