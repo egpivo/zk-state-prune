@@ -6,11 +6,15 @@
 [![Go Version](https://img.shields.io/github/go-mod/go-version/egpivo/zk-state-prune)](https://github.com/egpivo/zk-state-prune/blob/main/go.mod)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Cost-aware hot/cold tiering for ZK rollup state, driven by survival analysis.**
+**A cache eviction / hot-cold tiering policy for ZK rollup state.**
 
-`zk-state-prune` (binary: `zksp`) treats on-chain state access as a survival
-process, fits a calibrated per-slot access-probability model, and picks a
-tiering decision per slot from the cost surrogate
+`zk-state-prune` (binary: `zksp`) is an **eviction policy**, not a correctness
+mechanism: it does not change state, consensus, or proof validity. Worst case
+is a **cache miss** (higher latency / cost), not state loss.
+
+It treats on-chain state access as a survival process, fits a calibrated
+per-slot access-probability model, and picks a tiering decision per slot from
+the cost surrogate:
 
 ```
 d_i* = argmin_d  c(d) + ℓ(d) · p_i(τ)
@@ -18,8 +22,9 @@ d_i* = argmin_d  c(d) + ℓ(d) · p_i(τ)
 
 where `c(d)` is the per-tier holding cost, `ℓ(d)` the miss penalty, and
 `p_i(τ) = 1 − S_i(τ)` the calibrated probability of access within horizon `τ`.
-The threshold collapses to `p* = (c_ram · τ) / ℓ_miss`: demote a slot at the
-first idle duration where its conditional access probability drops below `p*`.
+For a two-tier setup this collapses to a probability cutoff
+`p* = (c_ram · τ) / ℓ_miss`: demote a slot at the first idle duration where its
+conditional access probability drops below `p*`.
 
 ## Pipeline
 
